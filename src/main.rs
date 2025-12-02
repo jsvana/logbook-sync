@@ -135,12 +135,43 @@ async fn run_sync(config: Config) -> Result<()> {
 }
 
 async fn run_status(config: Config) -> Result<()> {
+    use logbook_sync::adif::parse_adif;
+    use logbook_sync::watcher::FileWatcher;
+
     let db = Database::open(&config.database.path)?;
     let stats = db.get_stats()?;
 
     println!("Logbook Sync Status");
     println!("===================");
     println!("Callsign: {}", config.general.callsign);
+
+    // Scan watch directory for ADIF files
+    println!();
+    println!("Watch Directory: {}", config.local.watch_dir.display());
+
+    let watcher = FileWatcher::new(&config);
+    let files = watcher.get_existing_files().unwrap_or_default();
+
+    let mut total_file_qsos = 0;
+    let mut new_qsos = 0;
+
+    for file in &files {
+        if let Ok(content) = std::fs::read_to_string(file) {
+            if let Ok(parsed) = parse_adif(&content) {
+                total_file_qsos += parsed.qsos.len();
+                for qso in &parsed.qsos {
+                    if !db.qso_exists(qso).unwrap_or(true) {
+                        new_qsos += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    println!("  ADIF files:      {}", files.len());
+    println!("  QSOs in files:   {}", total_file_qsos);
+    println!("  Not in database: {}", new_qsos);
+
     println!();
     println!("Local Database:");
     println!("  Total QSOs:      {}", stats.total_qsos);
