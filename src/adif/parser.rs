@@ -209,7 +209,8 @@ mod tests {
 
     #[test]
     fn test_parse_minimal_adif() {
-        let content = "<EOH>\n<CALL:4>W1AW<QSO_DATE:8>20241201<TIME_ON:4>1430<BAND:3>20m<MODE:2>CW<EOR>";
+        let content =
+            "<EOH>\n<CALL:4>W1AW<QSO_DATE:8>20241201<TIME_ON:4>1430<BAND:3>20m<MODE:2>CW<EOR>";
         let result = parse_adif(content).unwrap();
 
         assert_eq!(result.qsos.len(), 1);
@@ -243,7 +244,10 @@ mod tests {
 
         let result = parse_adif(content).unwrap();
 
-        assert_eq!(result.header.fields.get("PROGRAMID"), Some(&"Ham2K PoLo".to_string()));
+        assert_eq!(
+            result.header.fields.get("PROGRAMID"),
+            Some(&"Ham2K PoLo".to_string())
+        );
         assert_eq!(result.qsos.len(), 1);
 
         let qso = &result.qsos[0];

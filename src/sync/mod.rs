@@ -33,8 +33,8 @@ impl Default for RetryConfig {
 impl RetryConfig {
     /// Calculate delay for a given attempt number (0-indexed)
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let delay_ms = (self.initial_delay_ms as f64
-            * self.exponential_base.powi(attempt as i32)) as u64;
+        let delay_ms =
+            (self.initial_delay_ms as f64 * self.exponential_base.powi(attempt as i32)) as u64;
         Duration::from_millis(delay_ms.min(self.max_delay_ms))
     }
 }
@@ -69,6 +69,7 @@ pub struct SyncService {
 }
 
 impl SyncService {
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(config: Config, db: Database) -> Self {
         let qrz_client = if config.qrz.enabled {
             Some(QrzClient::new(
@@ -148,10 +149,7 @@ impl SyncService {
                 }
             };
 
-            match self
-                .upload_qso_with_retry(client, &qso, stored.id)
-                .await
-            {
+            match self.upload_qso_with_retry(client, &qso, stored.id).await {
                 Ok(result) => {
                     if result.success {
                         stats.qsos_uploaded += 1;

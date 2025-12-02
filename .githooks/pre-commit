@@ -1,0 +1,34 @@
+#!/bin/bash
+# Pre-commit hook for logbook-sync
+# Install: git config core.hooksPath .githooks
+# Or: cp .githooks/pre-commit .git/hooks/pre-commit
+
+set -e
+
+echo "Running pre-commit checks..."
+
+# Check formatting
+echo "  Checking formatting (cargo fmt)..."
+if ! cargo fmt --all -- --check; then
+    echo ""
+    echo "ERROR: Code is not formatted. Run 'cargo fmt' to fix."
+    exit 1
+fi
+
+# Run clippy
+echo "  Running linter (cargo clippy)..."
+if ! cargo clippy --all-targets --all-features -- -D warnings 2>/dev/null; then
+    echo ""
+    echo "ERROR: Clippy found issues. Fix the warnings above."
+    exit 1
+fi
+
+# Quick compile check
+echo "  Checking compilation (cargo check)..."
+if ! cargo check --all-targets 2>/dev/null; then
+    echo ""
+    echo "ERROR: Code does not compile."
+    exit 1
+fi
+
+echo "All pre-commit checks passed!"

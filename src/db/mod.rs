@@ -246,6 +246,7 @@ impl Database {
     }
 
     /// Update confirmation status for a QSO (matched by call, date, time, band, mode)
+    #[allow(clippy::too_many_arguments)]
     pub fn update_confirmation(
         &self,
         call: &str,
@@ -396,9 +397,9 @@ impl Database {
 
     /// Get statistics for status display
     pub fn get_stats(&self) -> Result<DbStats> {
-        let total_qsos: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM qsos", [], |row| row.get(0))?;
+        let total_qsos: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM qsos", [], |row| row.get(0))?;
 
         let synced_qrz: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM qsos WHERE qrz_synced_at IS NOT NULL",
@@ -424,11 +425,9 @@ impl Database {
             |row| row.get(0),
         )?;
 
-        let processed_files: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM processed_files", [], |row| {
-                row.get(0)
-            })?;
+        let processed_files: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM processed_files", [], |row| row.get(0))?;
 
         Ok(DbStats {
             total_qsos,

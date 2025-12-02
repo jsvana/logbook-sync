@@ -1,0 +1,17 @@
+#!/bin/bash
+# Pre-push hook for logbook-sync
+# Install: git config core.hooksPath .githooks
+
+set -e
+
+echo "Running pre-push checks..."
+
+# Run tests
+echo "  Running tests (cargo test)..."
+if ! cargo test --all-features; then
+    echo ""
+    echo "ERROR: Tests failed. Fix the failing tests before pushing."
+    exit 1
+fi
+
+echo "All pre-push checks passed!"

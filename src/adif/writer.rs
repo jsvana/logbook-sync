@@ -179,7 +179,7 @@ mod tests {
             other_fields: HashMap::new(),
         };
 
-        let output = write_adif(None, &[qso.clone()]);
+        let output = write_adif(None, std::slice::from_ref(&qso));
         let parsed = parse_adif(&output).unwrap();
 
         assert_eq!(parsed.qsos.len(), 1);

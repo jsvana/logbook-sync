@@ -155,7 +155,9 @@ logbook-sync works great with the [POTA app](https://pota.app):
 2. After each activation, the app exports an ADIF file
 3. logbook-sync detects the new file and uploads to QRZ automatically
 
-## Building
+## Development
+
+### Building
 
 ```bash
 # Debug build
@@ -170,6 +172,34 @@ cargo test
 # Run with verbose logging
 RUST_LOG=debug cargo run -- -c config.test.toml sync
 ```
+
+### Pre-commit Hooks
+
+Set up pre-commit hooks to run `cargo fmt`, `cargo clippy`, and `cargo test` automatically:
+
+**Option 1: Using pre-commit framework (recommended)**
+```bash
+pip install pre-commit
+pre-commit install
+pre-commit install --hook-type pre-push
+```
+
+**Option 2: Using git hooks directly**
+```bash
+git config core.hooksPath .githooks
+```
+
+The hooks will:
+- **pre-commit**: Run `cargo fmt --check` and `cargo clippy`
+- **pre-push**: Run `cargo test`
+
+### CI/CD
+
+GitHub Actions automatically runs on every push and pull request:
+- Format checking (`cargo fmt`)
+- Linting (`cargo clippy`)
+- Tests (`cargo test`)
+- Release builds for Linux and macOS
 
 ## Project Structure
 

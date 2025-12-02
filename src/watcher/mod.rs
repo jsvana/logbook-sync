@@ -1,5 +1,5 @@
-use crate::db::{compute_file_checksum, Database};
 use crate::adif::parse_adif;
+use crate::db::{compute_file_checksum, Database};
 use crate::{Config, Result};
 use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
@@ -85,7 +85,10 @@ fn run_watcher(
 
     let mut debouncer = new_debouncer(
         Duration::from_secs(debounce_secs),
-        move |res: std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
+        move |res: std::result::Result<
+            Vec<notify_debouncer_mini::DebouncedEvent>,
+            notify::Error,
+        >| {
             if let Ok(events) = res {
                 for event in events {
                     let _ = sync_tx.send(event);
@@ -112,7 +115,7 @@ fn run_watcher(
         let watch_event = match event.kind {
             DebouncedEventKind::Any => WatchEvent::FileChanged(path.clone()),
             DebouncedEventKind::AnyContinuous => continue, // Still being modified
-            _ => continue, // Handle any future variants
+            _ => continue,                                 // Handle any future variants
         };
 
         if tx.blocking_send(watch_event).is_err() {

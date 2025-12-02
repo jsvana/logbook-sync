@@ -109,10 +109,7 @@ impl Config {
 
         // Update user agent with callsign
         if !config.qrz.user_agent.contains(&config.general.callsign) {
-            config.qrz.user_agent = format!(
-                "LogbookSync/0.1.0 ({})",
-                config.general.callsign
-            );
+            config.qrz.user_agent = format!("LogbookSync/0.1.0 ({})", config.general.callsign);
         }
 
         Ok(config)
@@ -120,15 +117,16 @@ impl Config {
 
     pub fn validate(&self) -> crate::Result<()> {
         if self.general.callsign.is_empty() {
-            return Err(crate::Error::Config(
-                config::ConfigError::Message("callsign is required".to_string()),
-            ));
+            return Err(crate::Error::Config(config::ConfigError::Message(
+                "callsign is required".to_string(),
+            )));
         }
 
         if !self.local.watch_dir.exists() {
-            return Err(crate::Error::Config(config::ConfigError::Message(
-                format!("watch_dir does not exist: {:?}", self.local.watch_dir),
-            )));
+            return Err(crate::Error::Config(config::ConfigError::Message(format!(
+                "watch_dir does not exist: {:?}",
+                self.local.watch_dir
+            ))));
         }
 
         if self.qrz.enabled && self.qrz.api_key.is_empty() {

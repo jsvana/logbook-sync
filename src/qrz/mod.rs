@@ -164,7 +164,10 @@ impl QrzClient {
         start_date: &str,
         end_date: &str,
     ) -> Result<FetchResult> {
-        let option = format!("BETWEEN:{},{},MAX:{}", start_date, end_date, MAX_FETCH_PER_REQUEST);
+        let option = format!(
+            "BETWEEN:{},{},MAX:{}",
+            start_date, end_date, MAX_FETCH_PER_REQUEST
+        );
         self.fetch_with_option(&option).await
     }
 
@@ -385,9 +388,7 @@ fn parse_fetch_response(body: &str) -> Result<FetchResult> {
             });
         }
 
-        return Err(Error::Qrz(
-            reason.unwrap_or(&"Unknown error").to_string(),
-        ));
+        return Err(Error::Qrz(reason.unwrap_or(&"Unknown error").to_string()));
     }
 
     // Get the count for pagination
