@@ -1,0 +1,57 @@
+# Logbook Sync Configuration
+# Copy this file to /etc/logbook-sync/config.toml or specify with -c flag
+
+[general]
+# Your amateur radio callsign
+callsign = "YOURCALL"
+
+# Sync interval in seconds (for periodic full sync)
+sync_interval = 300
+
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+
+[local]
+# Directory containing ADIF files to sync
+watch_dir = "/home/user/ham-logs"
+
+# Output directory for downloaded logs
+output_dir = "/home/user/ham-logs/downloaded"
+
+# File patterns to watch
+patterns = ["*.adi", "*.adif"]
+
+# Debounce period (seconds) - wait for file writes to complete
+debounce_secs = 5
+
+# Process existing files on startup
+process_existing = true
+
+[qrz]
+# Enable QRZ sync
+enabled = true
+
+# API key (get from QRZ logbook settings)
+# Can also be set via ADIF_SYNC_QRZ_API_KEY environment variable
+api_key = "XXXX-XXXX-XXXX-XXXX"
+
+# Which direction to sync
+upload = true     # Local → QRZ
+download = true   # QRZ → Local (confirmations)
+
+# Download interval (seconds) - less frequent than upload
+download_interval = 3600
+
+[pota]
+# Enable POTA integration (optional, not yet implemented)
+enabled = false
+
+# Directory for manual POTA exports
+# import_dir = "/home/user/ham-logs/pota-imports"
+
+# Auto-import CSV exports when detected
+auto_import_csv = false
+
+[database]
+# State database location
+path = "/var/lib/logbook-sync/state.db"

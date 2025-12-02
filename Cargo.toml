@@ -1,0 +1,61 @@
+[package]
+name = "logbook-sync"
+version = "0.1.0"
+edition = "2021"
+description = "ADIF log synchronization daemon for amateur radio"
+authors = ["jsvana"]
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# QRZ API client
+qrz-logbook-api = "0.1"
+
+# Configuration
+config = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# File watching
+notify = "6"
+notify-debouncer-mini = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Database (state tracking)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Hashing for file checksums
+sha2 = "0.10"
+hex = "0.4"
+
+# Async utilities
+futures = "0.3"
+
+# Systemd integration
+sd-notify = "0.4"
+
+# URL encoding for QRZ API
+urlencoding = "2.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"

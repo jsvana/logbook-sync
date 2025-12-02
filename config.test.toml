@@ -1,0 +1,27 @@
+# Test configuration for logbook-sync
+# Uses the provided QRZ API key and local directories
+
+[general]
+callsign = "W6JSV"
+sync_interval = 300
+log_level = "debug"
+
+[local]
+watch_dir = "/home/jsvana/projects/logbook-sync/test-logs"
+output_dir = "/home/jsvana/projects/logbook-sync/test-logs/downloaded"
+patterns = ["*.adi", "*.adif"]
+debounce_secs = 5
+process_existing = true
+
+[qrz]
+enabled = true
+api_key = "1929-BDD0-182F-5B67"
+upload = true
+download = true
+download_interval = 3600
+
+[pota]
+enabled = false
+
+[database]
+path = "/home/jsvana/projects/logbook-sync/test-state.db"

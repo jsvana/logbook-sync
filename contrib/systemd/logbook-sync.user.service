@@ -1,0 +1,22 @@
+[Unit]
+Description=ADIF Logbook Synchronization Daemon (User)
+Documentation=https://github.com/jsvana/logbook-sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/logbook-sync -c %h/.config/logbook-sync/config.toml daemon
+Restart=on-failure
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=logbook-sync
+
+# Environment
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

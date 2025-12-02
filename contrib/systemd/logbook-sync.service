@@ -1,0 +1,35 @@
+[Unit]
+Description=ADIF Logbook Synchronization Daemon
+Documentation=https://github.com/jsvana/logbook-sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/logbook-sync -c /etc/logbook-sync/config.toml daemon
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Allow read access to home directories for ADIF files
+ReadWritePaths=/var/lib/logbook-sync
+ReadOnlyPaths=/home
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=logbook-sync
+
+# Environment
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

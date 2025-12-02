@@ -1,0 +1,53 @@
+# Logbook Sync Configuration
+# Copy this file to /etc/logbook-sync/config.toml (system) or
+# ~/.config/logbook-sync/config.toml (user)
+
+[general]
+# Your amateur radio callsign
+callsign = "YOURCALL"
+
+# Sync interval in seconds (default: 300 = 5 minutes)
+sync_interval = 300
+
+[local]
+# Directory to watch for new ADIF files
+# For POTA app: ~/Documents/prior
+watch_dir = "/home/username/Documents/prior"
+
+# Directory for output files (downloaded ADIFs, etc.)
+output_dir = "/home/username/logbook-sync/output"
+
+# File patterns to match (glob patterns)
+patterns = ["*.adi", "*.adif", "*.ADI", "*.ADIF"]
+
+# Debounce time in seconds (wait for file to stabilize)
+debounce_secs = 2
+
+# Process existing files on startup
+process_existing = true
+
+[database]
+# SQLite database path for state tracking
+# System: /var/lib/logbook-sync/logbook.db
+# User: ~/.local/share/logbook-sync/logbook.db
+path = "/var/lib/logbook-sync/logbook.db"
+
+[qrz]
+# Enable QRZ.com integration
+enabled = true
+
+# Your QRZ Logbook API key (from https://logbook.qrz.com/logbook)
+# Can also be set via LOGBOOK_SYNC_QRZ_API_KEY environment variable
+api_key = "YOUR-QRZ-API-KEY"
+
+# User agent for API requests
+user_agent = "logbook-sync/0.1.0"
+
+# Enable uploading new QSOs to QRZ
+upload = true
+
+# Enable downloading QSO confirmations from QRZ (requires subscription)
+download = true
+
+# Download check interval in seconds (default: 3600 = 1 hour)
+download_interval = 3600
