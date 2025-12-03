@@ -226,7 +226,7 @@ fn extract_number_before_keyword(text: &str, keyword: &str) -> Option<u32> {
             && !before[..num_end]
                 .chars()
                 .last()
-                .map_or(false, |c| c.is_ascii_digit())
+                .is_some_and(|c| c.is_ascii_digit())
         {
             num_end -= 1;
         }
@@ -238,7 +238,7 @@ fn extract_number_before_keyword(text: &str, keyword: &str) -> Option<u32> {
             && before[..num_start]
                 .chars()
                 .last()
-                .map_or(false, |c| c.is_ascii_digit())
+                .is_some_and(|c| c.is_ascii_digit())
         {
             num_start -= 1;
         }
@@ -247,7 +247,7 @@ fn extract_number_before_keyword(text: &str, keyword: &str) -> Option<u32> {
             && !before
                 .chars()
                 .nth(num_start)
-                .map_or(false, |c| c.is_ascii_digit())
+                .is_some_and(|c| c.is_ascii_digit())
         {
             num_start += 1;
         }
