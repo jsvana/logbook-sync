@@ -48,7 +48,7 @@ impl ClublogClient {
             .ok_or_else(|| Error::Other("ClubLog API key not configured".into()))?;
 
         // Convert single QSO to ADIF (just the record, not full file)
-        let adif_record = write_adif(None, &[qso.clone()]);
+        let adif_record = write_adif(None, std::slice::from_ref(qso));
 
         debug!(call = %qso.call, "Uploading QSO to ClubLog");
 

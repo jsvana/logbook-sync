@@ -41,7 +41,7 @@ impl HrdlogClient {
             .ok_or_else(|| Error::Other("HRDLog upload code not configured".into()))?;
 
         // Convert single QSO to ADIF record
-        let adif_data = write_adif(None, &[qso.clone()]);
+        let adif_data = write_adif(None, std::slice::from_ref(qso));
 
         debug!(call = %qso.call, "Uploading QSO to HRDLog");
 
