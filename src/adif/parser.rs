@@ -101,9 +101,22 @@ fn parse_fields(content: &str) -> Vec<(String, String)> {
             if let Ok(len) = parts[1].parse::<usize>() {
                 let value_start = end + 1;
                 let value_end = (value_start + len).min(content.len());
-                let value = content[value_start..value_end].to_string();
-                fields.push((field_name, value));
-                pos = value_end;
+
+                // Safely extract the value, handling potential UTF-8 boundary issues
+                if let Some(value) = content.get(value_start..value_end) {
+                    fields.push((field_name, value.to_string()));
+                    pos = value_end;
+                } else if let Some(remaining) = content.get(value_start..) {
+                    // Fall back to finding the next < or end
+                    let actual_end = remaining.find('<').unwrap_or(remaining.len());
+                    if let Some(value) = remaining.get(..actual_end) {
+                        fields.push((field_name, value.trim().to_string()));
+                    }
+                    pos = value_start + actual_end;
+                } else {
+                    // Skip this field entirely if we can't safely access it
+                    pos = end + 1;
+                }
             } else {
                 pos = end + 1;
             }

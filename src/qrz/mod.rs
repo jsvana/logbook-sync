@@ -11,7 +11,7 @@ use tracing::{debug, info, trace, warn};
 
 const QRZ_API_URL: &str = "https://logbook.qrz.com/api";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const MAX_FETCH_PER_REQUEST: u32 = 250;
+const MAX_FETCH_PER_REQUEST: u32 = 2000;
 
 /// QRZ Logbook API client
 pub struct QrzClient {
@@ -47,6 +47,26 @@ pub struct FetchedQso {
     pub lotw_qsl_sent: Option<String>,
     pub qsl_rcvd: Option<String>,
     pub qsl_sent: Option<String>,
+}
+
+/// Convert a date field to Y/N status
+/// QRZ returns date fields (LOTW_QSLRDATE) instead of status (LOTW_QSL_RCVD)
+/// If a date is present and valid (not empty or "00000000"), treat as "Y"
+fn date_to_status(date: Option<String>) -> Option<String> {
+    match date {
+        Some(d) if !d.is_empty() && d != "00000000" => Some("Y".to_string()),
+        Some(_) => None, // Empty or all zeros means no confirmation
+        None => None,
+    }
+}
+
+/// Convert QRZ APP_QRZLOG_STATUS to Y/N
+/// "C" = Confirmed (both parties logged to QRZ), "N" = Not confirmed
+fn qrz_status_to_confirmed(status: Option<String>) -> Option<String> {
+    match status.as_deref() {
+        Some("C") => Some("Y".to_string()),
+        _ => None,
+    }
 }
 
 /// Result of a fetch operation
@@ -181,16 +201,36 @@ impl QrzClient {
     /// Fetch all QSOs (with automatic pagination)
     pub async fn fetch_all(&self) -> Result<Vec<FetchedQso>> {
         let mut all_qsos = Vec::new();
-        let mut offset = 0;
+        let mut offset = 0u32;
 
         loop {
-            let option = format!("MAX:{},OFFSET:{}", MAX_FETCH_PER_REQUEST, offset);
+            // QRZ doesn't like OFFSET:0, so only include it when > 0
+            let option = if offset == 0 {
+                format!("MAX:{}", MAX_FETCH_PER_REQUEST)
+            } else {
+                format!("MAX:{},OFFSET:{}", MAX_FETCH_PER_REQUEST, offset)
+            };
+            debug!(option = %option, offset = offset, "Fetching QSOs from QRZ");
             let result = self.fetch_with_option(&option).await?;
 
             let count = result.qsos.len();
+            debug!(
+                batch_count = count,
+                total_count = result.total_count,
+                has_more = result.has_more,
+                "QRZ fetch result"
+            );
             all_qsos.extend(result.qsos);
 
             if count < MAX_FETCH_PER_REQUEST as usize || !result.has_more {
+                debug!(
+                    reason = if count < MAX_FETCH_PER_REQUEST as usize {
+                        "batch smaller than max"
+                    } else {
+                        "has_more=false"
+                    },
+                    "Stopping pagination"
+                );
                 break;
             }
 
@@ -228,7 +268,7 @@ impl QrzClient {
             .await?;
 
         let body = response.text().await?;
-        trace!(response_len = body.len(), response = %body, "QRZ fetch response received");
+        trace!(response_len = body.len(), "QRZ fetch response received");
         parse_fetch_response(&body)
     }
 }
@@ -307,14 +347,50 @@ fn format_field(name: &str, value: &str) -> String {
     format!("<{}:{}>{}", name, value.len(), value)
 }
 
+/// Decode HTML entities in a string
+fn html_decode(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
 /// Parse response key-value pairs
+/// Note: The ADIF field can contain & characters (as HTML entities &lt; etc)
+/// so we need to handle it specially - it's always the last field
 fn parse_response_pairs(body: &str) -> HashMap<&str, &str> {
-    body.split('&')
-        .filter_map(|pair| {
+    let mut result = HashMap::new();
+
+    // Check if there's an ADIF field - it needs special handling
+    if let Some(adif_pos) = body.find("ADIF=") {
+        // Parse everything before ADIF normally
+        let before_adif = &body[..adif_pos];
+        for pair in before_adif.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
             let mut parts = pair.splitn(2, '=');
-            Some((parts.next()?, parts.next().unwrap_or("")))
-        })
-        .collect()
+            if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                result.insert(key, value);
+            }
+        }
+
+        // The ADIF value is everything after "ADIF="
+        let adif_value = &body[adif_pos + 5..];
+        result.insert("ADIF", adif_value);
+    } else {
+        // No ADIF field, parse normally
+        for pair in body.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            if let (Some(key), value) = (parts.next(), parts.next()) {
+                result.insert(key, value.unwrap_or(""));
+            }
+        }
+    }
+
+    result
 }
 
 /// Parse QRZ API response for INSERT action
@@ -336,7 +412,7 @@ fn parse_upload_response(body: &str) -> Result<UploadResult> {
         let is_duplicate = reason.to_lowercase().contains("duplicate");
 
         if is_duplicate {
-            info!("QSO already exists in QRZ (duplicate)");
+            debug!("QSO already exists in QRZ (duplicate)");
         } else {
             warn!(error = %reason, "QRZ upload failed");
         }
@@ -397,13 +473,16 @@ fn parse_fetch_response(body: &str) -> Result<FetchResult> {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
-    // The ADIF field contains the QSO records (URL encoded)
+    // The ADIF field contains the QSO records (HTML and URL encoded)
     let adif_encoded = pairs.get("ADIF").unwrap_or(&"");
 
     // URL decode the ADIF data
-    let adif = urlencoding::decode(adif_encoded)
+    let adif_url_decoded = urlencoding::decode(adif_encoded)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| adif_encoded.to_string());
+
+    // HTML decode the ADIF data (QRZ returns HTML entities)
+    let adif = html_decode(&adif_url_decoded);
 
     if adif.is_empty() {
         return Ok(FetchResult {
@@ -426,10 +505,28 @@ fn parse_fetch_response(body: &str) -> Result<FetchResult> {
                 .other_fields
                 .remove("APP_QRZLOG_LOGID")
                 .and_then(|s| s.parse().ok());
-            let lotw_qsl_rcvd = qso.other_fields.remove("LOTW_QSL_RCVD");
-            let lotw_qsl_sent = qso.other_fields.remove("LOTW_QSL_SENT");
-            let qsl_rcvd = qso.other_fields.remove("QSL_RCVD");
-            let qsl_sent = qso.other_fields.remove("QSL_SENT");
+
+            // QRZ returns date fields (LOTW_QSLRDATE) instead of status fields (LOTW_QSL_RCVD)
+            // Check for status first, then fall back to date-based detection
+            let lotw_qsl_rcvd = qso
+                .other_fields
+                .remove("LOTW_QSL_RCVD")
+                .or_else(|| date_to_status(qso.other_fields.remove("LOTW_QSLRDATE")));
+            let lotw_qsl_sent = qso
+                .other_fields
+                .remove("LOTW_QSL_SENT")
+                .or_else(|| date_to_status(qso.other_fields.remove("LOTW_QSLSDATE")));
+            // For QSL confirmation, check QRZ's APP_QRZLOG_STATUS first (highest priority)
+            // "C" = Confirmed via QRZ logbook (both parties logged the QSO)
+            // This takes priority over standard QSL_RCVD because QRZ returns both fields
+            // (QSL_RCVD=N just means no paper QSL, but APP_QRZLOG_STATUS=C indicates QRZ matching)
+            let qsl_rcvd = qrz_status_to_confirmed(qso.other_fields.remove("APP_QRZLOG_STATUS"))
+                .or_else(|| qso.other_fields.remove("QSL_RCVD"))
+                .or_else(|| date_to_status(qso.other_fields.remove("QSLRDATE")));
+            let qsl_sent = qso
+                .other_fields
+                .remove("QSL_SENT")
+                .or_else(|| date_to_status(qso.other_fields.remove("QSLSDATE")));
 
             FetchedQso {
                 qso,

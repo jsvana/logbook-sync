@@ -261,12 +261,9 @@ impl Database {
     ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
 
-        // Normalize time to 6 digits
-        let time_normalized = if time_on.len() == 4 {
-            format!("{}00", time_on)
-        } else {
-            time_on.to_string()
-        };
+        // Extract just HHMM (first 4 chars) for matching
+        // QRZ returns 4-digit times but local DB may have 6-digit with seconds
+        let time_hhmm = &time_on[..4.min(time_on.len())];
 
         let rows = self.conn.execute(
             r#"
@@ -276,7 +273,9 @@ impl Database {
                 qsl_rcvd = COALESCE(?3, qsl_rcvd),
                 qsl_sent = COALESCE(?4, qsl_sent),
                 updated_at = ?5
-            WHERE call = ?6 AND qso_date = ?7 AND time_on = ?8 AND band = ?9 AND mode = ?10
+            WHERE call = ?6 AND qso_date = ?7
+              AND SUBSTR(time_on, 1, 4) = ?8
+              AND band = ?9 AND mode = ?10
             "#,
             params![
                 lotw_qsl_rcvd,
@@ -286,7 +285,7 @@ impl Database {
                 now,
                 call.to_uppercase(),
                 qso_date,
-                time_normalized,
+                time_hhmm,
                 band.to_lowercase(),
                 mode.to_uppercase(),
             ],
@@ -393,6 +392,32 @@ impl Database {
             params![key, value, now],
         )?;
         Ok(())
+    }
+
+    /// Insert a new QSO (convenience method)
+    pub fn insert_qso(&self, qso: &Qso) -> Result<i64> {
+        self.upsert_qso(qso, None)
+    }
+
+    /// Get all QSOs from the database
+    pub fn get_all_qsos(&self) -> Result<Vec<Qso>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT adif_record FROM qsos
+            ORDER BY qso_date, time_on
+            "#,
+        )?;
+
+        let qsos = stmt
+            .query_map([], |row| {
+                let json: String = row.get(0)?;
+                Ok(json)
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str::<Qso>(&json).ok())
+            .collect();
+
+        Ok(qsos)
     }
 
     /// Get statistics for status display

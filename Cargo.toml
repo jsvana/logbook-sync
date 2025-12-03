@@ -11,7 +11,7 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "cookies"] }
 
 # QRZ API client
 qrz-logbook-api = "0.1"

@@ -43,15 +43,56 @@ download = true   # QRZ → Local (confirmations)
 download_interval = 3600
 
 [pota]
-# Enable POTA integration (optional, not yet implemented)
+# Enable POTA export feature
 enabled = false
 
-# Directory for manual POTA exports
+# Output directory for POTA export files
+# Files are named: CALLSIGN@PARK-YYMMDD.adi
+# output_dir = "/home/user/ham-logs/pota-exports"
+
+# Directory for manual POTA imports (future feature)
 # import_dir = "/home/user/ham-logs/pota-imports"
 
-# Auto-import CSV exports when detected
+# Auto-import CSV exports when detected (future feature)
 auto_import_csv = false
+
+[wavelog]
+# Enable Wavelog integration (download from self-hosted Wavelog)
+enabled = false
+
+# Base URL of your Wavelog instance
+base_url = "https://log.example.com"
+
+# API key from Wavelog (Settings -> API Keys)
+api_key = "YOUR-WAVELOG-API-KEY"
+
+# Username and password for full ADIF export (recommended)
+# This allows downloading your complete log, not just recent 50 QSOs
+# username = "your-wavelog-username"
+# password = "your-wavelog-password"
+
+# Station ID to export from (find this in Wavelog's station profiles)
+# If not set, auto-detected from the export page
+# station_id = "1"
+
+# Public slug for your logbook (alternative: for recent_qsos endpoint, max 50 QSOs)
+# logbook_slug = "main-log"
+
+# Download check interval in seconds
+download_interval = 3600
+
+# Accept invalid/self-signed SSL certificates (for localhost or self-signed certs)
+# WARNING: Only enable this for trusted self-hosted instances
+accept_invalid_certs = false
 
 [database]
 # State database location
 path = "/var/lib/logbook-sync/state.db"
+
+# Config for sending notifications
+# See https://docs.ntfy.sh/
+[ntfy]
+enabled = true
+
+# Topic to send notifications to
+topic = "your-private-topic"

@@ -2,6 +2,7 @@
 
 use crate::adif::Qso;
 use crate::db::Database;
+use crate::ntfy::NtfyClient;
 use crate::qrz::{QrzClient, UploadResult};
 use crate::watcher::{process_adif_file, FileWatcher, ProcessResult, WatchEvent};
 use crate::{Config, Result};
@@ -49,6 +50,9 @@ pub struct SyncStats {
     pub qsos_uploaded: usize,
     pub qsos_upload_failed: usize,
     pub qsos_already_on_qrz: usize,
+    // Download stats
+    pub qsos_downloaded: usize,
+    pub confirmations_updated: usize,
 }
 
 impl SyncStats {
@@ -65,6 +69,7 @@ pub struct SyncService {
     config: Config,
     db: Arc<Database>,
     qrz_client: Option<QrzClient>,
+    ntfy_client: Option<NtfyClient>,
     retry_config: RetryConfig,
 }
 
@@ -80,11 +85,27 @@ impl SyncService {
             None
         };
 
+        let ntfy_client = config
+            .ntfy
+            .as_ref()
+            .filter(|c| c.enabled)
+            .map(|c| NtfyClient::new(c.clone()));
+
         Self {
             config,
             db: Arc::new(db),
             qrz_client,
+            ntfy_client,
             retry_config: RetryConfig::default(),
+        }
+    }
+
+    /// Send a notification about sync activity (if ntfy is configured)
+    async fn notify_sync(&self, stats: &SyncStats) {
+        if let Some(ref client) = self.ntfy_client {
+            if let Err(e) = client.notify_sync(stats, &self.config.general.callsign).await {
+                warn!(error = %e, "Failed to send ntfy notification");
+            }
         }
     }
 
@@ -214,7 +235,7 @@ impl SyncService {
                     } else if result.is_duplicate {
                         // Mark as synced since it exists on QRZ
                         self.db.mark_qrz_synced(db_id, 0)?;
-                        info!(
+                        debug!(
                             call = %qso.call,
                             date = %qso.qso_date,
                             "QSO already exists on QRZ (duplicate)"
@@ -255,6 +276,109 @@ impl SyncService {
         )))
     }
 
+    /// Download QSOs and confirmations from QRZ
+    pub async fn download_from_qrz(&self) -> Result<SyncStats> {
+        let mut stats = SyncStats::default();
+
+        let client = match &self.qrz_client {
+            Some(c) => c,
+            None => {
+                debug!("QRZ client not configured, skipping download");
+                return Ok(stats);
+            }
+        };
+
+        if !self.config.qrz.download {
+            debug!("QRZ download disabled");
+            return Ok(stats);
+        }
+
+        info!("Downloading QSOs from QRZ...");
+
+        match client.fetch_all().await {
+            Ok(fetched_qsos) => {
+                stats.qsos_downloaded = fetched_qsos.len();
+                debug!(count = stats.qsos_downloaded, "Downloaded QSOs from QRZ");
+
+                // Count confirmations available
+                let confirmed_count = fetched_qsos
+                    .iter()
+                    .filter(|q| {
+                        q.lotw_qsl_rcvd.as_deref() == Some("Y")
+                            || q.qsl_rcvd.as_deref() == Some("Y")
+                    })
+                    .count();
+                debug!(
+                    confirmed = confirmed_count,
+                    "QSOs with confirmations in download"
+                );
+
+                // Log first few QSOs for debugging
+                for (i, fetched) in fetched_qsos.iter().take(3).enumerate() {
+                    debug!(
+                        idx = i,
+                        call = %fetched.qso.call,
+                        date = %fetched.qso.qso_date,
+                        time = %fetched.qso.time_on,
+                        band = %fetched.qso.band,
+                        mode = %fetched.qso.mode,
+                        lotw_rcvd = ?fetched.lotw_qsl_rcvd,
+                        "Sample downloaded QSO"
+                    );
+                }
+
+                let mut matched = 0;
+                let mut unmatched_samples = 0;
+                for fetched in &fetched_qsos {
+                    let lotw_rcvd = fetched.lotw_qsl_rcvd.as_deref();
+                    let lotw_sent = fetched.lotw_qsl_sent.as_deref();
+                    let qsl_rcvd = fetched.qsl_rcvd.as_deref();
+                    let qsl_sent = fetched.qsl_sent.as_deref();
+
+                    if self.db.update_confirmation(
+                        &fetched.qso.call,
+                        &fetched.qso.qso_date,
+                        &fetched.qso.time_on,
+                        &fetched.qso.band,
+                        &fetched.qso.mode,
+                        lotw_rcvd,
+                        lotw_sent,
+                        qsl_rcvd,
+                        qsl_sent,
+                    )? {
+                        matched += 1;
+                        if lotw_rcvd == Some("Y") || qsl_rcvd == Some("Y") {
+                            stats.confirmations_updated += 1;
+                        }
+                    } else if unmatched_samples < 3 {
+                        // Log a few unmatched QSOs to help debug
+                        debug!(
+                            call = %fetched.qso.call,
+                            date = %fetched.qso.qso_date,
+                            time = %fetched.qso.time_on,
+                            band = %fetched.qso.band,
+                            mode = %fetched.qso.mode,
+                            "QSO from QRZ not found in local DB"
+                        );
+                        unmatched_samples += 1;
+                    }
+                }
+
+                info!(
+                    downloaded = stats.qsos_downloaded,
+                    matched = matched,
+                    confirmations = stats.confirmations_updated,
+                    "QRZ download complete"
+                );
+            }
+            Err(e) => {
+                error!(error = %e, "QRZ download failed");
+            }
+        }
+
+        Ok(stats)
+    }
+
     /// Run the daemon loop
     pub async fn run_daemon(self) -> Result<()> {
         info!(
@@ -272,9 +396,10 @@ impl SyncService {
                 "Processed existing files"
             );
 
-            // Upload any pending QSOs
-            if let Err(e) = self.upload_pending_to_qrz().await {
-                error!(error = %e, "Initial QRZ upload failed");
+            // Upload any pending QSOs and notify
+            match self.upload_pending_to_qrz().await {
+                Ok(stats) => self.notify_sync(&stats).await,
+                Err(e) => error!(error = %e, "Initial QRZ upload failed"),
             }
         }
 
@@ -311,9 +436,10 @@ impl SyncService {
                                             "New QSOs detected"
                                         );
 
-                                        // Trigger upload
-                                        if let Err(e) = self.upload_pending_to_qrz().await {
-                                            error!(error = %e, "Failed to upload to QRZ");
+                                        // Trigger upload and notify
+                                        match self.upload_pending_to_qrz().await {
+                                            Ok(stats) => self.notify_sync(&stats).await,
+                                            Err(e) => error!(error = %e, "Failed to upload to QRZ"),
                                         }
                                     }
                                 }
@@ -332,17 +458,20 @@ impl SyncService {
                 _ = sync_timer.tick() => {
                     debug!("Running periodic sync check");
 
-                    // Check for any unsynced QSOs
-                    if let Err(e) = self.upload_pending_to_qrz().await {
-                        error!(error = %e, "Periodic QRZ sync failed");
+                    // Check for any unsynced QSOs and notify
+                    match self.upload_pending_to_qrz().await {
+                        Ok(stats) => self.notify_sync(&stats).await,
+                        Err(e) => error!(error = %e, "Periodic QRZ sync failed"),
                     }
                 }
 
                 // Periodic QRZ download (for confirmations)
                 _ = download_timer.tick() => {
                     if self.config.qrz.download {
-                        debug!("QRZ download check (not yet implemented)");
-                        // TODO: Implement download of confirmations
+                        match self.download_from_qrz().await {
+                            Ok(stats) => self.notify_sync(&stats).await,
+                            Err(e) => error!(error = %e, "Periodic QRZ download failed"),
+                        }
                     }
                 }
 

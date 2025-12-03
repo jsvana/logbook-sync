@@ -1,3 +1,4 @@
+use crate::wavelog::WavelogConfig;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -8,7 +9,29 @@ pub struct Config {
     pub qrz: QrzConfig,
     #[serde(default)]
     pub pota: PotaConfig,
+    #[serde(default)]
+    pub wavelog: Option<WavelogConfig>,
+    #[serde(default)]
+    pub ntfy: Option<NtfyConfig>,
     pub database: DatabaseConfig,
+}
+
+/// Configuration for ntfy.sh notifications
+#[derive(Debug, Deserialize, Clone)]
+pub struct NtfyConfig {
+    /// Whether ntfy notifications are enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// The ntfy server URL (default: https://ntfy.sh)
+    #[serde(default = "default_ntfy_server")]
+    pub server: String,
+    /// The topic to publish to
+    pub topic: String,
+    /// Optional authentication token
+    pub token: Option<String>,
+    /// Priority level (1-5, default 3)
+    #[serde(default = "default_ntfy_priority")]
+    pub priority: u8,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -51,6 +74,9 @@ pub struct QrzConfig {
 pub struct PotaConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Directory for POTA export files
+    pub output_dir: Option<PathBuf>,
+    /// Directory for importing POTA CSV files (future feature)
     pub import_dir: Option<PathBuf>,
     #[serde(default)]
     pub auto_import_csv: bool,
@@ -87,6 +113,14 @@ fn default_user_agent() -> String {
 
 fn default_download_interval() -> u64 {
     3600
+}
+
+fn default_ntfy_server() -> String {
+    "https://ntfy.sh".to_string()
+}
+
+fn default_ntfy_priority() -> u8 {
+    3
 }
 
 impl Config {

@@ -23,5 +23,20 @@ download_interval = 3600
 [pota]
 enabled = false
 
+[wavelog]
+enabled = true
+base_url = "http://localhost:8086/"
+api_key = "wld8a0a38d59a16"
+download_interval = 3600
+accept_invalid_certs = true
+station_id = "1"
+username = "jsvana"
+password = "linked"
+
 [database]
 path = "/home/jsvana/projects/logbook-sync/test-state.db"
+
+[ntfy]
+enabled = true
+server = "https://ntfy.westpeninsulashould.works"
+topic = "qso_sync"

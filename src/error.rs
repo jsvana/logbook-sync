@@ -23,6 +23,9 @@ pub enum Error {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error("Ntfy notification error: {0}")]
+    Ntfy(String),
+
     #[error("{0}")]
     Other(String),
 }

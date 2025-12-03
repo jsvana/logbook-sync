@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use logbook_sync::db::Database;
 use logbook_sync::qrz::QrzClient;
-use logbook_sync::{Config, SyncService};
+use logbook_sync::{Config, PotaExporter, SyncService, WavelogClient};
 use std::path::PathBuf;
-use tracing::{error, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -45,8 +45,32 @@ enum Commands {
         file: PathBuf,
     },
 
-    /// Download logs from remote services
-    Download,
+    /// Download logs from remote services (QRZ or Wavelog)
+    Download {
+        /// Source to download from (qrz, wavelog)
+        #[arg(long, short, default_value = "qrz")]
+        source: String,
+    },
+
+    /// Export POTA activation logs
+    #[command(name = "pota-export")]
+    PotaExport {
+        /// Source of QSOs: "database" or path to ADIF file
+        #[arg(long, default_value = "database")]
+        source: String,
+
+        /// Output directory (overrides config)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+
+        /// Filter by date (YYYYMMDD)
+        #[arg(long)]
+        date: Option<String>,
+
+        /// Filter by park reference (e.g., US-3315)
+        #[arg(long)]
+        park: Option<String>,
+    },
 
     /// Validate configuration file
     Config {
@@ -87,7 +111,13 @@ async fn main() -> Result<()> {
         Commands::Sync => run_sync(config).await,
         Commands::Status => run_status(config).await,
         Commands::Upload { file } => run_upload(config, file).await,
-        Commands::Download => run_download(config).await,
+        Commands::Download { source } => run_download(config, &source).await,
+        Commands::PotaExport {
+            source,
+            output,
+            date,
+            park,
+        } => run_pota_export(config, &source, output, date, park).await,
         Commands::Config { validate } => run_config_check(config, validate),
         Commands::Watch => run_watch(config).await,
     }
@@ -129,6 +159,14 @@ async fn run_sync(config: Config) -> Result<()> {
     println!("  Uploaded:     {}", upload_stats.qsos_uploaded);
     println!("  Already exist:{}", upload_stats.qsos_already_on_qrz);
     println!("  Failed:       {}", upload_stats.qsos_upload_failed);
+
+    // Download from QRZ (confirmations)
+    println!("\nDownloading from QRZ...");
+    let download_stats = service.download_from_qrz().await?;
+
+    println!("QRZ Download:");
+    println!("  QSOs fetched:    {}", download_stats.qsos_downloaded);
+    println!("  Confirmations:   {}", download_stats.confirmations_updated);
 
     println!("\nSync complete!");
     Ok(())
@@ -189,9 +227,42 @@ async fn run_status(config: Config) -> Result<()> {
             Ok(status) => {
                 if let Some(count) = status.count {
                     println!("  Total QSOs:   {}", count);
+                    // Calculate potential downloads
+                    let local_synced = stats.synced_qrz;
+                    if count > local_synced {
+                        let potential = count - local_synced;
+                        println!(
+                            "  Available:    ~{} (QRZ has more than local synced)",
+                            potential
+                        );
+                    }
                 }
                 if let Some(confirmed) = status.confirmed {
                     println!("  Confirmed:    {}", confirmed);
+                    // Check for new confirmations
+                    let local_confirmed = stats.lotw_confirmed + stats.qsl_confirmed;
+                    if confirmed > local_confirmed {
+                        let diff = confirmed - local_confirmed;
+                        // If QRZ has more QSOs than local DB, the diff includes confirmations
+                        // for QSOs not in local DB - so we can't accurately show "new confirms"
+                        let local_synced = stats.synced_qrz;
+                        if let Some(count) = status.count {
+                            if local_synced >= count {
+                                // All QRZ QSOs are local, so all confirmations are actionable
+                                println!(
+                                    "  New confirms: ~{} (run 'download' to sync)",
+                                    diff
+                                );
+                            }
+                            // If local_synced < count, the diff includes non-local QSOs
+                            // so we don't show it (would be misleading)
+                        } else {
+                            println!(
+                                "  New confirms: ~{} (run 'download' to sync)",
+                                diff
+                            );
+                        }
+                    }
                 }
                 if let Some(dxcc) = status.dxcc {
                     println!("  DXCC:         {}", dxcc);
@@ -201,6 +272,91 @@ async fn run_status(config: Config) -> Result<()> {
                 println!("  Error: {}", e);
             }
         }
+    }
+
+    // Check Wavelog status if enabled
+    if let Some(ref wavelog_config) = config.wavelog {
+        if wavelog_config.enabled {
+            println!();
+            println!("Wavelog ({}):", wavelog_config.base_url);
+            match WavelogClient::new(wavelog_config.clone()) {
+                Ok(client) => {
+                    // Try to get station info
+                    match client.get_station_info().await {
+                        Ok(stations) => {
+                            println!("  Stations:     {}", stations.len());
+                            for station in &stations {
+                                println!(
+                                    "    - {} ({})",
+                                    station.station_callsign, station.station_profile_name
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("  Station info: Error - {}", e);
+                        }
+                    }
+
+                    // Try to get recent QSO count
+                    if wavelog_config.logbook_slug.is_some() {
+                        match client.get_recent_qsos(50).await {
+                            Ok(response) => {
+                                println!("  Recent QSOs:  {} available", response.count);
+                                if response.count > 0 {
+                                    // Check how many are new
+                                    let qsos: Vec<_> = response
+                                        .qsos
+                                        .into_iter()
+                                        .map(|wl| {
+                                            let qso: logbook_sync::adif::Qso = wl.into();
+                                            qso
+                                        })
+                                        .collect();
+                                    let mut new_count = 0;
+                                    for qso in &qsos {
+                                        if !db.qso_exists(qso).unwrap_or(true) {
+                                            new_count += 1;
+                                        }
+                                    }
+                                    if new_count > 0 {
+                                        println!(
+                                            "  New QSOs:     {} (run 'download -s wavelog' to sync)",
+                                            new_count
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("  Recent QSOs:  Error - {}", e);
+                            }
+                        }
+                    } else {
+                        println!("  Recent QSOs:  (logbook_slug not configured)");
+                    }
+                }
+                Err(e) => {
+                    println!("  Error: {}", e);
+                }
+            }
+        }
+    }
+
+    // POTA summary
+    let pota_qsos = db.get_all_qsos().unwrap_or_default();
+    let pota_count = pota_qsos
+        .iter()
+        .filter(|q| {
+            q.my_sig
+                .as_ref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("POTA"))
+                && q.my_sig_info.is_some()
+        })
+        .count();
+    if pota_count > 0 {
+        println!();
+        println!("POTA:");
+        println!("  Activation QSOs: {}", pota_count);
+        println!("  (run 'pota-export' to generate upload files)");
     }
 
     Ok(())
@@ -242,9 +398,22 @@ async fn run_upload(config: Config, file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn run_download(config: Config) -> Result<()> {
+async fn run_download(config: Config, source: &str) -> Result<()> {
     config.validate()?;
 
+    match source.to_lowercase().as_str() {
+        "qrz" => run_download_qrz(config).await,
+        "wavelog" => run_download_wavelog(config).await,
+        _ => {
+            anyhow::bail!(
+                "Unknown download source: {}. Use 'qrz' or 'wavelog'",
+                source
+            );
+        }
+    }
+}
+
+async fn run_download_qrz(config: Config) -> Result<()> {
     if !config.qrz.enabled || !config.qrz.download {
         println!("QRZ download is disabled");
         return Ok(());
@@ -318,6 +487,202 @@ async fn run_download(config: Config) -> Result<()> {
             println!("Download failed: {}", e);
         }
     }
+
+    Ok(())
+}
+
+async fn run_download_wavelog(config: Config) -> Result<()> {
+    let wavelog_config = config
+        .wavelog
+        .as_ref()
+        .filter(|w| w.enabled)
+        .ok_or_else(|| anyhow::anyhow!("Wavelog is not configured or not enabled"))?;
+
+    println!("Downloading from Wavelog...\n");
+    println!("  URL: {}", wavelog_config.base_url);
+
+    let client = WavelogClient::new(wavelog_config.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to create Wavelog client: {}", e))?;
+
+    // Get station info first
+    match client.get_station_info().await {
+        Ok(stations) => {
+            println!("\nStation Profiles:");
+            for station in &stations {
+                println!(
+                    "  {} ({}) - {}",
+                    station.station_callsign, station.station_id, station.station_profile_name
+                );
+            }
+        }
+        Err(e) => {
+            println!("  Warning: Could not fetch station info: {}", e);
+        }
+    }
+
+    // Download QSOs using the get_contacts_adif API
+    println!("\nDownloading QSOs via API...");
+
+    // TODO: Could store lastfetchedid in database for incremental sync
+    let fetch_from_id = 0; // 0 = get all QSOs
+
+    let adif_content = client
+        .download_adif(fetch_from_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("ADIF download failed: {}", e))?;
+
+    // Parse the ADIF content
+    use logbook_sync::adif::parse_adif;
+    let qsos: Vec<logbook_sync::adif::Qso> = if adif_content.contains("<EOH>")
+        || adif_content.contains("<eoh>")
+    {
+        let record = parse_adif(&adif_content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse ADIF: {}", e))?;
+        println!("Downloaded {} QSOs", record.qsos.len());
+        record.qsos
+    } else {
+        println!("No QSOs returned (empty ADIF)");
+        Vec::new()
+    };
+
+    if qsos.is_empty() {
+        println!("\nNo QSOs to download");
+        return Ok(());
+    }
+
+    // Save to database
+    let db = Database::open(&config.database.path)?;
+    let mut new_count = 0;
+    let mut dup_count = 0;
+
+    for qso in &qsos {
+        if db.qso_exists(qso)? {
+            dup_count += 1;
+        } else {
+            db.insert_qso(qso)?;
+            new_count += 1;
+        }
+    }
+
+    println!("\nResults:");
+    println!("  New QSOs:    {}", new_count);
+    println!("  Duplicates:  {}", dup_count);
+
+    // Save to ADIF file
+    if new_count > 0 {
+        use logbook_sync::adif::write_adif;
+
+        let adif_content = write_adif(None, &qsos);
+
+        let date_str = chrono::Utc::now().format("%Y%m%d").to_string();
+        let output_path = config
+            .local
+            .output_dir
+            .join(format!("wavelog_download_{}.adi", date_str));
+
+        std::fs::create_dir_all(&config.local.output_dir)?;
+        std::fs::write(&output_path, adif_content)?;
+        println!("  Saved to:    {}", output_path.display());
+    }
+
+    Ok(())
+}
+
+async fn run_pota_export(
+    config: Config,
+    source: &str,
+    output: Option<PathBuf>,
+    date_filter: Option<String>,
+    park_filter: Option<String>,
+) -> Result<()> {
+    use logbook_sync::adif::parse_adif;
+
+    // Determine output directory
+    let output_dir = output
+        .or_else(|| config.pota.output_dir.clone())
+        .unwrap_or_else(|| config.local.output_dir.join("pota"));
+
+    println!("POTA Export");
+    println!("===========");
+    println!("Output directory: {}", output_dir.display());
+
+    // Load QSOs from source
+    let qsos = match source.to_lowercase().as_str() {
+        "database" => {
+            println!("Source: local database");
+            let db = Database::open(&config.database.path)?;
+            db.get_all_qsos()?
+        }
+        path => {
+            // Treat as ADIF file path
+            let file_path = PathBuf::from(path);
+            if !file_path.exists() {
+                anyhow::bail!("ADIF file not found: {}", path);
+            }
+            println!("Source: {}", path);
+            let content = std::fs::read_to_string(&file_path)?;
+            let parsed = parse_adif(&content)?;
+            parsed.qsos
+        }
+    };
+
+    println!("Total QSOs loaded: {}", qsos.len());
+
+    // Apply filters
+    let filtered_qsos: Vec<_> = qsos
+        .into_iter()
+        .filter(|q| {
+            // Must be a POTA QSO
+            if !PotaExporter::is_pota_qso(q) {
+                return false;
+            }
+
+            // Date filter
+            if let Some(ref d) = date_filter {
+                let normalized = q.qso_date.replace('-', "");
+                let filter_normalized = d.replace('-', "");
+                if !normalized.starts_with(&filter_normalized) {
+                    return false;
+                }
+            }
+
+            // Park filter
+            if let Some(ref p) = park_filter {
+                if let Some(ref qp) = q.my_sig_info {
+                    if !qp.eq_ignore_ascii_case(p) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .collect();
+
+    let pota_count = filtered_qsos.len();
+    println!("POTA QSOs to export: {}", pota_count);
+
+    if pota_count == 0 {
+        println!("\nNo POTA QSOs found matching the criteria.");
+        return Ok(());
+    }
+
+    // Export
+    let exporter = PotaExporter::new(output_dir, config.general.callsign.clone());
+    let files = exporter.export(&filtered_qsos)?;
+
+    println!("\nCreated {} POTA export file(s):", files.len());
+    for f in &files {
+        println!("  {}", f.display());
+    }
+
+    info!(
+        files = files.len(),
+        qsos = pota_count,
+        "POTA export complete"
+    );
 
     Ok(())
 }
