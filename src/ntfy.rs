@@ -70,14 +70,14 @@ impl NtfyClient {
     }
 
     /// Send a sync summary notification based on stats
-    /// Only sends if there was actual activity (uploads, downloads, or confirmations)
+    /// Only sends if there was actual new activity (uploads, new downloads, or confirmations)
     pub async fn notify_sync(&self, stats: &SyncStats, callsign: &str) -> Result<()> {
-        // Only send if there was actual activity
+        // Only send if there was actual new activity (not just re-downloading existing QSOs)
         if stats.qsos_uploaded == 0
-            && stats.qsos_downloaded == 0
+            && stats.qsos_downloaded_new == 0
             && stats.confirmations_updated == 0
         {
-            debug!("No sync activity, skipping ntfy notification");
+            debug!("No new sync activity, skipping ntfy notification");
             return Ok(());
         }
 
@@ -93,11 +93,15 @@ impl NtfyClient {
             ));
         }
 
-        if stats.qsos_downloaded > 0 {
+        if stats.qsos_downloaded_new > 0 {
             parts.push(format!(
-                "Downloaded {} QSO{}",
-                stats.qsos_downloaded,
-                if stats.qsos_downloaded == 1 { "" } else { "s" }
+                "Downloaded {} new QSO{}",
+                stats.qsos_downloaded_new,
+                if stats.qsos_downloaded_new == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ));
         }
 
@@ -302,7 +306,7 @@ mod tests {
     fn test_sync_notification_message() {
         let stats = SyncStats {
             qsos_uploaded: 5,
-            qsos_downloaded: 10,
+            qsos_downloaded_new: 10,
             confirmations_updated: 3,
             qsos_already_on_qrz: 2,
             ..Default::default()
@@ -312,8 +316,8 @@ mod tests {
         if stats.qsos_uploaded > 0 {
             parts.push(format!("Uploaded {} QSOs", stats.qsos_uploaded));
         }
-        if stats.qsos_downloaded > 0 {
-            parts.push(format!("Downloaded {} QSOs", stats.qsos_downloaded));
+        if stats.qsos_downloaded_new > 0 {
+            parts.push(format!("Downloaded {} new QSOs", stats.qsos_downloaded_new));
         }
         if stats.confirmations_updated > 0 {
             parts.push(format!("{} new confirmations", stats.confirmations_updated));
@@ -322,7 +326,7 @@ mod tests {
         let message = parts.join(", ");
         assert_eq!(
             message,
-            "Uploaded 5 QSOs, Downloaded 10 QSOs, 3 new confirmations"
+            "Uploaded 5 QSOs, Downloaded 10 new QSOs, 3 new confirmations"
         );
     }
 
@@ -330,7 +334,7 @@ mod tests {
     fn test_no_activity_skips_notification() {
         let stats = SyncStats::default();
         assert_eq!(stats.qsos_uploaded, 0);
-        assert_eq!(stats.qsos_downloaded, 0);
+        assert_eq!(stats.qsos_downloaded_new, 0);
         assert_eq!(stats.confirmations_updated, 0);
     }
 }

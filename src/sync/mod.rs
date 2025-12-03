@@ -59,6 +59,8 @@ pub struct SyncStats {
     pub qsos_already_on_qrz: usize,
     // Download stats
     pub qsos_downloaded: usize,
+    /// New QSOs from download (not already in database)
+    pub qsos_downloaded_new: usize,
     pub confirmations_updated: usize,
 }
 
