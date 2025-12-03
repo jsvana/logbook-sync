@@ -39,6 +39,9 @@ enum Commands {
     /// Show sync status and statistics
     Status,
 
+    /// Show QSO statistics by source and date
+    Stats,
+
     /// Manually upload specific ADIF file
     Upload {
         /// Path to ADIF file
@@ -110,6 +113,7 @@ async fn main() -> Result<()> {
         Commands::Daemon => run_daemon(config).await,
         Commands::Sync => run_sync(config).await,
         Commands::Status => run_status(config).await,
+        Commands::Stats => run_stats(config),
         Commands::Upload { file } => run_upload(config, file).await,
         Commands::Download { source } => run_download(config, &source).await,
         Commands::PotaExport {
@@ -359,6 +363,53 @@ async fn run_status(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn run_stats(config: Config) -> Result<()> {
+    let db = Database::open(&config.database.path)?;
+
+    let total = db.get_total_qso_count()?;
+    let sources = db.get_source_statistics()?;
+
+    println!("QSO Statistics");
+    println!("==============\n");
+
+    println!("Total QSOs: {}\n", total);
+
+    // Source table
+    println!("By Source:");
+    println!("{:-<30}", "");
+    println!("{:<15} {:>10}", "Source", "Count");
+    println!("{:-<30}", "");
+    for (source, count) in &sources {
+        println!("{:<15} {:>10}", source, count);
+    }
+    println!("{:-<30}", "");
+
+    // Recent dates table for each source
+    for (source, _) in &sources {
+        let recent_dates = db.get_recent_date_statistics_by_source(source, 10)?;
+        if recent_dates.is_empty() {
+            continue;
+        }
+
+        println!("\nLatest 10 Dates ({}):", source);
+        println!("{:-<30}", "");
+        println!("{:<15} {:>10}", "Date", "QSOs");
+        println!("{:-<30}", "");
+        for (date, count) in &recent_dates {
+            // Format date from YYYYMMDD to YYYY-MM-DD
+            let formatted = if date.len() == 8 {
+                format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8])
+            } else {
+                date.clone()
+            };
+            println!("{:<15} {:>10}", formatted, count);
+        }
+        println!("{:-<30}", "");
+    }
+
+    Ok(())
+}
+
 async fn run_upload(config: Config, file: PathBuf) -> Result<()> {
     config.validate()?;
 
@@ -401,9 +452,11 @@ async fn run_download(config: Config, source: &str) -> Result<()> {
     match source.to_lowercase().as_str() {
         "qrz" => run_download_qrz(config).await,
         "wavelog" => run_download_wavelog(config).await,
+        "lotw" => run_download_lotw(config).await,
+        "eqsl" => run_download_eqsl(config).await,
         _ => {
             anyhow::bail!(
-                "Unknown download source: {}. Use 'qrz' or 'wavelog'",
+                "Unknown download source: {}. Use 'qrz', 'wavelog', 'lotw', or 'eqsl'",
                 source
             );
         }
@@ -411,6 +464,8 @@ async fn run_download(config: Config, source: &str) -> Result<()> {
 }
 
 async fn run_download_qrz(config: Config) -> Result<()> {
+    use logbook_sync::qso_source;
+
     if !config.qrz.enabled || !config.qrz.download {
         println!("QRZ download is disabled");
         return Ok(());
@@ -429,10 +484,18 @@ async fn run_download_qrz(config: Config) -> Result<()> {
             println!("Downloaded {} QSOs", fetched_qsos.len());
             let result_qsos = fetched_qsos;
 
+            let mut new_count = 0;
             let mut updated = 0;
             let mut new_confirmations = 0;
 
             for fetched in &result_qsos {
+                // Check if QSO exists locally
+                if !db.qso_exists(&fetched.qso)? {
+                    // Insert new QSO from QRZ
+                    db.insert_qso_with_source(&fetched.qso, qso_source::QRZ, None)?;
+                    new_count += 1;
+                }
+
                 // Update confirmation status in local database
                 let lotw_rcvd = fetched.lotw_qsl_rcvd.as_deref();
                 let lotw_sent = fetched.lotw_qsl_sent.as_deref();
@@ -458,7 +521,8 @@ async fn run_download_qrz(config: Config) -> Result<()> {
             }
 
             println!("\nResults:");
-            println!("  QSOs matched:     {}", updated);
+            println!("  New QSOs:         {}", new_count);
+            println!("  QSOs updated:     {}", updated);
             println!("  Confirmations:    {}", new_confirmations);
 
             // Optionally save to ADIF file
@@ -489,6 +553,8 @@ async fn run_download_qrz(config: Config) -> Result<()> {
 }
 
 async fn run_download_wavelog(config: Config) -> Result<()> {
+    use logbook_sync::qso_source;
+
     let wavelog_config = config
         .wavelog
         .as_ref()
@@ -517,22 +583,33 @@ async fn run_download_wavelog(config: Config) -> Result<()> {
         }
     }
 
+    // Open database
+    let db = Database::open(&config.database.path)?;
+
+    // Get last fetched ID for incremental sync
+    let fetch_from_id = db.get_wavelog_last_fetched_id()?;
+
     // Download QSOs using the get_contacts_adif API
     println!("\nDownloading QSOs via API...");
+    if fetch_from_id > 0 {
+        println!("  Incremental sync from ID: {}", fetch_from_id);
+    } else {
+        println!("  Full sync (fetching all QSOs)");
+    }
 
-    // TODO: Could store lastfetchedid in database for incremental sync
-    let fetch_from_id = 0; // 0 = get all QSOs
-
-    let adif_content = client
-        .download_adif(fetch_from_id)
+    let api_response = client
+        .get_contacts_adif(fetch_from_id)
         .await
         .map_err(|e| anyhow::anyhow!("ADIF download failed: {}", e))?;
+
+    let adif_content = &api_response.adif;
+    let new_last_fetched_id = api_response.lastfetchedid;
 
     // Parse the ADIF content
     use logbook_sync::adif::parse_adif;
     let qsos: Vec<logbook_sync::adif::Qso> =
         if adif_content.contains("<EOH>") || adif_content.contains("<eoh>") {
-            let record = parse_adif(&adif_content)
+            let record = parse_adif(adif_content)
                 .map_err(|e| anyhow::anyhow!("Failed to parse ADIF: {}", e))?;
             println!("Downloaded {} QSOs", record.qsos.len());
             record.qsos
@@ -542,12 +619,15 @@ async fn run_download_wavelog(config: Config) -> Result<()> {
         };
 
     if qsos.is_empty() {
-        println!("\nNo QSOs to download");
+        println!("\nNo new QSOs to download");
+        // Still update the last fetched ID
+        if new_last_fetched_id > fetch_from_id {
+            db.set_wavelog_last_fetched_id(new_last_fetched_id)?;
+        }
         return Ok(());
     }
 
-    // Save to database
-    let db = Database::open(&config.database.path)?;
+    // Save to database with source tracking
     let mut new_count = 0;
     let mut dup_count = 0;
 
@@ -555,14 +635,18 @@ async fn run_download_wavelog(config: Config) -> Result<()> {
         if db.qso_exists(qso)? {
             dup_count += 1;
         } else {
-            db.insert_qso(qso)?;
+            db.insert_qso_with_source(qso, qso_source::WAVELOG, None)?;
             new_count += 1;
         }
     }
 
+    // Update the last fetched ID for next incremental sync
+    db.set_wavelog_last_fetched_id(new_last_fetched_id)?;
+
     println!("\nResults:");
-    println!("  New QSOs:    {}", new_count);
-    println!("  Duplicates:  {}", dup_count);
+    println!("  New QSOs:         {}", new_count);
+    println!("  Duplicates:       {}", dup_count);
+    println!("  Last fetched ID:  {}", new_last_fetched_id);
 
     // Save to ADIF file
     if new_count > 0 {
@@ -578,7 +662,202 @@ async fn run_download_wavelog(config: Config) -> Result<()> {
 
         std::fs::create_dir_all(&config.local.output_dir)?;
         std::fs::write(&output_path, adif_content)?;
-        println!("  Saved to:    {}", output_path.display());
+        println!("  Saved to:         {}", output_path.display());
+    }
+
+    Ok(())
+}
+
+async fn run_download_lotw(config: Config) -> Result<()> {
+    use logbook_sync::qso_source;
+    use logbook_sync::LotwClient;
+
+    let lotw_config = config
+        .lotw
+        .as_ref()
+        .filter(|l| l.enabled && l.download)
+        .ok_or_else(|| {
+            anyhow::anyhow!("LoTW is not configured, not enabled, or download is disabled")
+        })?;
+
+    println!("Downloading confirmations from LoTW...\n");
+
+    let client = LotwClient::new(lotw_config.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to create LoTW client: {}", e))?;
+
+    // Open database to get last download date
+    let db = Database::open(&config.database.path)?;
+
+    // Get last download date from sync state
+    let since_date = db.get_sync_state("lotw_last_download")?;
+    if let Some(ref date) = since_date {
+        println!("  Fetching confirmations since: {}", date);
+    } else {
+        println!("  Fetching all confirmations (first sync)");
+    }
+
+    let confirmations = client
+        .download_confirmations(since_date.as_deref())
+        .await
+        .map_err(|e| anyhow::anyhow!("LoTW download failed: {}", e))?;
+
+    println!("\nDownloaded {} confirmation(s)", confirmations.len());
+
+    if confirmations.is_empty() {
+        println!("No new confirmations from LoTW");
+        return Ok(());
+    }
+
+    // Update confirmation status in local database
+    let mut updated_count = 0;
+    let mut new_count = 0;
+
+    for conf in &confirmations {
+        // Try to update existing QSO confirmation status
+        let updated = db.update_confirmation(
+            &conf.qso.call,
+            &conf.qso.qso_date,
+            &conf.qso.time_on,
+            &conf.qso.band,
+            &conf.qso.mode,
+            Some("Y"), // lotw_qsl_rcvd
+            None,      // lotw_qsl_sent
+            None,      // qsl_rcvd
+            None,      // qsl_sent
+        )?;
+
+        if updated {
+            updated_count += 1;
+        } else {
+            // QSO doesn't exist locally, insert it with source tracking
+            db.insert_qso_with_source(&conf.qso, qso_source::LOTW, None)?;
+            new_count += 1;
+        }
+    }
+
+    // Update the last download date
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    db.set_sync_state("lotw_last_download", &today)?;
+
+    println!("\nResults:");
+    println!("  Confirmations updated: {}", updated_count);
+    println!("  New QSOs imported:     {}", new_count);
+    println!("  Last sync date saved:  {}", today);
+
+    // Save to ADIF file if there are new confirmations
+    if !confirmations.is_empty() {
+        use logbook_sync::adif::write_adif;
+
+        let qsos: Vec<_> = confirmations.iter().map(|c| c.qso.clone()).collect();
+        let adif_content = write_adif(None, &qsos);
+
+        let date_str = chrono::Utc::now().format("%Y%m%d").to_string();
+        let output_path = config
+            .local
+            .output_dir
+            .join(format!("lotw_confirmations_{}.adi", date_str));
+
+        std::fs::create_dir_all(&config.local.output_dir)?;
+        std::fs::write(&output_path, adif_content)?;
+        println!("  Saved to:              {}", output_path.display());
+    }
+
+    Ok(())
+}
+
+async fn run_download_eqsl(config: Config) -> Result<()> {
+    use logbook_sync::qso_source;
+    use logbook_sync::EqslClient;
+
+    let eqsl_config = config
+        .eqsl
+        .as_ref()
+        .filter(|e| e.enabled && e.download)
+        .ok_or_else(|| {
+            anyhow::anyhow!("eQSL is not configured, not enabled, or download is disabled")
+        })?;
+
+    println!("Downloading confirmations from eQSL...\n");
+    println!("  Note: Full confirmation download requires AG membership");
+
+    let client = EqslClient::new(eqsl_config.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to create eQSL client: {}", e))?;
+
+    // Open database
+    let db = Database::open(&config.database.path)?;
+
+    // Get last download date from sync state
+    let since_date = db.get_sync_state("eqsl_last_download")?;
+    if let Some(ref date) = since_date {
+        println!("  Fetching confirmations since: {}", date);
+    } else {
+        println!("  Fetching all confirmations (first sync)");
+    }
+
+    let confirmations = client
+        .download_confirmations(since_date.as_deref())
+        .await
+        .map_err(|e| anyhow::anyhow!("eQSL download failed: {}", e))?;
+
+    println!("\nDownloaded {} confirmation(s)", confirmations.len());
+
+    if confirmations.is_empty() {
+        println!("No new confirmations from eQSL");
+        return Ok(());
+    }
+
+    // Update confirmation status in local database
+    let mut updated_count = 0;
+    let mut new_count = 0;
+
+    for conf in &confirmations {
+        // Try to update existing QSO confirmation status
+        let updated = db.update_confirmation(
+            &conf.qso.call,
+            &conf.qso.qso_date,
+            &conf.qso.time_on,
+            &conf.qso.band,
+            &conf.qso.mode,
+            None,      // lotw_qsl_rcvd
+            None,      // lotw_qsl_sent
+            Some("Y"), // qsl_rcvd (eQSL uses this field)
+            None,      // qsl_sent
+        )?;
+
+        if updated {
+            updated_count += 1;
+        } else {
+            // QSO doesn't exist locally, insert it with source tracking
+            db.insert_qso_with_source(&conf.qso, qso_source::EQSL, None)?;
+            new_count += 1;
+        }
+    }
+
+    // Update the last download date
+    let today = chrono::Utc::now().format("%Y%m%d").to_string();
+    db.set_sync_state("eqsl_last_download", &today)?;
+
+    println!("\nResults:");
+    println!("  Confirmations updated: {}", updated_count);
+    println!("  New QSOs imported:     {}", new_count);
+    println!("  Last sync date saved:  {}", today);
+
+    // Save to ADIF file if there are new confirmations
+    if !confirmations.is_empty() {
+        use logbook_sync::adif::write_adif;
+
+        let qsos: Vec<_> = confirmations.iter().map(|c| c.qso.clone()).collect();
+        let adif_content = write_adif(None, &qsos);
+
+        let date_str = chrono::Utc::now().format("%Y%m%d").to_string();
+        let output_path = config
+            .local
+            .output_dir
+            .join(format!("eqsl_confirmations_{}.adi", date_str));
+
+        std::fs::create_dir_all(&config.local.output_dir)?;
+        std::fs::write(&output_path, adif_content)?;
+        println!("  Saved to:              {}", output_path.display());
     }
 
     Ok(())

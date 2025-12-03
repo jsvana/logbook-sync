@@ -1,7 +1,11 @@
 pub mod adif;
+pub mod clublog;
 pub mod config;
 pub mod db;
+pub mod eqsl;
 pub mod error;
+pub mod hrdlog;
+pub mod lotw;
 pub mod ntfy;
 pub mod pota;
 pub mod qrz;
@@ -9,8 +13,13 @@ pub mod sync;
 pub mod watcher;
 pub mod wavelog;
 
-pub use config::{Config, NtfyConfig};
+pub use clublog::ClublogClient;
+pub use config::{ClublogConfig, Config, EqslConfig, HrdlogConfig, LotwConfig, NtfyConfig};
+pub use db::qso_source;
+pub use eqsl::EqslClient;
 pub use error::{Error, Result};
+pub use hrdlog::HrdlogClient;
+pub use lotw::LotwClient;
 pub use ntfy::NtfyClient;
 pub use pota::PotaExporter;
 pub use sync::SyncService;

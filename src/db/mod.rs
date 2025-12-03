@@ -30,6 +30,21 @@ pub struct StoredQso {
     pub created_at: String,
     pub updated_at: String,
     pub adif_record: String,
+    /// Source of this QSO: 'local', 'qrz', 'wavelog', 'lotw', etc.
+    pub source: Option<String>,
+    /// External system's ID for this QSO (e.g., QRZ logid, Wavelog ID)
+    pub source_id: Option<String>,
+}
+
+/// Known QSO sources
+pub mod qso_source {
+    pub const LOCAL: &str = "local";
+    pub const QRZ: &str = "qrz";
+    pub const WAVELOG: &str = "wavelog";
+    pub const LOTW: &str = "lotw";
+    pub const EQSL: &str = "eqsl";
+    pub const CLUBLOG: &str = "clublog";
+    pub const HRDLOG: &str = "hrdlog";
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +77,7 @@ impl Database {
         let conn = Connection::open_in_memory()?;
         let db = Database { conn };
         db.initialize()?;
+        db.migrate()?;
         Ok(db)
     }
 
@@ -132,9 +148,25 @@ impl Database {
             )?;
         }
 
+        // Add source tracking columns (migration v2)
+        if !columns.contains(&"source".to_string()) {
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE qsos ADD COLUMN source TEXT DEFAULT 'local';
+                ALTER TABLE qsos ADD COLUMN source_id TEXT;
+                "#,
+            )?;
+        }
+
         // Create index on lotw_qsl_rcvd (after migration ensures column exists)
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_qsos_lotw ON qsos(lotw_qsl_rcvd)",
+            [],
+        )?;
+
+        // Create index on source for filtering by origin
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_qsos_source ON qsos(source)",
             [],
         )?;
 
@@ -143,6 +175,17 @@ impl Database {
 
     /// Insert or update a QSO record
     pub fn upsert_qso(&self, qso: &Qso, source_file: Option<&str>) -> Result<i64> {
+        self.upsert_qso_with_source(qso, source_file, qso_source::LOCAL, None)
+    }
+
+    /// Insert or update a QSO record with source tracking
+    pub fn upsert_qso_with_source(
+        &self,
+        qso: &Qso,
+        source_file: Option<&str>,
+        source: &str,
+        source_id: Option<&str>,
+    ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let adif_json = serde_json::to_string(qso).map_err(|e| Error::Other(e.to_string()))?;
         let source_hash = compute_hash(&adif_json);
@@ -151,13 +194,15 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO qsos (call, qso_date, time_on, band, mode, source_file, source_hash,
-                              created_at, updated_at, adif_record)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
+                              created_at, updated_at, adif_record, source, source_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11)
             ON CONFLICT(call, qso_date, time_on, band, mode) DO UPDATE SET
                 source_file = COALESCE(excluded.source_file, source_file),
                 source_hash = excluded.source_hash,
                 updated_at = excluded.updated_at,
-                adif_record = excluded.adif_record
+                adif_record = excluded.adif_record,
+                source = COALESCE(excluded.source, source),
+                source_id = COALESCE(excluded.source_id, source_id)
             "#,
             params![
                 qso.call.to_uppercase(),
@@ -169,6 +214,8 @@ impl Database {
                 source_hash,
                 now,
                 adif_json,
+                source,
+                source_id,
             ],
         )?;
 
@@ -200,7 +247,7 @@ impl Database {
             r#"
             SELECT id, call, qso_date, time_on, band, mode, source_file, source_hash,
                    qrz_logid, qrz_synced_at, lotw_qsl_rcvd, lotw_qsl_sent, qsl_rcvd, qsl_sent,
-                   pota_synced, created_at, updated_at, adif_record
+                   pota_synced, created_at, updated_at, adif_record, source, source_id
             FROM qsos
             WHERE qrz_synced_at IS NULL
             ORDER BY qso_date, time_on
@@ -228,6 +275,8 @@ impl Database {
                     created_at: row.get(15)?,
                     updated_at: row.get(16)?,
                     adif_record: row.get(17)?,
+                    source: row.get(18)?,
+                    source_id: row.get(19)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -300,7 +349,7 @@ impl Database {
             r#"
             SELECT id, call, qso_date, time_on, band, mode, source_file, source_hash,
                    qrz_logid, qrz_synced_at, lotw_qsl_rcvd, lotw_qsl_sent, qsl_rcvd, qsl_sent,
-                   pota_synced, created_at, updated_at, adif_record
+                   pota_synced, created_at, updated_at, adif_record, source, source_id
             FROM qsos
             WHERE lotw_qsl_rcvd = 'Y'
             ORDER BY qso_date DESC, time_on DESC
@@ -328,6 +377,8 @@ impl Database {
                     created_at: row.get(15)?,
                     updated_at: row.get(16)?,
                     adif_record: row.get(17)?,
+                    source: row.get(18)?,
+                    source_id: row.get(19)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -394,9 +445,141 @@ impl Database {
         Ok(())
     }
 
+    /// Get Wavelog last fetched ID for incremental sync
+    pub fn get_wavelog_last_fetched_id(&self) -> Result<i64> {
+        Ok(self
+            .get_sync_state("wavelog_last_fetched_id")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Set Wavelog last fetched ID for incremental sync
+    pub fn set_wavelog_last_fetched_id(&self, id: i64) -> Result<()> {
+        self.set_sync_state("wavelog_last_fetched_id", &id.to_string())
+    }
+
+    /// Get QSOs by source (for filtering/querying)
+    pub fn get_qsos_by_source(&self, source: &str) -> Result<Vec<Qso>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT adif_record FROM qsos
+            WHERE source = ?1
+            ORDER BY qso_date, time_on
+            "#,
+        )?;
+
+        let qsos = stmt
+            .query_map([source], |row| {
+                let json: String = row.get(0)?;
+                Ok(json)
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str::<Qso>(&json).ok())
+            .collect();
+
+        Ok(qsos)
+    }
+
+    /// Count QSOs by source
+    pub fn count_qsos_by_source(&self, source: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM qsos WHERE source = ?1",
+            [source],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get statistics grouped by source
+    pub fn get_source_statistics(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT COALESCE(source, 'unknown') as src, COUNT(*) as count
+            FROM qsos
+            GROUP BY src
+            ORDER BY count DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Get QSO counts for the most recent dates
+    pub fn get_recent_date_statistics(&self, limit: usize) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT qso_date, COUNT(*) as count
+            FROM qsos
+            GROUP BY qso_date
+            ORDER BY qso_date DESC
+            LIMIT ?1
+            "#,
+        )?;
+
+        let rows = stmt.query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Get QSO counts for the most recent dates, grouped by source
+    pub fn get_recent_date_statistics_by_source(
+        &self,
+        source: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT qso_date, COUNT(*) as count
+            FROM qsos
+            WHERE source = ?1
+            GROUP BY qso_date
+            ORDER BY qso_date DESC
+            LIMIT ?2
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![source, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Get total QSO count
+    pub fn get_total_qso_count(&self) -> Result<i64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM qsos", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
     /// Insert a new QSO (convenience method)
     pub fn insert_qso(&self, qso: &Qso) -> Result<i64> {
         self.upsert_qso(qso, None)
+    }
+
+    /// Insert a new QSO with source tracking (convenience method)
+    pub fn insert_qso_with_source(
+        &self,
+        qso: &Qso,
+        source: &str,
+        source_id: Option<&str>,
+    ) -> Result<i64> {
+        self.upsert_qso_with_source(qso, None, source, source_id)
     }
 
     /// Get all QSOs from the database

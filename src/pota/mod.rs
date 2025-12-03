@@ -6,7 +6,7 @@
 use chrono::NaiveDate;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::info;
 
 use crate::adif::Qso;
@@ -46,20 +46,24 @@ impl PotaExporter {
 
     /// Check if a QSO is a POTA activation QSO
     pub fn is_pota_qso(qso: &Qso) -> bool {
-        qso.is_pota() && qso.my_sig_info.as_ref().is_some_and(|s| !s.is_empty())
+        qso.is_pota() && qso.get_pota_ref().is_some()
     }
 
     /// Extract the park reference from a QSO
     pub fn get_park_ref(qso: &Qso) -> Option<&str> {
-        qso.my_sig_info.as_deref()
+        qso.get_pota_ref()
     }
 
-    /// Group QSOs by UTC date and park reference
+    /// Group QSOs by UTC date and park reference, deduplicating by call/date/time/band/mode
     pub fn group_qsos<'a>(
         &self,
         qsos: impl Iterator<Item = &'a Qso>,
     ) -> HashMap<PotaGroupKey, Vec<&'a Qso>> {
+        use std::collections::HashSet;
+
         let mut groups: HashMap<PotaGroupKey, Vec<&Qso>> = HashMap::new();
+        // Track seen QSOs globally to avoid duplicates across all groups
+        let mut seen: HashSet<String> = HashSet::new();
 
         for qso in qsos {
             if !Self::is_pota_qso(qso) {
@@ -80,6 +84,13 @@ impl PotaExporter {
                 Some(d) => d,
                 None => continue,
             };
+
+            // Deduplicate by call/date/time/band/mode within each park/date group
+            let dedup_key = format!("{}:{}", park_ref, qso.dedup_key());
+            if seen.contains(&dedup_key) {
+                continue;
+            }
+            seen.insert(dedup_key);
 
             let key = PotaGroupKey { date, park_ref };
             groups.entry(key).or_default().push(qso);
@@ -109,7 +120,7 @@ impl PotaExporter {
             let filepath = self.output_dir.join(&filename);
 
             // Generate ADIF content
-            let adif = self.generate_pota_adif(&group_qsos);
+            let adif = self.generate_pota_adif(&group_qsos, callsign, &key.park_ref, &key.date);
 
             // Write to file
             fs::write(&filepath, adif)?;
@@ -128,31 +139,23 @@ impl PotaExporter {
         Ok(created_files)
     }
 
-    /// Export QSOs to a single POTA ADIF file at the specified path
-    pub fn export_to_file(&self, qsos: &[Qso], output_path: &Path) -> Result<usize> {
-        let pota_qsos: Vec<&Qso> = qsos.iter().filter(|q| Self::is_pota_qso(q)).collect();
-
-        if pota_qsos.is_empty() {
-            return Ok(0);
-        }
-
-        // Ensure parent directory exists
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let adif = self.generate_pota_adif(&pota_qsos);
-        fs::write(output_path, adif)?;
-
-        Ok(pota_qsos.len())
-    }
-
     /// Generate POTA-compliant ADIF content
-    fn generate_pota_adif(&self, qsos: &[&Qso]) -> String {
+    fn generate_pota_adif(
+        &self,
+        qsos: &[&Qso],
+        activator: &str,
+        park: &str,
+        date: &NaiveDate,
+    ) -> String {
         let mut output = String::new();
 
-        // Header
-        output.push_str("POTA Export from logbook-sync\n");
+        // Header with activator, park, and date
+        let date_str = date.format("%Y-%m-%d").to_string();
+        output.push_str(&format!(
+            "ADIF for {}: POTA {} on {}\n",
+            activator, park, date_str
+        ));
+        output.push_str(&format_field("ADIF_VER", "3.1.5"));
         output.push_str(&format_field("PROGRAMID", "logbook-sync"));
         output.push_str(&format_field("PROGRAMVERSION", env!("CARGO_PKG_VERSION")));
 
@@ -162,7 +165,7 @@ impl PotaExporter {
 
         // QSO records
         for qso in qsos {
-            output.push_str(&self.format_qso_record(qso));
+            output.push_str(&self.format_qso_record(qso, park));
             output.push('\n');
         }
 
@@ -170,56 +173,115 @@ impl PotaExporter {
     }
 
     /// Format a single QSO record for POTA ADIF
-    fn format_qso_record(&self, qso: &Qso) -> String {
+    /// Field order follows Ham2K Portable Logger format for compatibility
+    /// The park parameter ensures MY_SIG, MY_SIG_INFO, MY_POTA_REF, and QSLMSG are always present
+    fn format_qso_record(&self, qso: &Qso, park: &str) -> String {
         let mut record = String::new();
 
-        // Required fields
-        if let Some(ref v) = qso.station_callsign {
-            record.push_str(&format_field("STATION_CALLSIGN", v));
-        }
+        // Core QSO fields
         record.push_str(&format_field("CALL", &qso.call));
-        record.push_str(&format_field("QSO_DATE", &qso.qso_date));
-        record.push_str(&format_field("TIME_ON", &qso.time_on));
-        record.push_str(&format_field("BAND", &qso.band));
         record.push_str(&format_field("MODE", &qso.mode));
-
-        // Frequency
+        record.push_str(&format_field("BAND", &qso.band));
         if let Some(ref v) = qso.freq {
             record.push_str(&format_field("FREQ", v));
         }
+        record.push_str(&format_field("QSO_DATE", &qso.qso_date));
+        record.push_str(&format_field("TIME_ON", &qso.time_on));
 
         // Signal reports
-        if let Some(ref v) = qso.rst_sent {
-            record.push_str(&format_field("RST_SENT", v));
-        }
         if let Some(ref v) = qso.rst_rcvd {
             record.push_str(&format_field("RST_RCVD", v));
         }
-
-        // POTA-specific fields
-        if let Some(ref v) = qso.my_sig {
-            record.push_str(&format_field("MY_SIG", v));
-        }
-        if let Some(ref v) = qso.my_sig_info {
-            record.push_str(&format_field("MY_SIG_INFO", v));
-        }
-        if let Some(ref v) = qso.sig {
-            record.push_str(&format_field("SIG", v));
-        }
-        if let Some(ref v) = qso.sig_info {
-            record.push_str(&format_field("SIG_INFO", v));
-        }
-        if let Some(ref v) = qso.my_state {
-            record.push_str(&format_field("MY_STATE", v));
+        if let Some(ref v) = qso.rst_sent {
+            record.push_str(&format_field("RST_SENT", v));
         }
 
-        // Optional but useful fields
+        // Station info
+        if let Some(ref v) = qso.station_callsign {
+            record.push_str(&format_field("STATION_CALLSIGN", v));
+        }
+        if let Some(v) = qso.other_fields.get("OPERATOR") {
+            record.push_str(&format_field("OPERATOR", v));
+        }
+
+        // Grid squares
         if let Some(ref v) = qso.gridsquare {
             record.push_str(&format_field("GRIDSQUARE", v));
         }
         if let Some(ref v) = qso.my_gridsquare {
             record.push_str(&format_field("MY_GRIDSQUARE", v));
         }
+
+        // Contacted station info from other_fields
+        if let Some(v) = qso.other_fields.get("NAME") {
+            record.push_str(&format_field("NAME", v));
+        }
+        if let Some(v) = qso.other_fields.get("DXCC") {
+            record.push_str(&format_field("DXCC", v));
+        }
+        if let Some(v) = qso.other_fields.get("QTH") {
+            record.push_str(&format_field("QTH", v));
+        }
+        if let Some(ref v) = qso.state {
+            record.push_str(&format_field("STATE", v));
+        }
+        if let Some(v) = qso.other_fields.get("CQZ") {
+            record.push_str(&format_field("CQZ", v));
+        }
+        if let Some(v) = qso.other_fields.get("ITUZ") {
+            record.push_str(&format_field("ITUZ", v));
+        }
+
+        // QSL message - use existing or generate from park reference
+        let qslmsg = qso
+            .other_fields
+            .get("QSLMSG")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if !qslmsg.is_empty() {
+            record.push_str(&format_field("QSLMSG", qslmsg));
+        } else {
+            record.push_str(&format_field("QSLMSG", &format!("POTA {}", park)));
+        }
+
+        // Hunter POTA info (contacted station at a park)
+        if let Some(ref v) = qso.sig {
+            record.push_str(&format_field("SIG", v));
+        }
+        if let Some(ref v) = qso.sig_info {
+            record.push_str(&format_field("SIG_INFO", v));
+        }
+        if let Some(v) = qso.other_fields.get("POTA_REF") {
+            record.push_str(&format_field("POTA_REF", v));
+        }
+
+        // Activator POTA info (my station at a park) - always include for POTA exports
+        let my_sig = qso.my_sig.as_deref().unwrap_or("POTA");
+        record.push_str(&format_field("MY_SIG", my_sig));
+
+        let my_sig_info = qso.my_sig_info.as_deref().unwrap_or(park);
+        record.push_str(&format_field("MY_SIG_INFO", my_sig_info));
+
+        let my_pota_ref = qso
+            .other_fields
+            .get("MY_POTA_REF")
+            .map(|s| s.as_str())
+            .unwrap_or(park);
+        record.push_str(&format_field("MY_POTA_REF", my_pota_ref));
+
+        if let Some(v) = qso.other_fields.get("MY_WWFF_REF") {
+            record.push_str(&format_field("MY_WWFF_REF", v));
+        }
+
+        // My location info
+        if let Some(ref v) = qso.my_state {
+            record.push_str(&format_field("MY_STATE", v));
+        }
+        if let Some(ref v) = qso.my_cnty {
+            record.push_str(&format_field("MY_CNTY", v));
+        }
+
+        // Comment
         if let Some(ref v) = qso.comment {
             record.push_str(&format_field("COMMENT", v));
         }

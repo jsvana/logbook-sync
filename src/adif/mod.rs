@@ -46,12 +46,20 @@ pub struct Qso {
 
 impl Qso {
     /// Create a unique key for deduplication (call + date + time + band + mode)
+    /// Uses only HHMM (first 4 digits) of time since seconds often differ between sources
     pub fn dedup_key(&self) -> String {
+        // Use only first 4 characters of time (HHMM) for deduplication
+        // This handles both HHMM and HHMMSS formats consistently
+        let time_hhmm = if self.time_on.len() >= 4 {
+            &self.time_on[..4]
+        } else {
+            &self.time_on
+        };
         format!(
             "{}:{}:{}:{}:{}",
             self.call.to_uppercase(),
             self.qso_date,
-            self.time_on,
+            time_hhmm,
             self.band.to_lowercase(),
             self.mode.to_uppercase()
         )
@@ -68,8 +76,49 @@ impl Qso {
 
     /// Check if this is a POTA activation QSO
     pub fn is_pota(&self) -> bool {
-        self.my_sig
+        // Check MY_SIG field
+        if self
+            .my_sig
             .as_ref()
             .is_some_and(|s| s.eq_ignore_ascii_case("POTA"))
+        {
+            return true;
+        }
+
+        // Also check QSLMSG field for "POTA" pattern (e.g., "POTA US-0189")
+        if let Some(qslmsg) = self.other_fields.get("QSLMSG") {
+            if qslmsg.to_uppercase().contains("POTA") {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Extract POTA park reference from this QSO
+    pub fn get_pota_ref(&self) -> Option<&str> {
+        // First check MY_SIG_INFO
+        if let Some(ref info) = self.my_sig_info {
+            if !info.is_empty() {
+                return Some(info.as_str());
+            }
+        }
+
+        // Fall back to extracting from QSLMSG (e.g., "POTA US-0189")
+        if let Some(qslmsg) = self.other_fields.get("QSLMSG") {
+            // Look for pattern like "POTA XX-NNNN"
+            if let Some(pos) = qslmsg.to_uppercase().find("POTA") {
+                let after_pota = &qslmsg[pos + 4..].trim_start();
+                // Extract the park reference (first word after "POTA")
+                let park_ref = after_pota.split_whitespace().next()?;
+                if !park_ref.is_empty() {
+                    // Return the original case from the qslmsg
+                    let start = qslmsg.find(park_ref)?;
+                    return Some(&qslmsg[start..start + park_ref.len()]);
+                }
+            }
+        }
+
+        None
     }
 }
