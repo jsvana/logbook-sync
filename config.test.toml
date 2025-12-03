@@ -25,13 +25,13 @@ enabled = false
 
 [wavelog]
 enabled = true
-base_url = "http://localhost:8086/"
-api_key = "wld8a0a38d59a16"
+base_url = "https://wavelog.qrp.lol/"
+api_key = "wl5b39ed9de5a29"
 download_interval = 3600
 accept_invalid_certs = true
 station_id = "1"
 username = "jsvana"
-password = "linked"
+password = "LRHkvTkGTbu@ZWaPsNb6"
 
 [database]
 path = "/home/jsvana/projects/logbook-sync/test-state.db"
@@ -39,4 +39,5 @@ path = "/home/jsvana/projects/logbook-sync/test-state.db"
 [ntfy]
 enabled = true
 server = "https://ntfy.westpeninsulashould.works"
-topic = "qso_sync"
+topic = "OLst4lvVaUC2IADb"
+token = "tk_l2mjh51sy9zw09rgz513zduh5amx9"

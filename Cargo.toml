@@ -31,7 +31,7 @@ notify-debouncer-mini = "0.4"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Database (state tracking)
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -58,6 +58,11 @@ sd-notify = "0.4"
 
 # URL encoding for QRZ API
 urlencoding = "2.1"
+
+# Metrics and HTTP server for health checks
+prometheus = "0.13"
+axum = "0.7"
+lazy_static = "1.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,5 +1,6 @@
 use crate::wavelog::WavelogConfig;
 use serde::Deserialize;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -21,7 +22,107 @@ pub struct Config {
     pub hrdlog: Option<HrdlogConfig>,
     #[serde(default)]
     pub ntfy: Option<NtfyConfig>,
+    #[serde(default)]
+    pub resilience: ResilienceConfig,
+    #[serde(default)]
+    pub server: Option<ServerConfig>,
     pub database: DatabaseConfig,
+}
+
+/// Configuration for the HTTP server (health checks and metrics)
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServerConfig {
+    /// Whether the HTTP server is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// Port to listen on
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+    /// Address to bind to
+    #[serde(default = "default_bind_address")]
+    pub bind_address: IpAddr,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_server_port(),
+            bind_address: default_bind_address(),
+        }
+    }
+}
+
+fn default_server_port() -> u16 {
+    9090
+}
+
+fn default_bind_address() -> IpAddr {
+    "127.0.0.1".parse().unwrap()
+}
+
+/// Configuration for retry and resilience behavior
+#[derive(Debug, Deserialize, Clone)]
+pub struct ResilienceConfig {
+    /// Maximum retry attempts for transient failures
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Initial backoff delay in milliseconds
+    #[serde(default = "default_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Maximum backoff delay in milliseconds
+    #[serde(default = "default_max_backoff_ms")]
+    pub max_backoff_ms: u64,
+    /// Backoff multiplier (exponential)
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+    /// Whether to add jitter to backoff delays
+    #[serde(default = "default_true")]
+    pub jitter: bool,
+    /// Alert after this many consecutive failures
+    #[serde(default = "default_consecutive_failures_alert")]
+    pub consecutive_failures_alert: u32,
+    /// Alert if no successful sync in this many hours
+    #[serde(default = "default_stale_sync_hours")]
+    pub stale_sync_hours: u32,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            initial_backoff_ms: default_initial_backoff_ms(),
+            max_backoff_ms: default_max_backoff_ms(),
+            backoff_multiplier: default_backoff_multiplier(),
+            jitter: true,
+            consecutive_failures_alert: default_consecutive_failures_alert(),
+            stale_sync_hours: default_stale_sync_hours(),
+        }
+    }
+}
+
+fn default_max_retries() -> u32 {
+    5
+}
+
+fn default_initial_backoff_ms() -> u64 {
+    1000
+}
+
+fn default_max_backoff_ms() -> u64 {
+    60000
+}
+
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
+
+fn default_consecutive_failures_alert() -> u32 {
+    3
+}
+
+fn default_stale_sync_hours() -> u32 {
+    24
 }
 
 /// Configuration for ntfy.sh notifications

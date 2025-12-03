@@ -2,10 +2,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use logbook_sync::db::Database;
 use logbook_sync::qrz::QrzClient;
-use logbook_sync::{Config, PotaExporter, SyncService, WavelogClient};
+use logbook_sync::{Config, PotaExporter, SyncOptions, SyncService, WavelogClient};
 use std::path::PathBuf;
-use tracing::{error, info, Level};
-use tracing_subscriber::EnvFilter;
+use tracing::{error, info, warn, Level};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[derive(Parser)]
 #[command(name = "logbook-sync")]
@@ -23,6 +23,14 @@ struct Cli {
     /// Suppress non-error output
     #[arg(short, long)]
     quiet: bool,
+
+    /// Dry run mode - preview changes without making them
+    #[arg(long, global = true)]
+    dry_run: bool,
+
+    /// Output logs in JSON format (for log aggregation)
+    #[arg(long, global = true)]
+    json_logs: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -84,6 +92,36 @@ enum Commands {
 
     /// Watch directory and show events (debug mode)
     Watch,
+
+    /// Database maintenance operations
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
+
+    /// Send a test notification via ntfy
+    #[command(name = "test-ntfy")]
+    TestNtfy {
+        /// Custom message to send (optional)
+        #[arg(long, short)]
+        message: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbAction {
+    /// Compact the database (VACUUM)
+    Vacuum,
+    /// Show database statistics
+    Info,
+    /// Analyze and optimize query performance
+    Optimize,
+    /// Export all QSOs to ADIF file
+    Export {
+        /// Output file path
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -101,20 +139,41 @@ async fn main() -> Result<()> {
         }
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(log_level.into()))
-        .init();
+    let filter = EnvFilter::from_default_env().add_directive(log_level.into());
+
+    if cli.json_logs {
+        // JSON format for log aggregation (Loki, ELK, etc.)
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().json())
+            .init();
+    } else {
+        // Human-readable format for development
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer())
+            .init();
+    }
+
+    // Create sync options from CLI flags
+    let sync_options = SyncOptions {
+        dry_run: cli.dry_run,
+    };
+
+    if cli.dry_run {
+        warn!("DRY RUN MODE - no changes will be made");
+    }
 
     // Load configuration
     let config = Config::load(&cli.config)
         .with_context(|| format!("Failed to load config from {:?}", cli.config))?;
 
     match cli.command {
-        Commands::Daemon => run_daemon(config).await,
-        Commands::Sync => run_sync(config).await,
+        Commands::Daemon => run_daemon(config, sync_options).await,
+        Commands::Sync => run_sync(config, sync_options).await,
         Commands::Status => run_status(config).await,
         Commands::Stats => run_stats(config),
-        Commands::Upload { file } => run_upload(config, file).await,
+        Commands::Upload { file } => run_upload(config, file, sync_options).await,
         Commands::Download { source } => run_download(config, &source).await,
         Commands::PotaExport {
             source,
@@ -124,27 +183,32 @@ async fn main() -> Result<()> {
         } => run_pota_export(config, &source, output, date, park).await,
         Commands::Config { validate } => run_config_check(config, validate),
         Commands::Watch => run_watch(config).await,
+        Commands::Db { action } => run_db_command(config, action),
+        Commands::TestNtfy { message } => run_test_ntfy(config, message).await,
     }
 }
 
-async fn run_daemon(config: Config) -> Result<()> {
+async fn run_daemon(config: Config, sync_options: SyncOptions) -> Result<()> {
     config.validate()?;
 
     let db = Database::open(&config.database.path).context("Failed to open database")?;
-    let service = SyncService::new(config, db);
+    let service = SyncService::with_options(config, db, sync_options);
 
     service.run_daemon().await?;
 
     Ok(())
 }
 
-async fn run_sync(config: Config) -> Result<()> {
+async fn run_sync(config: Config, sync_options: SyncOptions) -> Result<()> {
     config.validate()?;
 
+    if sync_options.dry_run {
+        println!("DRY RUN MODE - no changes will be made\n");
+    }
     println!("Running one-time sync...\n");
 
     let db = Database::open(&config.database.path)?;
-    let service = SyncService::new(config, db);
+    let service = SyncService::with_options(config, db, sync_options);
 
     // Process existing files
     let stats = service.process_existing_files()?;
@@ -410,17 +474,20 @@ fn run_stats(config: Config) -> Result<()> {
     Ok(())
 }
 
-async fn run_upload(config: Config, file: PathBuf) -> Result<()> {
+async fn run_upload(config: Config, file: PathBuf, sync_options: SyncOptions) -> Result<()> {
     config.validate()?;
 
     if !file.exists() {
         anyhow::bail!("File not found: {:?}", file);
     }
 
+    if sync_options.dry_run {
+        println!("DRY RUN MODE - no changes will be made\n");
+    }
     println!("Processing: {}", file.display());
 
     let db = Database::open(&config.database.path)?;
-    let service = SyncService::new(config, db);
+    let service = SyncService::with_options(config, db, sync_options);
 
     // Process the file
     let result = service.process_file(&file)?;
@@ -1034,5 +1101,143 @@ async fn run_watch(config: Config) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Database maintenance commands
+fn run_db_command(config: Config, action: DbAction) -> Result<()> {
+    let db = Database::open(&config.database.path)?;
+
+    match action {
+        DbAction::Vacuum => {
+            println!("Compacting database...");
+            let before = db.file_size()?;
+            db.vacuum()?;
+            let after = db.file_size()?;
+            let saved = before.saturating_sub(after);
+            println!("Done!");
+            println!("  Before: {} bytes", before);
+            println!("  After:  {} bytes", after);
+            if saved > 0 {
+                println!("  Saved:  {} bytes", saved);
+            }
+        }
+        DbAction::Info => {
+            let info = db.detailed_info()?;
+            let stats = db.get_stats()?;
+            let integrity = db.integrity_check()?;
+
+            println!("Database Information");
+            println!("====================\n");
+
+            println!("Location: {}", config.database.path.display());
+            println!();
+
+            println!("Storage:");
+            println!(
+                "  Total size:     {} bytes ({:.2} KB)",
+                info.total_size,
+                info.total_size as f64 / 1024.0
+            );
+            println!("  Page size:      {} bytes", info.page_size);
+            println!("  Page count:     {}", info.page_count);
+            println!("  Freelist pages: {}", info.freelist_count);
+            println!("  Wasted space:   {} bytes", info.wasted_space);
+            println!("  Journal mode:   {}", info.journal_mode);
+            println!();
+
+            println!("Schema:");
+            println!("  Schema version: {}", info.schema_version);
+            println!("  User version:   {}", info.user_version);
+            println!();
+
+            println!("Contents:");
+            println!("  Total QSOs:      {}", stats.total_qsos);
+            println!("  Synced to QRZ:   {}", stats.synced_qrz);
+            println!("  Pending upload:  {}", stats.pending_qrz);
+            println!("  LotW confirmed:  {}", stats.lotw_confirmed);
+            println!("  QSL confirmed:   {}", stats.qsl_confirmed);
+            println!("  Files processed: {}", stats.processed_files);
+            println!();
+
+            println!("Integrity: {}", integrity);
+        }
+        DbAction::Optimize => {
+            println!("Optimizing database...");
+
+            // First vacuum
+            println!("  Running VACUUM...");
+            let before = db.file_size()?;
+            db.vacuum()?;
+            let after = db.file_size()?;
+
+            // Then analyze
+            println!("  Running ANALYZE...");
+            db.analyze()?;
+
+            println!("Done!");
+            let saved = before.saturating_sub(after);
+            if saved > 0 {
+                println!("  Space recovered: {} bytes", saved);
+            }
+            println!("  Query statistics updated");
+        }
+        DbAction::Export { output } => {
+            use logbook_sync::adif::write_adif;
+
+            println!("Exporting all QSOs to ADIF...");
+            let qsos = db.get_all_qsos()?;
+
+            if qsos.is_empty() {
+                println!("No QSOs in database");
+                return Ok(());
+            }
+
+            let adif_content = write_adif(None, &qsos);
+
+            // Create parent directory if needed
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            std::fs::write(&output, adif_content)?;
+
+            println!("Done!");
+            println!("  QSOs exported: {}", qsos.len());
+            println!("  Output file:   {}", output.display());
+        }
+    }
+
+    Ok(())
+}
+
+/// Test ntfy notifications
+async fn run_test_ntfy(config: Config, custom_message: Option<String>) -> Result<()> {
+    use logbook_sync::NtfyClient;
+
+    let ntfy_config = config
+        .ntfy
+        .as_ref()
+        .filter(|n| n.enabled)
+        .ok_or_else(|| anyhow::anyhow!("ntfy is not configured or not enabled"))?;
+
+    println!("Testing ntfy notifications...\n");
+    println!("  Server: {}", ntfy_config.server);
+    println!("  Topic:  {}", ntfy_config.topic);
+
+    let client = NtfyClient::new(ntfy_config.clone());
+
+    let title = format!("Test from {}", config.general.callsign);
+    let message = custom_message.unwrap_or_else(|| {
+        format!(
+            "This is a test notification from logbook-sync for {}",
+            config.general.callsign
+        )
+    });
+
+    println!("\nSending notification...");
+    client.send(&title, &message).await?;
+
+    println!("Success! Check your ntfy client for the notification.");
     Ok(())
 }

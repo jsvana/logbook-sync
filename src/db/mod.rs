@@ -646,6 +646,95 @@ impl Database {
             processed_files,
         })
     }
+
+    // === Database Maintenance Methods ===
+
+    /// Compact the database (VACUUM)
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute("VACUUM", [])?;
+        Ok(())
+    }
+
+    /// Analyze and optimize query performance
+    pub fn analyze(&self) -> Result<()> {
+        self.conn.execute("ANALYZE", [])?;
+        Ok(())
+    }
+
+    /// Get database file size in bytes
+    pub fn file_size(&self) -> Result<u64> {
+        let size: i64 = self.conn.query_row(
+            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(size as u64)
+    }
+
+    /// Get database integrity check result
+    pub fn integrity_check(&self) -> Result<String> {
+        let result: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(result)
+    }
+
+    /// Get freelist count (unused pages)
+    pub fn freelist_count(&self) -> Result<i64> {
+        let count: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Get detailed database info
+    pub fn detailed_info(&self) -> Result<DbInfo> {
+        let page_count: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let freelist_count: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let schema_version: i64 = self
+            .conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let user_version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let journal_mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+
+        let total_size = page_count * page_size;
+        let wasted_space = freelist_count * page_size;
+
+        Ok(DbInfo {
+            page_count,
+            page_size,
+            freelist_count,
+            total_size,
+            wasted_space,
+            schema_version,
+            user_version,
+            journal_mode,
+        })
+    }
+}
+
+/// Detailed database information
+#[derive(Debug)]
+pub struct DbInfo {
+    pub page_count: i64,
+    pub page_size: i64,
+    pub freelist_count: i64,
+    pub total_size: i64,
+    pub wasted_space: i64,
+    pub schema_version: i64,
+    pub user_version: i64,
+    pub journal_mode: String,
 }
 
 #[derive(Debug)]

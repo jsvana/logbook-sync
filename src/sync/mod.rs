@@ -11,6 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// Options for sync operations
+#[derive(Debug, Clone, Default)]
+pub struct SyncOptions {
+    /// Dry run mode - preview changes without making them
+    pub dry_run: bool,
+}
+
 /// Configuration for retry behavior
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -71,11 +78,17 @@ pub struct SyncService {
     qrz_client: Option<QrzClient>,
     ntfy_client: Option<NtfyClient>,
     retry_config: RetryConfig,
+    sync_options: SyncOptions,
 }
 
 impl SyncService {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(config: Config, db: Database) -> Self {
+        Self::with_options(config, db, SyncOptions::default())
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn with_options(config: Config, db: Database, sync_options: SyncOptions) -> Self {
         let qrz_client = if config.qrz.enabled {
             Some(QrzClient::new(
                 config.qrz.api_key.clone(),
@@ -91,13 +104,27 @@ impl SyncService {
             .filter(|c| c.enabled)
             .map(|c| NtfyClient::new(c.clone()));
 
+        // Use retry config from config file
+        let retry_config = RetryConfig {
+            max_attempts: config.resilience.max_retries,
+            initial_delay_ms: config.resilience.initial_backoff_ms,
+            max_delay_ms: config.resilience.max_backoff_ms,
+            exponential_base: config.resilience.backoff_multiplier,
+        };
+
         Self {
             config,
             db: Arc::new(db),
             qrz_client,
             ntfy_client,
-            retry_config: RetryConfig::default(),
+            retry_config,
+            sync_options,
         }
+    }
+
+    /// Check if running in dry run mode
+    pub fn is_dry_run(&self) -> bool {
+        self.sync_options.dry_run
     }
 
     /// Send a notification about sync activity (if ntfy is configured)
@@ -159,6 +186,28 @@ impl SyncService {
         let pending = self.db.get_unsynced_qrz()?;
         if pending.is_empty() {
             debug!("No pending QSOs to upload");
+            return Ok(stats);
+        }
+
+        // Dry run mode - just report what would be uploaded
+        if self.sync_options.dry_run {
+            info!(
+                count = pending.len(),
+                "DRY RUN: Would upload {} QSOs to QRZ",
+                pending.len()
+            );
+            for stored in &pending {
+                if let Ok(qso) = serde_json::from_str::<Qso>(&stored.adif_record) {
+                    info!(
+                        call = %qso.call,
+                        date = %qso.qso_date,
+                        time = %qso.time_on,
+                        band = %qso.band,
+                        mode = %qso.mode,
+                        "DRY RUN: Would upload QSO"
+                    );
+                }
+            }
             return Ok(stats);
         }
 
@@ -478,15 +527,23 @@ impl SyncService {
                     }
                 }
 
-                // Handle Ctrl+C
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received shutdown signal");
+                // Handle shutdown signals (SIGINT/Ctrl+C and SIGTERM)
+                _ = shutdown_signal() => {
+                    info!("Received shutdown signal, initiating graceful shutdown...");
                     break;
                 }
             }
         }
 
-        info!("Sync daemon stopped");
+        // Notify systemd we're stopping
+        let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Stopping]);
+
+        info!("Finishing pending operations before shutdown...");
+
+        // Give pending operations a chance to complete (with timeout)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        info!("Sync daemon stopped gracefully");
         Ok(())
     }
 
@@ -507,6 +564,36 @@ fn is_permanent_error(error: &str) -> bool {
         || error_lower.contains("malformed")
         || error_lower.contains("station_callsign")
         || error_lower.contains("doesnt match")
+}
+
+/// Wait for a shutdown signal (SIGINT/Ctrl+C or SIGTERM on Unix)
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigint = signal(SignalKind::interrupt()).expect("Failed to create SIGINT handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to create SIGTERM handler");
+
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!("Received SIGINT");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On non-Unix platforms, just wait for Ctrl+C
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
+        info!("Received Ctrl+C");
+    }
 }
 
 #[cfg(test)]

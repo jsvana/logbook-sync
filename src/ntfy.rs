@@ -121,6 +121,177 @@ impl NtfyClient {
 
         self.send(&title, &message).await
     }
+
+    /// Send an error notification with high priority
+    pub async fn notify_error(&self, callsign: &str, service: &str, error: &str) -> Result<()> {
+        if !self.config.enabled {
+            debug!("ntfy notifications disabled, skipping error notification");
+            return Ok(());
+        }
+
+        let url = format!(
+            "{}/{}",
+            self.config.server.trim_end_matches('/'),
+            self.config.topic
+        );
+
+        let title = format!("{} Sync Error", callsign);
+        let message = format!("{} sync failed: {}", service, error);
+
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Title", title.clone())
+            .header("Priority", "4") // High priority for errors
+            .header("Tags", "warning,radio");
+
+        // Add authentication if configured
+        if let Some(ref token) = self.config.token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        request = request.body(message.clone());
+
+        match request.send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    info!("Sent error notification: {}", title);
+                    Ok(())
+                } else {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    error!(status = %status, body = %body, "Failed to send error notification");
+                    Err(crate::Error::Ntfy(format!("HTTP {}: {}", status, body)))
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to send error notification");
+                Err(crate::Error::Ntfy(e.to_string()))
+            }
+        }
+    }
+
+    /// Send an alert for consecutive sync failures
+    pub async fn notify_consecutive_failures(
+        &self,
+        callsign: &str,
+        service: &str,
+        failure_count: u32,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        if !self.config.enabled {
+            debug!("ntfy notifications disabled, skipping failure alert");
+            return Ok(());
+        }
+
+        let url = format!(
+            "{}/{}",
+            self.config.server.trim_end_matches('/'),
+            self.config.topic
+        );
+
+        let title = format!("{} Sync Alert", callsign);
+        let message = if let Some(err) = last_error {
+            format!(
+                "{} sync has failed {} consecutive times.\nLast error: {}",
+                service, failure_count, err
+            )
+        } else {
+            format!(
+                "{} sync has failed {} consecutive times.",
+                service, failure_count
+            )
+        };
+
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Title", title.clone())
+            .header("Priority", "5") // Urgent priority for persistent failures
+            .header("Tags", "rotating_light,radio");
+
+        // Add authentication if configured
+        if let Some(ref token) = self.config.token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        request = request.body(message.clone());
+
+        match request.send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    info!("Sent failure alert: {}", title);
+                    Ok(())
+                } else {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    error!(status = %status, body = %body, "Failed to send failure alert");
+                    Err(crate::Error::Ntfy(format!("HTTP {}: {}", status, body)))
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to send failure alert");
+                Err(crate::Error::Ntfy(e.to_string()))
+            }
+        }
+    }
+
+    /// Send a stale sync warning (no successful sync in configured time)
+    pub async fn notify_stale_sync(
+        &self,
+        callsign: &str,
+        service: &str,
+        hours_since_last: u32,
+    ) -> Result<()> {
+        if !self.config.enabled {
+            debug!("ntfy notifications disabled, skipping stale sync alert");
+            return Ok(());
+        }
+
+        let url = format!(
+            "{}/{}",
+            self.config.server.trim_end_matches('/'),
+            self.config.topic
+        );
+
+        let title = format!("{} Sync Warning", callsign);
+        let message = format!(
+            "No successful {} sync in {} hours. Please check the service.",
+            service, hours_since_last
+        );
+
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Title", title.clone())
+            .header("Priority", "4") // High priority for warnings
+            .header("Tags", "clock,radio");
+
+        // Add authentication if configured
+        if let Some(ref token) = self.config.token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        request = request.body(message.clone());
+
+        match request.send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    info!("Sent stale sync warning: {}", title);
+                    Ok(())
+                } else {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    error!(status = %status, body = %body, "Failed to send stale sync warning");
+                    Err(crate::Error::Ntfy(format!("HTTP {}: {}", status, body)))
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to send stale sync warning");
+                Err(crate::Error::Ntfy(e.to_string()))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
