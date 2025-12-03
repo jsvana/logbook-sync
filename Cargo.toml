@@ -10,11 +10,14 @@ license = "MIT"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP client
-reqwest = { version = "0.12", features = ["json", "cookies", "multipart"] }
+# HTTP client (using rustls for cross-compilation support)
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "multipart", "rustls-tls"] }
 
 # QRZ API client
 qrz-logbook-api = "0.1"
+
+# OpenSSL vendored for cross-compilation (qrz-logbook-api pulls in native-tls)
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Configuration
 config = "0.14"
