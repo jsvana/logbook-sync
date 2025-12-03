@@ -257,12 +257,7 @@ impl WavelogClient {
             "fetchfromid": fetch_from_id
         });
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&request_body).send().await?;
 
         if !response.status().is_success() {
             return Err(Error::Other(format!(

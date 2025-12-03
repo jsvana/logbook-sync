@@ -103,7 +103,10 @@ impl SyncService {
     /// Send a notification about sync activity (if ntfy is configured)
     async fn notify_sync(&self, stats: &SyncStats) {
         if let Some(ref client) = self.ntfy_client {
-            if let Err(e) = client.notify_sync(stats, &self.config.general.callsign).await {
+            if let Err(e) = client
+                .notify_sync(stats, &self.config.general.callsign)
+                .await
+            {
                 warn!(error = %e, "Failed to send ntfy notification");
             }
         }

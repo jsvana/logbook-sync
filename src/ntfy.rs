@@ -30,9 +30,14 @@ impl NtfyClient {
             return Ok(());
         }
 
-        let url = format!("{}/{}", self.config.server.trim_end_matches('/'), self.config.topic);
+        let url = format!(
+            "{}/{}",
+            self.config.server.trim_end_matches('/'),
+            self.config.topic
+        );
 
-        let mut request = self.client
+        let mut request = self
+            .client
             .post(&url)
             .header("Title", title)
             .header("Priority", self.config.priority.to_string())
@@ -100,7 +105,11 @@ impl NtfyClient {
             parts.push(format!(
                 "{} new confirmation{}",
                 stats.confirmations_updated,
-                if stats.confirmations_updated == 1 { "" } else { "s" }
+                if stats.confirmations_updated == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ));
         }
 
@@ -140,7 +149,10 @@ mod tests {
         }
 
         let message = parts.join(", ");
-        assert_eq!(message, "Uploaded 5 QSOs, Downloaded 10 QSOs, 3 new confirmations");
+        assert_eq!(
+            message,
+            "Uploaded 5 QSOs, Downloaded 10 QSOs, 3 new confirmations"
+        );
     }
 
     #[test]

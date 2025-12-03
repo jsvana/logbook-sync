@@ -166,7 +166,10 @@ async fn run_sync(config: Config) -> Result<()> {
 
     println!("QRZ Download:");
     println!("  QSOs fetched:    {}", download_stats.qsos_downloaded);
-    println!("  Confirmations:   {}", download_stats.confirmations_updated);
+    println!(
+        "  Confirmations:   {}",
+        download_stats.confirmations_updated
+    );
 
     println!("\nSync complete!");
     Ok(())
@@ -249,18 +252,12 @@ async fn run_status(config: Config) -> Result<()> {
                         if let Some(count) = status.count {
                             if local_synced >= count {
                                 // All QRZ QSOs are local, so all confirmations are actionable
-                                println!(
-                                    "  New confirms: ~{} (run 'download' to sync)",
-                                    diff
-                                );
+                                println!("  New confirms: ~{} (run 'download' to sync)", diff);
                             }
                             // If local_synced < count, the diff includes non-local QSOs
                             // so we don't show it (would be misleading)
                         } else {
-                            println!(
-                                "  New confirms: ~{} (run 'download' to sync)",
-                                diff
-                            );
+                            println!("  New confirms: ~{} (run 'download' to sync)", diff);
                         }
                     }
                 }
@@ -533,17 +530,16 @@ async fn run_download_wavelog(config: Config) -> Result<()> {
 
     // Parse the ADIF content
     use logbook_sync::adif::parse_adif;
-    let qsos: Vec<logbook_sync::adif::Qso> = if adif_content.contains("<EOH>")
-        || adif_content.contains("<eoh>")
-    {
-        let record = parse_adif(&adif_content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse ADIF: {}", e))?;
-        println!("Downloaded {} QSOs", record.qsos.len());
-        record.qsos
-    } else {
-        println!("No QSOs returned (empty ADIF)");
-        Vec::new()
-    };
+    let qsos: Vec<logbook_sync::adif::Qso> =
+        if adif_content.contains("<EOH>") || adif_content.contains("<eoh>") {
+            let record = parse_adif(&adif_content)
+                .map_err(|e| anyhow::anyhow!("Failed to parse ADIF: {}", e))?;
+            println!("Downloaded {} QSOs", record.qsos.len());
+            record.qsos
+        } else {
+            println!("No QSOs returned (empty ADIF)");
+            Vec::new()
+        };
 
     if qsos.is_empty() {
         println!("\nNo QSOs to download");
