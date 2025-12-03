@@ -1,5 +1,10 @@
 # logbook-sync
 
+[![CI](https://github.com/jsvana/logbook-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/jsvana/logbook-sync/actions/workflows/ci.yml)
+[![Release](https://github.com/jsvana/logbook-sync/actions/workflows/release.yml/badge.svg)](https://github.com/jsvana/logbook-sync/actions/workflows/release.yml)
+[![Latest Release](https://img.shields.io/github/v/release/jsvana/logbook-sync?include_prereleases)](https://github.com/jsvana/logbook-sync/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 ADIF log synchronization daemon for amateur radio operators. Automatically syncs QSO logs from local ADIF files to cloud services like QRZ.com.
 
 ## Features
