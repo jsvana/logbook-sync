@@ -1,0 +1,48 @@
+[Unit]
+Description=logbook-sync Amateur Radio Log Synchronization
+Documentation=https://github.com/jsvana/logbook-sync
+After=network.target
+
+[Service]
+Type=notify
+User=logbook-sync
+Group=logbook-sync
+
+# Paths
+WorkingDirectory=/var/lib/logbook-sync
+ExecStart=/usr/local/bin/logbook-sync web --bind 127.0.0.1:3000
+
+# Configuration
+Environment="LOGBOOK_SYNC_CONFIG=/etc/logbook-sync/config.toml"
+EnvironmentFile=-/etc/logbook-sync/env
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/logbook-sync
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=logbook-sync
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

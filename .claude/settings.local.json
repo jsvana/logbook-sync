@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo search:*)",
+      "Bash(cargo fmt:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

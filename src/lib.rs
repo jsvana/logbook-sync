@@ -2,6 +2,7 @@ pub mod adif;
 pub mod circuit_breaker;
 pub mod clublog;
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod eqsl;
 pub mod error;
@@ -16,12 +17,14 @@ pub mod server;
 pub mod sync;
 pub mod watcher;
 pub mod wavelog;
+pub mod web;
 
 pub use clublog::ClublogClient;
 pub use config::{
     ClublogConfig, Config, EqslConfig, HrdlogConfig, LofiConfig, LotwConfig, NtfyConfig,
     ResilienceConfig, ServerConfig,
 };
+pub use crypto::{CryptoError, MasterKey, UserCrypto};
 pub use db::qso_source;
 pub use eqsl::EqslClient;
 pub use error::{Error, Result};

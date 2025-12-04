@@ -34,7 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Database (state tracking)
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
@@ -46,8 +46,9 @@ anyhow = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Hashing for file checksums
+# Hashing for file checksums and HMAC
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 
 # UUID generation for LoFi client key
@@ -67,8 +68,26 @@ urlencoding = "2.1"
 
 # Metrics and HTTP server for health checks
 prometheus = "0.13"
-axum = "0.7"
+axum = { version = "0.7", features = ["macros"] }
+axum-extra = { version = "0.9", features = ["typed-header", "cookie"] }
 lazy_static = "1.4"
+
+# Web server middleware
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# Encryption for user configuration data
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+
+# Password input for CLI
+rpassword = "7"
+
+# Base64 encoding for encryption
+base64 = "0.22"
+
+# Time handling for sessions
+time = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

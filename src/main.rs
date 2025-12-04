@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use logbook_sync::db::Database;
+use logbook_sync::crypto::MasterKey;
+use logbook_sync::db::{users, Database};
 use logbook_sync::qrz::QrzClient;
 use logbook_sync::{Config, PotaExporter, SyncOptions, SyncService, WavelogClient};
 use std::path::PathBuf;
@@ -112,6 +113,72 @@ enum Commands {
         #[command(subcommand)]
         action: LofiAction,
     },
+
+    /// Add a new user
+    UserAdd {
+        /// Username (required)
+        #[arg(long)]
+        username: String,
+
+        /// Email address (optional)
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Amateur radio callsign
+        #[arg(long)]
+        callsign: Option<String>,
+
+        /// Make this user an admin
+        #[arg(long)]
+        admin: bool,
+    },
+
+    /// Remove a user
+    UserRemove {
+        /// Username to remove
+        username: String,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// List all users
+    UserList {
+        /// Output format (table, json, csv)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+
+    /// Reset a user's password
+    UserResetPw {
+        /// Username
+        username: String,
+    },
+
+    /// Enable/disable a user
+    UserSetActive {
+        /// Username
+        username: String,
+
+        /// Active status
+        #[arg(long)]
+        active: bool,
+    },
+
+    /// Generate a new master encryption key
+    GenerateMasterKey {
+        /// Output format (hex or base64)
+        #[arg(long, default_value = "base64")]
+        format: String,
+    },
+
+    /// Run the web server
+    Web {
+        /// Web server bind address
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -208,6 +275,23 @@ async fn main() -> Result<()> {
         Commands::Db { action } => run_db_command(config, action),
         Commands::TestNtfy { message } => run_test_ntfy(config, message).await,
         Commands::Lofi { action } => run_lofi_command(config, action).await,
+        Commands::UserAdd {
+            username,
+            email,
+            callsign,
+            admin,
+        } => run_user_add(&config, username, email, callsign, admin),
+        Commands::UserRemove { username, force } => run_user_remove(&config, &username, force),
+        Commands::UserList { format } => run_user_list(&config, &format),
+        Commands::UserResetPw { username } => run_user_reset_pw(&config, &username),
+        Commands::UserSetActive { username, active } => {
+            run_user_set_active(&config, &username, active)
+        }
+        Commands::GenerateMasterKey { format } => {
+            run_generate_master_key(&format);
+            Ok(())
+        }
+        Commands::Web { bind } => run_web_server(config, &bind).await,
     }
 }
 
@@ -1548,6 +1632,227 @@ async fn run_lofi_sync(config: &Config) -> Result<()> {
     println!("  New:     {}", stats.new_qsos);
     println!("  Updated: {}", stats.updated_qsos);
     println!("  Total:   {}", stats.total_qsos);
+
+    Ok(())
+}
+
+// === User Management Commands ===
+
+fn run_user_add(
+    config: &Config,
+    username: String,
+    email: Option<String>,
+    callsign: Option<String>,
+    admin: bool,
+) -> Result<()> {
+    use rusqlite::Connection;
+
+    // Prompt for password
+    let password = rpassword::prompt_password("Enter password: ")?;
+    let confirm = rpassword::prompt_password("Confirm password: ")?;
+
+    if password != confirm {
+        anyhow::bail!("Passwords do not match");
+    }
+
+    if password.len() < 12 {
+        anyhow::bail!("Password must be at least 12 characters");
+    }
+
+    let conn = Connection::open(&config.database.path)?;
+
+    let user = users::create_user(
+        &conn,
+        users::CreateUser {
+            username: username.clone(),
+            password,
+            email,
+            callsign,
+            is_admin: admin,
+        },
+    )?;
+
+    println!("Created user '{}' (ID: {})", user.username, user.id);
+    if admin {
+        println!("  -> User has admin privileges");
+    }
+
+    Ok(())
+}
+
+fn run_user_list(config: &Config, format: &str) -> Result<()> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open(&config.database.path)?;
+    let users_list = users::list_users(&conn)?;
+
+    match format {
+        "json" => {
+            #[derive(serde::Serialize)]
+            struct UserOutput {
+                id: i64,
+                username: String,
+                email: Option<String>,
+                callsign: Option<String>,
+                is_admin: bool,
+                is_active: bool,
+                last_login: Option<String>,
+            }
+
+            let output: Vec<_> = users_list
+                .iter()
+                .map(|u| UserOutput {
+                    id: u.id,
+                    username: u.username.clone(),
+                    email: u.email.clone(),
+                    callsign: u.callsign.clone(),
+                    is_admin: u.is_admin,
+                    is_active: u.is_active,
+                    last_login: u.last_login_at.clone(),
+                })
+                .collect();
+
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        "csv" => {
+            println!("id,username,email,callsign,is_admin,is_active,last_login");
+            for u in users_list {
+                println!(
+                    "{},{},{},{},{},{},{}",
+                    u.id,
+                    u.username,
+                    u.email.unwrap_or_default(),
+                    u.callsign.unwrap_or_default(),
+                    u.is_admin,
+                    u.is_active,
+                    u.last_login_at.unwrap_or_default(),
+                );
+            }
+        }
+        _ => {
+            // Table format
+            println!(
+                "{:<5} {:<20} {:<30} {:<10} {:<6} {:<6}",
+                "ID", "Username", "Email", "Callsign", "Admin", "Active"
+            );
+            println!("{}", "-".repeat(80));
+            for u in users_list {
+                println!(
+                    "{:<5} {:<20} {:<30} {:<10} {:<6} {:<6}",
+                    u.id,
+                    u.username,
+                    u.email.unwrap_or("-".into()),
+                    u.callsign.unwrap_or("-".into()),
+                    if u.is_admin { "yes" } else { "no" },
+                    if u.is_active { "yes" } else { "no" },
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_user_remove(config: &Config, username: &str, force: bool) -> Result<()> {
+    use rusqlite::Connection;
+    use std::io::Write;
+
+    let conn = Connection::open(&config.database.path)?;
+    let user = users::get_user_by_username(&conn, username)?
+        .ok_or_else(|| anyhow::anyhow!("User '{}' not found", username))?;
+
+    if !force {
+        print!(
+            "Are you sure you want to delete user '{}' and ALL their data? [y/N] ",
+            username
+        );
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    users::delete_user(&conn, user.id)?;
+    println!("Deleted user '{}'", username);
+
+    Ok(())
+}
+
+fn run_user_reset_pw(config: &Config, username: &str) -> Result<()> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open(&config.database.path)?;
+    let user = users::get_user_by_username(&conn, username)?
+        .ok_or_else(|| anyhow::anyhow!("User '{}' not found", username))?;
+
+    let password = rpassword::prompt_password("Enter new password: ")?;
+    let confirm = rpassword::prompt_password("Confirm new password: ")?;
+
+    if password != confirm {
+        anyhow::bail!("Passwords do not match");
+    }
+
+    if password.len() < 12 {
+        anyhow::bail!("Password must be at least 12 characters");
+    }
+
+    users::update_password(&conn, user.id, &password)?;
+    println!("Password updated for user '{}'", username);
+
+    Ok(())
+}
+
+fn run_user_set_active(config: &Config, username: &str, active: bool) -> Result<()> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open(&config.database.path)?;
+    let user = users::get_user_by_username(&conn, username)?
+        .ok_or_else(|| anyhow::anyhow!("User '{}' not found", username))?;
+
+    if active {
+        users::activate_user(&conn, user.id)?;
+        println!("User '{}' activated", username);
+    } else {
+        users::deactivate_user(&conn, user.id)?;
+        println!("User '{}' deactivated", username);
+    }
+
+    Ok(())
+}
+
+fn run_generate_master_key(format: &str) {
+    let key = MasterKey::generate();
+
+    match format {
+        "hex" => println!("{}", key.to_hex()),
+        _ => println!("{}", key.to_base64()),
+    }
+
+    eprintln!("\nStore this key securely! You can set it via:");
+    eprintln!("  Environment: LOGBOOK_SYNC_MASTER_KEY=<key>");
+    eprintln!("  Or file: /etc/logbook-sync/master.key (chmod 600)");
+}
+
+async fn run_web_server(config: Config, bind: &str) -> Result<()> {
+    use logbook_sync::web;
+
+    // Load master key from environment
+    let master_key = MasterKey::from_env().context(
+        "LOGBOOK_SYNC_MASTER_KEY environment variable not set or invalid. \
+         Generate one with: logbook-sync generate-master-key",
+    )?;
+
+    println!("Starting web server on {}", bind);
+    println!("Database: {}", config.database.path.display());
+
+    web::serve(config.database.path, master_key, bind)
+        .await
+        .context("Web server error")?;
 
     Ok(())
 }

@@ -1,3 +1,6 @@
+pub mod integrations;
+pub mod users;
+
 use crate::adif::Qso;
 use crate::{Error, Result};
 use chrono::Utc;
@@ -5,9 +8,19 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+pub use integrations::*;
+pub use users::*;
+
 /// State database for tracking sync status
 pub struct Database {
     conn: Connection,
+}
+
+impl Database {
+    /// Get a reference to the database connection
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +280,59 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_lofi_qso_refs_qso ON lofi_qso_refs(qso_uuid);
             CREATE INDEX IF NOT EXISTS idx_lofi_qso_refs_reference ON lofi_qso_refs(reference);
+
+            -- Multitenancy: Users table
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT UNIQUE,
+                password_hash TEXT NOT NULL,
+                encryption_salt BLOB NOT NULL,  -- 32 bytes, for per-user key derivation
+                callsign TEXT,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_login_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+            CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+            -- User integration configurations (encrypted)
+            CREATE TABLE IF NOT EXISTS user_integrations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                integration_type TEXT NOT NULL,  -- 'qrz', 'lofi', 'lotw', 'clublog', etc.
+                enabled INTEGER NOT NULL DEFAULT 1,
+                encrypted_config TEXT NOT NULL,  -- JSON encrypted with user's derived key
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(user_id, integration_type)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_integrations_user ON user_integrations(user_id);
+
+            -- User-specific watch directories
+            CREATE TABLE IF NOT EXISTS user_watch_paths (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                watch_path TEXT NOT NULL,
+                patterns TEXT NOT NULL DEFAULT '["*.adi", "*.adif", "*.ADI", "*.ADIF"]',  -- JSON array
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_watch_paths_user ON user_watch_paths(user_id);
+
+            -- Sessions table for web auth
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY NOT NULL,
+                data BLOB NOT NULL,
+                expiry_date INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expiry_date);
             "#,
         )?;
         Ok(())
