@@ -886,10 +886,7 @@ impl Database {
 
     /// Insert or update a LoFi operation
     /// Returns true if this is a new operation (not previously seen)
-    pub fn upsert_lofi_operation(
-        &self,
-        op: &crate::lofi::LofiOperation,
-    ) -> Result<bool> {
+    pub fn upsert_lofi_operation(&self, op: &crate::lofi::LofiOperation) -> Result<bool> {
         let existing: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM lofi_operations WHERE lofi_uuid = ?1",
             params![&op.uuid],
@@ -897,8 +894,7 @@ impl Database {
         )?;
 
         let is_new = existing == 0;
-        let raw_json =
-            serde_json::to_string(op).map_err(|e| Error::Other(e.to_string()))?;
+        let raw_json = serde_json::to_string(op).map_err(|e| Error::Other(e.to_string()))?;
 
         // Upsert the operation
         self.conn.execute(
@@ -985,8 +981,7 @@ impl Database {
         )?;
 
         let is_new = existing == 0;
-        let raw_json =
-            serde_json::to_string(qso).map_err(|e| Error::Other(e.to_string()))?;
+        let raw_json = serde_json::to_string(qso).map_err(|e| Error::Other(e.to_string()))?;
 
         self.conn.execute(
             r#"

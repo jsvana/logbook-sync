@@ -289,7 +289,10 @@ impl LofiClient {
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::Lofi(format!("LoFi API error: {} - {}", status, body)));
+            return Err(Error::Lofi(format!(
+                "LoFi API error: {} - {}",
+                status, body
+            )));
         }
 
         response

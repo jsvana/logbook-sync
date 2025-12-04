@@ -80,7 +80,10 @@ impl<'a> LofiSyncService<'a> {
         metrics::record_sync_duration("lofi", "full_sync", duration.as_secs_f64());
 
         if stats.new_operations > 0 || stats.updated_operations > 0 {
-            metrics::record_qso_downloaded("lofi", (stats.new_operations + stats.updated_operations) as u64);
+            metrics::record_qso_downloaded(
+                "lofi",
+                (stats.new_operations + stats.updated_operations) as u64,
+            );
         }
         if stats.new_qsos > 0 || stats.updated_qsos > 0 {
             metrics::record_qso_downloaded("lofi", (stats.new_qsos + stats.updated_qsos) as u64);

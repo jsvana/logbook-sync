@@ -1354,11 +1354,9 @@ async fn run_lofi_link(config: &Config, email: Option<String>) -> Result<()> {
     };
 
     // Get email from argument or config
-    let email = email
-        .or_else(|| lofi_config.email.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Email not provided. Use --email or configure in [lofi] section.")
-        })?;
+    let email = email.or_else(|| lofi_config.email.clone()).ok_or_else(|| {
+        anyhow::anyhow!("Email not provided. Use --email or configure in [lofi] section.")
+    })?;
 
     let client = LofiClient::with_token(lofi_config.clone(), bearer_token)
         .map_err(|e| anyhow::anyhow!("Failed to create LoFi client: {}", e))?;
@@ -1372,7 +1370,10 @@ async fn run_lofi_link(config: &Config, email: Option<String>) -> Result<()> {
 
     println!("Device link email sent!");
     println!();
-    println!("Check your email ({}) and click the confirmation link.", email);
+    println!(
+        "Check your email ({}) and click the confirmation link.",
+        email
+    );
     println!("After confirming, add this to your config.toml [lofi] section:");
     println!();
     println!("device_linked = true");
