@@ -27,7 +27,7 @@ impl LofiClient {
             .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| Error::Http(e))?;
+            .map_err(Error::Http)?;
 
         Ok(Self {
             client,
@@ -42,7 +42,7 @@ impl LofiClient {
             .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| Error::Http(e))?;
+            .map_err(Error::Http)?;
 
         Ok(Self {
             client,
@@ -132,7 +132,7 @@ impl LofiClient {
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Http(e))?;
+            .map_err(Error::Http)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -176,7 +176,7 @@ impl LofiClient {
             .json(&request)
             .send()
             .await
-            .map_err(|e| Error::Http(e))?;
+            .map_err(Error::Http)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -228,7 +228,7 @@ impl LofiClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| Error::Http(e))?;
+            .map_err(Error::Http)?;
 
         self.handle_response(response).await
     }
@@ -264,7 +264,7 @@ impl LofiClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| Error::Http(e))?;
+            .map_err(Error::Http)?;
 
         self.handle_response(response).await
     }
