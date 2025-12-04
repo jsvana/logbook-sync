@@ -2,6 +2,7 @@
 
 use crate::adif::Qso;
 use crate::db::Database;
+use crate::lofi::{LofiClient, LofiSyncService};
 use crate::ntfy::NtfyClient;
 use crate::qrz::{QrzClient, UploadResult};
 use crate::watcher::{process_adif_file, FileWatcher, ProcessResult, WatchEvent};
@@ -78,6 +79,7 @@ pub struct SyncService {
     config: Config,
     db: Arc<Database>,
     qrz_client: Option<QrzClient>,
+    lofi_client: Option<LofiClient>,
     ntfy_client: Option<NtfyClient>,
     retry_config: RetryConfig,
     sync_options: SyncOptions,
@@ -100,6 +102,21 @@ impl SyncService {
             None
         };
 
+        // Create LoFi client if configured and ready
+        // Token will be loaded from DB if available, or registered automatically on first sync
+        let lofi_client = config
+            .lofi
+            .as_ref()
+            .filter(|c| c.is_ready_for_sync())
+            .and_then(|c| {
+                // Try to get bearer token from database
+                let token = db.get_lofi_bearer_token().ok().flatten();
+                match token {
+                    Some(t) => LofiClient::with_token(c.clone(), t).ok(),
+                    None => LofiClient::new(c.clone()).ok(),
+                }
+            });
+
         let ntfy_client = config
             .ntfy
             .as_ref()
@@ -118,6 +135,7 @@ impl SyncService {
             config,
             db: Arc::new(db),
             qrz_client,
+            lofi_client,
             ntfy_client,
             retry_config,
             sync_options,
@@ -330,6 +348,104 @@ impl SyncService {
         )))
     }
 
+    /// Sync data from LoFi (operations and QSOs)
+    /// Automatically registers to get a bearer token if none exists,
+    /// and refreshes the token if it receives a 401 Unauthorized
+    pub async fn sync_from_lofi(&mut self) -> Result<()> {
+        if self.lofi_client.is_none() {
+            debug!("LoFi client not configured, skipping sync");
+            return Ok(());
+        }
+
+        let lofi_config = self.config.lofi.as_ref().unwrap();
+        let batch_size = lofi_config.sync_batch_size;
+        let loop_delay_ms = lofi_config.sync_loop_delay_ms;
+
+        // Check if we need to register for a token first
+        let needs_token = {
+            let client = self.lofi_client.as_ref().unwrap();
+            !client.has_bearer_token()
+        };
+
+        if needs_token {
+            info!("No LoFi bearer token found, registering with LoFi...");
+
+            let new_token = {
+                let client = self.lofi_client.as_mut().unwrap();
+                client.refresh_token().await?
+            };
+
+            self.db.set_lofi_bearer_token(&new_token)?;
+            info!("LoFi registration complete, bearer token stored");
+        }
+
+        info!("Syncing from LoFi...");
+
+        // Try sync, refresh token on auth error
+        let result = {
+            let client = self.lofi_client.as_ref().unwrap();
+            let service = LofiSyncService::new(
+                client,
+                &self.db,
+                self.ntfy_client.as_ref(),
+                batch_size,
+                loop_delay_ms,
+            );
+            service.sync_all().await
+        };
+
+        match result {
+            Ok(stats) => {
+                info!(
+                    new_operations = stats.new_operations,
+                    new_qsos = stats.new_qsos,
+                    "LoFi sync complete"
+                );
+            }
+            Err(crate::Error::LofiAuthError) => {
+                warn!("LoFi authentication failed, refreshing token...");
+
+                // Refresh the token
+                let new_token = {
+                    let client = self.lofi_client.as_mut().unwrap();
+                    client.refresh_token().await?
+                };
+
+                // Store the new token in the database
+                self.db.set_lofi_bearer_token(&new_token)?;
+                info!("LoFi bearer token refreshed and stored");
+
+                // Retry the sync with the new token
+                let client = self.lofi_client.as_ref().unwrap();
+                let service = LofiSyncService::new(
+                    client,
+                    &self.db,
+                    self.ntfy_client.as_ref(),
+                    batch_size,
+                    loop_delay_ms,
+                );
+
+                match service.sync_all().await {
+                    Ok(stats) => {
+                        info!(
+                            new_operations = stats.new_operations,
+                            new_qsos = stats.new_qsos,
+                            "LoFi sync complete (after token refresh)"
+                        );
+                    }
+                    Err(e) => {
+                        error!(error = %e, "LoFi sync failed after token refresh");
+                    }
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "LoFi sync failed");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Download QSOs and confirmations from QRZ
     pub async fn download_from_qrz(&self) -> Result<SyncStats> {
         let mut stats = SyncStats::default();
@@ -434,7 +550,7 @@ impl SyncService {
     }
 
     /// Run the daemon loop
-    pub async fn run_daemon(self) -> Result<()> {
+    pub async fn run_daemon(mut self) -> Result<()> {
         info!(
             callsign = %self.config.general.callsign,
             watch_dir = %self.config.local.watch_dir.display(),
@@ -457,6 +573,14 @@ impl SyncService {
             }
         }
 
+        // Run initial LoFi sync if configured
+        if self.lofi_client.is_some() {
+            info!("Running initial LoFi sync...");
+            if let Err(e) = self.sync_from_lofi().await {
+                error!(error = %e, "Initial LoFi sync failed");
+            }
+        }
+
         // Notify systemd we're ready
         let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
 
@@ -471,6 +595,15 @@ impl SyncService {
         // Set up QRZ download timer (less frequent)
         let download_interval = Duration::from_secs(self.config.qrz.download_interval);
         let mut download_timer = tokio::time::interval(download_interval);
+
+        // Set up LoFi sync timer (based on config check period)
+        let lofi_sync_interval = self
+            .config
+            .lofi
+            .as_ref()
+            .map(|c| Duration::from_millis(c.sync_check_period_ms))
+            .unwrap_or_else(|| Duration::from_secs(60));
+        let mut lofi_timer = tokio::time::interval(lofi_sync_interval);
 
         loop {
             tokio::select! {
@@ -525,6 +658,16 @@ impl SyncService {
                         match self.download_from_qrz().await {
                             Ok(stats) => self.notify_sync(&stats).await,
                             Err(e) => error!(error = %e, "Periodic QRZ download failed"),
+                        }
+                    }
+                }
+
+                // Periodic LoFi sync
+                _ = lofi_timer.tick() => {
+                    if self.lofi_client.is_some() {
+                        debug!("Running periodic LoFi sync");
+                        if let Err(e) = self.sync_from_lofi().await {
+                            error!(error = %e, "Periodic LoFi sync failed");
                         }
                     }
                 }

@@ -106,6 +106,12 @@ enum Commands {
         #[arg(long, short)]
         message: Option<String>,
     },
+
+    /// Ham2K LoFi integration commands
+    Lofi {
+        #[command(subcommand)]
+        action: LofiAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,6 +128,22 @@ enum DbAction {
         #[arg(short, long)]
         output: std::path::PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum LofiAction {
+    /// Generate client credentials for LoFi registration
+    Setup,
+    /// Link device with account (sends confirmation email)
+    Link {
+        /// Email address to send confirmation to
+        #[arg(short, long)]
+        email: Option<String>,
+    },
+    /// Check LoFi configuration and connection status
+    Status,
+    /// Perform one-time sync from LoFi
+    Sync,
 }
 
 #[tokio::main]
@@ -185,6 +207,7 @@ async fn main() -> Result<()> {
         Commands::Watch => run_watch(config).await,
         Commands::Db { action } => run_db_command(config, action),
         Commands::TestNtfy { message } => run_test_ntfy(config, message).await,
+        Commands::Lofi { action } => run_lofi_command(config, action).await,
     }
 }
 
@@ -1239,5 +1262,291 @@ async fn run_test_ntfy(config: Config, custom_message: Option<String>) -> Result
     client.send(&title, &message).await?;
 
     println!("Success! Check your ntfy client for the notification.");
+    Ok(())
+}
+
+/// Run LoFi subcommands
+async fn run_lofi_command(config: Config, action: LofiAction) -> Result<()> {
+    match action {
+        LofiAction::Setup => run_lofi_setup(&config).await,
+        LofiAction::Link { email } => run_lofi_link(&config, email).await,
+        LofiAction::Status => run_lofi_status(&config).await,
+        LofiAction::Sync => run_lofi_sync(&config).await,
+    }
+}
+
+/// Generate LoFi client credentials
+async fn run_lofi_setup(config: &Config) -> Result<()> {
+    use logbook_sync::lofi::LofiClient;
+
+    println!("LoFi Setup");
+    println!("==========\n");
+
+    // Check if already configured
+    if let Some(ref lofi) = config.lofi {
+        if lofi.client_key.is_some() && lofi.client_secret.is_some() {
+            println!("LoFi credentials already exist in config.");
+            println!("To generate new credentials, remove the existing client_key and client_secret first.\n");
+
+            // Show existing (partial) credentials
+            if let Some(ref key) = lofi.client_key {
+                println!("  client_key: {}...", &key[..8.min(key.len())]);
+            }
+            if lofi.client_secret.is_some() {
+                println!("  client_secret: (configured)");
+            }
+            return Ok(());
+        }
+    }
+
+    // Generate new credentials
+    let client_key = LofiClient::generate_client_key();
+    let client_secret = LofiClient::generate_client_secret();
+
+    println!("Generated new LoFi client credentials.\n");
+    println!("Add these to your config.toml [lofi] section:\n");
+    println!("[lofi]");
+    println!("enabled = true");
+    println!("client_key = \"{}\"", client_key);
+    println!("client_secret = \"{}\"", client_secret);
+    println!("callsign = \"{}\"", config.general.callsign);
+    println!();
+    println!("After adding these, run 'logbook-sync lofi link -e <email>' to link your device.");
+
+    Ok(())
+}
+
+/// Link device with LoFi account
+async fn run_lofi_link(config: &Config, email: Option<String>) -> Result<()> {
+    use logbook_sync::lofi::LofiClient;
+
+    println!("LoFi Device Linking");
+    println!("===================\n");
+
+    let lofi_config = config
+        .lofi
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("LoFi is not configured. Run 'lofi setup' first."))?;
+
+    if !lofi_config.has_credentials() {
+        return Err(anyhow::anyhow!(
+            "LoFi credentials not configured. Run 'lofi setup' first."
+        ));
+    }
+
+    // Get or create bearer token
+    let db = Database::open(&config.database.path)?;
+    let bearer_token = match db.get_lofi_bearer_token()? {
+        Some(token) => token,
+        None => {
+            // Auto-register to get a token
+            println!("No bearer token found, registering with LoFi...\n");
+            let mut client = LofiClient::new(lofi_config.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to create LoFi client: {}", e))?;
+            let token = client
+                .refresh_token()
+                .await
+                .map_err(|e| anyhow::anyhow!("Registration failed: {}", e))?;
+            db.set_lofi_bearer_token(&token)?;
+            println!("Registration successful, bearer token stored.\n");
+            token
+        }
+    };
+
+    // Get email from argument or config
+    let email = email
+        .or_else(|| lofi_config.email.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Email not provided. Use --email or configure in [lofi] section.")
+        })?;
+
+    let client = LofiClient::with_token(lofi_config.clone(), bearer_token)
+        .map_err(|e| anyhow::anyhow!("Failed to create LoFi client: {}", e))?;
+
+    println!("Sending device link request to {}...\n", email);
+
+    client
+        .link_device(&email)
+        .await
+        .map_err(|e| anyhow::anyhow!("Link request failed: {}", e))?;
+
+    println!("Device link email sent!");
+    println!();
+    println!("Check your email ({}) and click the confirmation link.", email);
+    println!("After confirming, add this to your config.toml [lofi] section:");
+    println!();
+    println!("device_linked = true");
+    println!();
+    println!("Then run 'logbook-sync lofi sync' to sync your data.");
+
+    Ok(())
+}
+
+/// Show LoFi status
+async fn run_lofi_status(config: &Config) -> Result<()> {
+    println!("LoFi Status");
+    println!("===========\n");
+
+    let lofi_config = match &config.lofi {
+        Some(c) => c,
+        None => {
+            println!("LoFi is not configured.");
+            println!("\nTo set up LoFi, run:");
+            println!("  logbook-sync lofi setup");
+            return Ok(());
+        }
+    };
+
+    // Check for bearer token in database
+    let db = Database::open(&config.database.path)?;
+    let has_bearer_token = db.has_lofi_bearer_token()?;
+
+    println!("Configuration:");
+    println!("  Enabled:       {}", lofi_config.enabled);
+    println!(
+        "  Client Key:    {}",
+        if lofi_config.client_key.is_some() {
+            "configured"
+        } else {
+            "not set"
+        }
+    );
+    println!(
+        "  Client Secret: {}",
+        if lofi_config.client_secret.is_some() {
+            "configured"
+        } else {
+            "not set"
+        }
+    );
+    println!(
+        "  Callsign:      {}",
+        lofi_config.callsign.as_deref().unwrap_or("not set")
+    );
+    println!(
+        "  Bearer Token:  {}",
+        if has_bearer_token {
+            "stored in database"
+        } else {
+            "not set"
+        }
+    );
+    println!("  Device Linked: {}", lofi_config.device_linked);
+    println!();
+    println!("Sync Settings:");
+    println!("  Batch Size:    {} records", lofi_config.sync_batch_size);
+    println!("  Loop Delay:    {} ms", lofi_config.sync_loop_delay_ms);
+    println!("  Check Period:  {} ms", lofi_config.sync_check_period_ms);
+
+    // Show readiness status
+    println!();
+    let is_ready = lofi_config.is_ready_for_sync();
+    if is_ready {
+        println!("Status: Ready for sync");
+        if !has_bearer_token {
+            println!("  (bearer token will be obtained automatically on first sync)");
+        }
+    } else {
+        println!("Status: Not ready for sync");
+        if lofi_config.client_key.is_none() || lofi_config.client_secret.is_none() {
+            println!("  - Run 'lofi setup' to generate credentials");
+        }
+        if !lofi_config.device_linked {
+            println!("  - Run 'lofi link' to link device");
+        }
+    }
+
+    // Show local database stats
+    if let Ok(stats) = db.get_lofi_stats() {
+        println!();
+        println!("Local Database:");
+        println!("  Operations:      {}", stats.operations);
+        println!("  QSOs:            {}", stats.qsos);
+        println!("  POTA Operations: {}", stats.pota_operations);
+    }
+
+    Ok(())
+}
+
+/// Run one-time LoFi sync
+async fn run_lofi_sync(config: &Config) -> Result<()> {
+    use logbook_sync::lofi::{LofiClient, LofiSyncService};
+    use logbook_sync::NtfyClient;
+
+    println!("LoFi Sync");
+    println!("=========\n");
+
+    let lofi_config = config
+        .lofi
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("LoFi is not configured. Run 'lofi setup' first."))?;
+
+    if !lofi_config.has_credentials() {
+        return Err(anyhow::anyhow!(
+            "LoFi credentials not configured. Run 'lofi setup' first."
+        ));
+    }
+
+    if !lofi_config.is_ready_for_sync() {
+        return Err(anyhow::anyhow!(
+            "LoFi is not ready for sync. Run 'lofi status' to check configuration."
+        ));
+    }
+
+    let db = Database::open(&config.database.path)?;
+
+    // Get or create bearer token
+    let bearer_token = match db.get_lofi_bearer_token()? {
+        Some(token) => token,
+        None => {
+            // Auto-register to get a token
+            println!("No bearer token found, registering with LoFi...\n");
+            let mut client = LofiClient::new(lofi_config.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to create LoFi client: {}", e))?;
+            let token = client
+                .refresh_token()
+                .await
+                .map_err(|e| anyhow::anyhow!("Registration failed: {}", e))?;
+            db.set_lofi_bearer_token(&token)?;
+            println!("Registration successful, bearer token stored.\n");
+            token
+        }
+    };
+
+    let client = LofiClient::with_token(lofi_config.clone(), bearer_token)
+        .map_err(|e| anyhow::anyhow!("Failed to create LoFi client: {}", e))?;
+
+    let ntfy = config
+        .ntfy
+        .as_ref()
+        .filter(|n| n.enabled)
+        .map(|n| NtfyClient::new(n.clone()));
+
+    let service = LofiSyncService::new(
+        &client,
+        &db,
+        ntfy.as_ref(),
+        lofi_config.sync_batch_size,
+        lofi_config.sync_loop_delay_ms,
+    );
+
+    println!("Syncing from LoFi...\n");
+
+    let stats = service
+        .sync_all()
+        .await
+        .map_err(|e| anyhow::anyhow!("Sync failed: {}", e))?;
+
+    println!("Sync Complete!\n");
+    println!("Operations:");
+    println!("  New:     {}", stats.new_operations);
+    println!("  Updated: {}", stats.updated_operations);
+    println!("  Total:   {}", stats.total_operations);
+    println!();
+    println!("QSOs:");
+    println!("  New:     {}", stats.new_qsos);
+    println!("  Updated: {}", stats.updated_qsos);
+    println!("  Total:   {}", stats.total_qsos);
+
     Ok(())
 }

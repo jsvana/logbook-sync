@@ -41,3 +41,10 @@ enabled = true
 server = "https://ntfy.westpeninsulashould.works"
 topic = "OLst4lvVaUC2IADb"
 token = "tk_l2mjh51sy9zw09rgz513zduh5amx9"
+
+[lofi]
+enabled = true
+client_key = "6a756917-627b-465a-b42b-fc127954cea5"
+client_secret = "902b3cbc8f1a9464957a801419ae436df24bbbb9030a64ad4d8d3e17fb416330"
+callsign = "W6JSV"
+device_linked = true

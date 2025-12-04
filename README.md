@@ -11,6 +11,7 @@ ADIF log synchronization daemon for amateur radio operators. Automatically syncs
 
 - **File Watching**: Monitors directories for new/changed ADIF files
 - **QRZ Integration**: Uploads QSOs to QRZ.com logbook automatically
+- **Ham2K LoFi Integration**: Syncs operations and QSOs from Ham2K PoLo mobile app
 - **Duplicate Detection**: Tracks synced QSOs to avoid duplicates
 - **Confirmation Tracking**: Downloads and tracks LotW/QSL confirmations
 - **systemd Integration**: Runs as a background service with proper notifications
@@ -65,6 +66,16 @@ user_agent = "logbook-sync/0.1.0"
 upload = true
 download = true
 download_interval = 3600
+
+# Optional: Ham2K LoFi integration (for PoLo app sync)
+# Run 'logbook-sync lofi setup' to generate credentials
+[lofi]
+enabled = true
+client_key = "YOUR-UUID-V4-KEY"
+client_secret = "YOUR-64-CHAR-SECRET"
+callsign = "W6JSV"
+# bearer_token is stored in the database (set by 'lofi register')
+device_linked = true  # Set after email confirmation
 ```
 
 ### Environment Variables
@@ -100,6 +111,12 @@ logbook-sync config --validate
 
 # Watch directory (debug mode)
 logbook-sync watch
+
+# LoFi commands (Ham2K PoLo integration)
+logbook-sync lofi setup     # Generate client credentials
+logbook-sync lofi link -e your@email.com  # Link device (sends confirmation email)
+logbook-sync lofi status    # Check LoFi configuration and sync status
+logbook-sync lofi sync      # One-time sync from LoFi
 ```
 
 ### Options
@@ -160,6 +177,47 @@ logbook-sync works great with the [POTA app](https://pota.app):
 2. After each activation, the app exports an ADIF file
 3. logbook-sync detects the new file and uploads to QRZ automatically
 
+## Ham2K LoFi Integration
+
+logbook-sync can sync your QSOs from [Ham2K PoLo](https://polo.ham2k.com/) mobile logging app via the LoFi cloud service:
+
+### Setup Process
+
+1. **Generate credentials**:
+   ```bash
+   logbook-sync lofi setup
+   ```
+   This generates a UUID client key and secret. Add them to your config.toml.
+
+2. **Link your device**:
+   ```bash
+   logbook-sync lofi link -e your@email.com
+   ```
+   This sends a confirmation email. Click the link in the email to authorize the connection.
+   (The bearer token is automatically obtained during this step if not already present.)
+
+3. **Enable device linking** in config:
+   ```toml
+   device_linked = true
+   ```
+
+4. **Sync your data**:
+   ```bash
+   logbook-sync lofi sync
+   ```
+
+Note: The bearer token is stored securely in the database, not in the config file. It is automatically obtained and refreshed as needed - no manual registration required.
+
+### Automatic Sync
+
+When running as a daemon, logbook-sync automatically syncs from LoFi at the configured interval (default: every 20 seconds). This keeps your local database up-to-date with any QSOs logged in the PoLo app.
+
+### What Gets Synced
+
+- **Operations**: POTA activations, SOTA summits, and other special activities
+- **QSOs**: All contact records with full metadata
+- **References**: Park/summit references for P2P and S2S contacts
+
 ## Development
 
 ### Building
@@ -219,6 +277,11 @@ src/
 │   └── writer.rs    # ADIF file generation
 ├── db/mod.rs        # SQLite database operations
 ├── qrz/mod.rs       # QRZ.com API client
+├── lofi/
+│   ├── mod.rs       # Ham2K LoFi module exports
+│   ├── client.rs    # LoFi API client
+│   ├── models.rs    # Data structures for operations/QSOs
+│   └── sync.rs      # LoFi sync service
 ├── sync/mod.rs      # Sync service coordinator
 └── watcher/mod.rs   # File system watcher
 ```
@@ -236,3 +299,4 @@ Contributions welcome! Please open an issue or pull request.
 - [QRZ Logbook API](https://www.qrz.com/docs/logbook/QRZLogbookAPI.html)
 - [ADIF Specification](https://adif.org/)
 - [POTA - Parks on the Air](https://pota.app)
+- [Ham2K PoLo](https://polo.ham2k.com/) - Mobile logging app with LoFi cloud sync

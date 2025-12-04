@@ -123,6 +123,150 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_qsos_qrz_synced ON qsos(qrz_synced_at);
             CREATE INDEX IF NOT EXISTS idx_qsos_source_file ON qsos(source_file);
+
+            -- LoFi Operations (collections of QSOs, often POTA activations)
+            CREATE TABLE IF NOT EXISTS lofi_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                -- LoFi identifiers
+                lofi_uuid TEXT NOT NULL UNIQUE,
+                account_uuid TEXT NOT NULL,
+
+                -- Timestamps (stored as milliseconds since epoch)
+                created_at_millis REAL NOT NULL,
+                updated_at_millis REAL NOT NULL,
+                synced_at_millis REAL,
+
+                -- Device tracking
+                created_on_device_id TEXT,
+                updated_on_device_id TEXT,
+
+                -- Operation metadata
+                station_call TEXT NOT NULL,
+                title TEXT,
+                subtitle TEXT,
+                grid TEXT,
+
+                -- QSO stats
+                qso_count INTEGER DEFAULT 0,
+                start_at_millis_min REAL,
+                start_at_millis_max REAL,
+
+                -- Status flags
+                deleted INTEGER DEFAULT 0,
+                synced INTEGER DEFAULT 0,
+
+                -- Sync tracking
+                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+                -- Store full JSON for complete data preservation
+                raw_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lofi_operations_updated ON lofi_operations(updated_at_millis);
+            CREATE INDEX IF NOT EXISTS idx_lofi_operations_station ON lofi_operations(station_call);
+            CREATE INDEX IF NOT EXISTS idx_lofi_operations_deleted ON lofi_operations(deleted);
+
+            -- LoFi Operation References (POTA parks, SOTA summits, etc.)
+            CREATE TABLE IF NOT EXISTS lofi_operation_refs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_uuid TEXT NOT NULL,
+
+                -- Reference info
+                ref_type TEXT NOT NULL,
+                reference TEXT NOT NULL,
+                program TEXT,
+                name TEXT,
+                location TEXT,
+                label TEXT,
+                short_label TEXT,
+
+                FOREIGN KEY (operation_uuid) REFERENCES lofi_operations(lofi_uuid) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lofi_op_refs_operation ON lofi_operation_refs(operation_uuid);
+            CREATE INDEX IF NOT EXISTS idx_lofi_op_refs_type ON lofi_operation_refs(ref_type);
+            CREATE INDEX IF NOT EXISTS idx_lofi_op_refs_reference ON lofi_operation_refs(reference);
+
+            -- LoFi QSOs
+            CREATE TABLE IF NOT EXISTS lofi_qsos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                -- LoFi identifiers
+                lofi_uuid TEXT NOT NULL UNIQUE,
+                account_uuid TEXT NOT NULL,
+
+                -- Link to operation (nullable)
+                operation_uuid TEXT,
+
+                -- Timestamps (stored as milliseconds since epoch)
+                created_at_millis REAL NOT NULL,
+                updated_at_millis REAL NOT NULL,
+                synced_at_millis REAL,
+                start_at_millis REAL NOT NULL,
+
+                -- Core QSO fields
+                their_call TEXT NOT NULL,
+                our_call TEXT,
+                band TEXT,
+                freq REAL,
+                mode TEXT,
+                rst_sent TEXT,
+                rst_rcvd TEXT,
+
+                -- Grid squares
+                our_grid TEXT,
+                their_grid TEXT,
+
+                -- Their info
+                their_name TEXT,
+                their_qth TEXT,
+                their_state TEXT,
+                their_country TEXT,
+                their_cq_zone INTEGER,
+                their_itu_zone INTEGER,
+
+                -- Additional fields
+                tx_pwr TEXT,
+                notes TEXT,
+
+                -- Status flags
+                deleted INTEGER DEFAULT 0,
+
+                -- Sync tracking
+                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                is_new INTEGER DEFAULT 1,
+
+                -- Store full JSON for complete data preservation
+                raw_json TEXT NOT NULL,
+
+                FOREIGN KEY (operation_uuid) REFERENCES lofi_operations(lofi_uuid)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lofi_qsos_updated ON lofi_qsos(updated_at_millis);
+            CREATE INDEX IF NOT EXISTS idx_lofi_qsos_their_call ON lofi_qsos(their_call);
+            CREATE INDEX IF NOT EXISTS idx_lofi_qsos_start_at ON lofi_qsos(start_at_millis);
+            CREATE INDEX IF NOT EXISTS idx_lofi_qsos_operation ON lofi_qsos(operation_uuid);
+            CREATE INDEX IF NOT EXISTS idx_lofi_qsos_is_new ON lofi_qsos(is_new);
+            CREATE INDEX IF NOT EXISTS idx_lofi_qsos_deleted ON lofi_qsos(deleted);
+
+            -- LoFi QSO References (their POTA park, SOTA summit, etc.)
+            CREATE TABLE IF NOT EXISTS lofi_qso_refs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                qso_uuid TEXT NOT NULL,
+
+                -- Reference info
+                ref_type TEXT NOT NULL,
+                reference TEXT NOT NULL,
+                program TEXT,
+
+                FOREIGN KEY (qso_uuid) REFERENCES lofi_qsos(lofi_uuid) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lofi_qso_refs_qso ON lofi_qso_refs(qso_uuid);
+            CREATE INDEX IF NOT EXISTS idx_lofi_qso_refs_reference ON lofi_qso_refs(reference);
             "#,
         )?;
         Ok(())
@@ -458,6 +602,21 @@ impl Database {
         self.set_sync_state("wavelog_last_fetched_id", &id.to_string())
     }
 
+    /// Get LoFi bearer token
+    pub fn get_lofi_bearer_token(&self) -> Result<Option<String>> {
+        self.get_sync_state("lofi_bearer_token")
+    }
+
+    /// Set LoFi bearer token
+    pub fn set_lofi_bearer_token(&self, token: &str) -> Result<()> {
+        self.set_sync_state("lofi_bearer_token", token)
+    }
+
+    /// Check if LoFi bearer token exists
+    pub fn has_lofi_bearer_token(&self) -> Result<bool> {
+        Ok(self.get_lofi_bearer_token()?.is_some())
+    }
+
     /// Get QSOs by source (for filtering/querying)
     pub fn get_qsos_by_source(&self, source: &str) -> Result<Vec<Qso>> {
         let mut stmt = self.conn.prepare(
@@ -722,6 +881,275 @@ impl Database {
             journal_mode,
         })
     }
+
+    // === LoFi Database Operations ===
+
+    /// Insert or update a LoFi operation
+    /// Returns true if this is a new operation (not previously seen)
+    pub fn upsert_lofi_operation(
+        &self,
+        op: &crate::lofi::LofiOperation,
+    ) -> Result<bool> {
+        let existing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lofi_operations WHERE lofi_uuid = ?1",
+            params![&op.uuid],
+            |row| row.get(0),
+        )?;
+
+        let is_new = existing == 0;
+        let raw_json =
+            serde_json::to_string(op).map_err(|e| Error::Other(e.to_string()))?;
+
+        // Upsert the operation
+        self.conn.execute(
+            r#"
+            INSERT INTO lofi_operations (
+                lofi_uuid, account_uuid, created_at_millis, updated_at_millis,
+                synced_at_millis, created_on_device_id, updated_on_device_id,
+                station_call, title, subtitle, grid, qso_count,
+                start_at_millis_min, start_at_millis_max, deleted, synced, raw_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            ON CONFLICT(lofi_uuid) DO UPDATE SET
+                updated_at_millis = excluded.updated_at_millis,
+                synced_at_millis = excluded.synced_at_millis,
+                updated_on_device_id = excluded.updated_on_device_id,
+                title = excluded.title,
+                subtitle = excluded.subtitle,
+                grid = excluded.grid,
+                qso_count = excluded.qso_count,
+                start_at_millis_min = excluded.start_at_millis_min,
+                start_at_millis_max = excluded.start_at_millis_max,
+                deleted = excluded.deleted,
+                synced = excluded.synced,
+                raw_json = excluded.raw_json,
+                last_updated_at = datetime('now')
+            "#,
+            params![
+                &op.uuid,
+                &op.account,
+                op.created_at_millis,
+                op.updated_at_millis,
+                op.synced_at_millis,
+                &op.created_on_device_id,
+                &op.updated_on_device_id,
+                &op.station_call,
+                &op.title,
+                &op.subtitle,
+                &op.grid,
+                op.qso_count,
+                op.start_at_millis_min,
+                op.start_at_millis_max,
+                op.deleted,
+                op.synced,
+                &raw_json,
+            ],
+        )?;
+
+        // Delete existing refs and insert new ones
+        self.conn.execute(
+            "DELETE FROM lofi_operation_refs WHERE operation_uuid = ?1",
+            params![&op.uuid],
+        )?;
+
+        for ref_item in &op.refs {
+            self.conn.execute(
+                r#"
+                INSERT INTO lofi_operation_refs (
+                    operation_uuid, ref_type, reference, program, name,
+                    location, label, short_label
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    &op.uuid,
+                    &ref_item.ref_type,
+                    &ref_item.reference,
+                    &ref_item.program,
+                    &ref_item.name,
+                    &ref_item.location,
+                    &ref_item.label,
+                    &ref_item.short_label,
+                ],
+            )?;
+        }
+
+        Ok(is_new)
+    }
+
+    /// Insert or update a LoFi QSO
+    /// Returns true if this is a new QSO (not previously seen)
+    pub fn upsert_lofi_qso(&self, qso: &crate::lofi::LofiQso) -> Result<bool> {
+        let existing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lofi_qsos WHERE lofi_uuid = ?1",
+            params![&qso.uuid],
+            |row| row.get(0),
+        )?;
+
+        let is_new = existing == 0;
+        let raw_json =
+            serde_json::to_string(qso).map_err(|e| Error::Other(e.to_string()))?;
+
+        self.conn.execute(
+            r#"
+            INSERT INTO lofi_qsos (
+                lofi_uuid, account_uuid, operation_uuid, created_at_millis,
+                updated_at_millis, synced_at_millis, start_at_millis,
+                their_call, our_call, band, freq, mode, rst_sent, rst_rcvd,
+                our_grid, their_grid, their_name, their_qth, their_state,
+                their_country, their_cq_zone, their_itu_zone, tx_pwr, notes,
+                deleted, raw_json, is_new
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+            ON CONFLICT(lofi_uuid) DO UPDATE SET
+                updated_at_millis = excluded.updated_at_millis,
+                synced_at_millis = excluded.synced_at_millis,
+                their_call = excluded.their_call,
+                our_call = excluded.our_call,
+                band = excluded.band,
+                freq = excluded.freq,
+                mode = excluded.mode,
+                rst_sent = excluded.rst_sent,
+                rst_rcvd = excluded.rst_rcvd,
+                our_grid = excluded.our_grid,
+                their_grid = excluded.their_grid,
+                their_name = excluded.their_name,
+                their_qth = excluded.their_qth,
+                their_state = excluded.their_state,
+                their_country = excluded.their_country,
+                their_cq_zone = excluded.their_cq_zone,
+                their_itu_zone = excluded.their_itu_zone,
+                tx_pwr = excluded.tx_pwr,
+                notes = excluded.notes,
+                deleted = excluded.deleted,
+                raw_json = excluded.raw_json,
+                last_updated_at = datetime('now')
+            "#,
+            params![
+                &qso.uuid,
+                &qso.account,
+                &qso.operation,
+                qso.created_at_millis,
+                qso.updated_at_millis,
+                qso.synced_at_millis,
+                qso.start_at_millis,
+                &qso.their_call,
+                &qso.our_call,
+                &qso.band,
+                qso.freq,
+                &qso.mode,
+                &qso.rst_sent,
+                &qso.rst_rcvd,
+                &qso.our_grid,
+                &qso.their_grid,
+                &qso.their_name,
+                &qso.their_qth,
+                &qso.their_state,
+                &qso.their_country,
+                qso.their_cq_zone,
+                qso.their_itu_zone,
+                &qso.tx_pwr,
+                &qso.notes,
+                qso.deleted,
+                &raw_json,
+                is_new,
+            ],
+        )?;
+
+        // Delete existing refs and insert new ones
+        self.conn.execute(
+            "DELETE FROM lofi_qso_refs WHERE qso_uuid = ?1",
+            params![&qso.uuid],
+        )?;
+
+        for ref_item in &qso.refs {
+            self.conn.execute(
+                r#"
+                INSERT INTO lofi_qso_refs (qso_uuid, ref_type, reference, program)
+                VALUES (?1, ?2, ?3, ?4)
+                "#,
+                params![
+                    &qso.uuid,
+                    &ref_item.ref_type,
+                    &ref_item.reference,
+                    &ref_item.program,
+                ],
+            )?;
+        }
+
+        Ok(is_new)
+    }
+
+    /// Get new LoFi QSOs that haven't been notified yet, then mark them as notified
+    pub fn get_and_mark_new_lofi_qsos(&self) -> Result<Vec<crate::lofi::LofiQso>> {
+        // Fetch the raw JSON and parse it back
+        let mut stmt = self.conn.prepare(
+            "SELECT raw_json FROM lofi_qsos WHERE is_new = 1 AND deleted = 0 ORDER BY start_at_millis",
+        )?;
+
+        let qsos: Vec<crate::lofi::LofiQso> = stmt
+            .query_map([], |row| {
+                let json: String = row.get(0)?;
+                Ok(json)
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect();
+
+        self.conn
+            .execute("UPDATE lofi_qsos SET is_new = 0 WHERE is_new = 1", [])?;
+
+        Ok(qsos)
+    }
+
+    /// Get total count of LoFi operations
+    pub fn get_lofi_operation_count(&self) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lofi_operations WHERE deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get total count of LoFi QSOs
+    pub fn get_lofi_qso_count(&self) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lofi_qsos WHERE deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get LoFi statistics
+    pub fn get_lofi_stats(&self) -> Result<LofiStats> {
+        let operations: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lofi_operations WHERE deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let qsos: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lofi_qsos WHERE deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let pota_operations: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(DISTINCT o.lofi_uuid)
+            FROM lofi_operations o
+            INNER JOIN lofi_operation_refs r ON o.lofi_uuid = r.operation_uuid
+            WHERE r.program = 'POTA' AND o.deleted = 0
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(LofiStats {
+            operations,
+            qsos,
+            pota_operations,
+        })
+    }
 }
 
 /// Detailed database information
@@ -745,6 +1173,14 @@ pub struct DbStats {
     pub lotw_confirmed: i64,
     pub qsl_confirmed: i64,
     pub processed_files: i64,
+}
+
+/// LoFi-specific statistics
+#[derive(Debug)]
+pub struct LofiStats {
+    pub operations: i64,
+    pub qsos: i64,
+    pub pota_operations: i64,
 }
 
 /// Compute SHA256 hash of content

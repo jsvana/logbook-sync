@@ -26,6 +26,12 @@ pub enum Error {
     #[error("Ntfy notification error: {0}")]
     Ntfy(String),
 
+    #[error("LoFi API error: {0}")]
+    Lofi(String),
+
+    #[error("LoFi authentication failed - token needs refresh")]
+    LofiAuthError,
+
     #[error("{0}")]
     Other(String),
 }
