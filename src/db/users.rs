@@ -20,6 +20,7 @@ pub struct User {
     pub callsign: Option<String>,
     pub is_admin: bool,
     pub is_active: bool,
+    pub theme: String,
     pub created_at: String,
     pub updated_at: String,
     pub last_login_at: Option<String>,
@@ -88,7 +89,7 @@ pub fn get_user_by_username(conn: &Connection, username: &str) -> Result<Option<
     let mut stmt = conn.prepare(
         r#"
         SELECT id, username, email, password_hash, encryption_salt, callsign,
-               is_admin, is_active, created_at, updated_at, last_login_at
+               is_admin, is_active, theme, created_at, updated_at, last_login_at
         FROM users WHERE username = ?1
         "#,
     )?;
@@ -104,9 +105,10 @@ pub fn get_user_by_username(conn: &Connection, username: &str) -> Result<Option<
                 callsign: row.get(5)?,
                 is_admin: row.get::<_, i64>(6)? != 0,
                 is_active: row.get::<_, i64>(7)? != 0,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-                last_login_at: row.get(10)?,
+                theme: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                last_login_at: row.get(11)?,
             })
         })
         .optional()?;
@@ -119,7 +121,7 @@ pub fn get_user_by_id(conn: &Connection, id: i64) -> Result<Option<User>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT id, username, email, password_hash, encryption_salt, callsign,
-               is_admin, is_active, created_at, updated_at, last_login_at
+               is_admin, is_active, theme, created_at, updated_at, last_login_at
         FROM users WHERE id = ?1
         "#,
     )?;
@@ -135,9 +137,10 @@ pub fn get_user_by_id(conn: &Connection, id: i64) -> Result<Option<User>> {
                 callsign: row.get(5)?,
                 is_admin: row.get::<_, i64>(6)? != 0,
                 is_active: row.get::<_, i64>(7)? != 0,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-                last_login_at: row.get(10)?,
+                theme: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                last_login_at: row.get(11)?,
             })
         })
         .optional()?;
@@ -150,7 +153,7 @@ pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT id, username, email, password_hash, encryption_salt, callsign,
-               is_admin, is_active, created_at, updated_at, last_login_at
+               is_admin, is_active, theme, created_at, updated_at, last_login_at
         FROM users ORDER BY username
         "#,
     )?;
@@ -166,9 +169,10 @@ pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
                 callsign: row.get(5)?,
                 is_admin: row.get::<_, i64>(6)? != 0,
                 is_active: row.get::<_, i64>(7)? != 0,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-                last_login_at: row.get(10)?,
+                theme: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                last_login_at: row.get(11)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -199,6 +203,23 @@ pub fn update_user_profile(
     conn.execute(
         "UPDATE users SET email = ?1, callsign = ?2, updated_at = datetime('now') WHERE id = ?3",
         params![email, callsign, user_id],
+    )?;
+
+    Ok(())
+}
+
+/// Update user theme preference
+pub fn update_user_theme(conn: &Connection, user_id: i64, theme: &str) -> Result<()> {
+    // Validate theme value
+    if theme != "light" && theme != "dark" {
+        return Err(crate::Error::Other(
+            "Invalid theme: must be 'light' or 'dark'".into(),
+        ));
+    }
+
+    conn.execute(
+        "UPDATE users SET theme = ?1, updated_at = datetime('now') WHERE id = ?2",
+        params![theme, user_id],
     )?;
 
     Ok(())

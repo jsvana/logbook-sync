@@ -5,20 +5,45 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>logbook-sync</title>
     <style>
+        /* Light theme (default) */
         :root {
+            --bg: #f5f5f7;
+            --surface: #ffffff;
+            --primary: #e0e0e0;
+            --accent: #e94560;
+            --text: #1a1a2e;
+            --text-dim: #666;
+            --success-bg: #d4edda;
+            --error-bg: #f8d7da;
+            --badge-enabled-bg: #d4edda;
+            --badge-enabled-text: #155724;
+            --badge-disabled-bg: #f8d7da;
+            --badge-disabled-text: #721c24;
+        }
+
+        /* Dark theme */
+        [data-theme="dark"] {
             --bg: #1a1a2e;
             --surface: #16213e;
             --primary: #0f3460;
             --accent: #e94560;
             --text: #eee;
             --text-dim: #888;
+            --success-bg: #1a472a;
+            --error-bg: #5c1a1a;
+            --badge-enabled-bg: #1a472a;
+            --badge-enabled-text: #4ade80;
+            --badge-disabled-bg: #5c1a1a;
+            --badge-disabled-text: #f87171;
         }
+
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: var(--bg);
             color: var(--text);
             min-height: 100vh;
+            transition: background-color 0.3s, color 0.3s;
         }
         .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
         .card {
@@ -56,8 +81,8 @@
         .tab.active { border-color: var(--accent); }
         .hidden { display: none !important; }
         .status { padding: 0.5rem; border-radius: 4px; margin-bottom: 1rem; }
-        .status.success { background: #1a472a; }
-        .status.error { background: #5c1a1a; }
+        .status.success { background: var(--success-bg); }
+        .status.error { background: var(--error-bg); }
         .integration-card {
             display: flex;
             justify-content: space-between;
@@ -88,8 +113,8 @@
             font-size: 0.75rem;
             margin-left: 0.5rem;
         }
-        .badge.enabled { background: #1a472a; color: #4ade80; }
-        .badge.disabled { background: #5c1a1a; color: #f87171; }
+        .badge.enabled { background: var(--badge-enabled-bg); color: var(--badge-enabled-text); }
+        .badge.disabled { background: var(--badge-disabled-bg); color: var(--badge-disabled-text); }
         #add-integration-menu {
             position: absolute;
             right: 0;
@@ -103,6 +128,49 @@
             display: block;
         }
         #add-integration-menu.hidden { display: none !important; }
+
+        /* Loading spinner */
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 3rem;
+            color: var(--text-dim);
+        }
+        .spinner {
+            width: 24px;
+            height: 24px;
+            border: 3px solid var(--primary);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 0.75rem;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+        .stat-item {
+            text-align: center;
+            padding: 1rem;
+            background: var(--bg);
+            border-radius: 4px;
+        }
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: var(--accent);
+        }
+        .stat-label {
+            font-size: 0.85rem;
+            color: var(--text-dim);
+            margin-top: 0.25rem;
+        }
     </style>
 </head>
 <body>
@@ -153,9 +221,15 @@
                             </div>
                         </div>
                     </div>
-                    <div id="configured-integrations"></div>
-                    <div id="no-integrations" class="hidden" style="color: var(--text-dim); text-align: center; padding: 2rem;">
-                        No integrations configured yet. Click "Add Integration" to get started.
+                    <div id="integrations-loading" class="loading">
+                        <div class="spinner"></div>
+                        <span>Loading integrations...</span>
+                    </div>
+                    <div id="integrations-content" class="hidden">
+                        <div id="configured-integrations"></div>
+                        <div id="no-integrations" class="hidden" style="color: var(--text-dim); text-align: center; padding: 2rem;">
+                            No integrations configured yet. Click "Add Integration" to get started.
+                        </div>
                     </div>
                 </div>
             </div>
@@ -163,18 +237,21 @@
             <!-- QSOs Tab -->
             <div id="tab-qsos" class="tab-content hidden">
                 <div class="card">
-                    <h2>Upload Log</h2>
-                    <p style="color: var(--text-dim); margin-bottom: 1rem;">Upload an ADIF file to import QSOs</p>
-                    <div style="display: flex; gap: 1rem; align-items: center;">
-                        <input type="file" id="adif-file" accept=".adi,.adif" style="flex: 1;">
-                        <button id="upload-btn">Upload</button>
+                    <h2>QSO Log</h2>
+                    <div id="qsos-loading" class="loading">
+                        <div class="spinner"></div>
+                        <span>Loading statistics...</span>
                     </div>
-                    <div id="upload-status" class="status hidden" style="margin-top: 1rem;"></div>
-                </div>
-
-                <div class="card">
-                    <h2>QSO Statistics</h2>
-                    <div id="qso-stats" style="margin-bottom: 1rem;"></div>
+                    <div id="qsos-content" class="hidden">
+                        <div id="qso-stats" class="stats-grid"></div>
+                        <hr style="border: none; border-top: 1px solid var(--primary); margin: 1.5rem 0;">
+                        <h3 style="margin-bottom: 0.75rem;">Upload ADIF Log</h3>
+                        <div style="display: flex; gap: 1rem; align-items: center;">
+                            <input type="file" id="adif-file" accept=".adi,.adif" style="flex: 1;">
+                            <button id="upload-btn">Upload</button>
+                        </div>
+                        <div id="upload-status" class="status hidden" style="margin-top: 1rem;"></div>
+                    </div>
                 </div>
 
                 <div class="card">
@@ -203,6 +280,17 @@
                         </div>
                         <button type="submit">Save Changes</button>
                     </form>
+                </div>
+
+                <div class="card">
+                    <h2>Appearance</h2>
+                    <div class="form-group">
+                        <label>Theme</label>
+                        <select id="theme-select" style="width: 200px;">
+                            <option value="light">Light</option>
+                            <option value="dark">Dark</option>
+                        </select>
+                    </div>
                 </div>
 
                 <div class="card">
@@ -332,8 +420,19 @@
             document.getElementById('user-callsign').textContent = currentUser.callsign || currentUser.username;
             document.getElementById('settings-callsign').value = currentUser.callsign || '';
             document.getElementById('settings-email').value = currentUser.email || '';
+            // Apply user's theme preference
+            applyTheme(currentUser.theme || 'light');
+            document.getElementById('theme-select').value = currentUser.theme || 'light';
             loadIntegrations();
             loadQsoStats();
+        }
+
+        function applyTheme(theme) {
+            if (theme === 'dark') {
+                document.documentElement.setAttribute('data-theme', 'dark');
+            } else {
+                document.documentElement.removeAttribute('data-theme');
+            }
         }
 
         document.getElementById('login-form').addEventListener('submit', async (e) => {
@@ -385,6 +484,12 @@
 
         // Integrations
         async function loadIntegrations() {
+            const loadingEl = document.getElementById('integrations-loading');
+            const contentEl = document.getElementById('integrations-content');
+
+            loadingEl.classList.remove('hidden');
+            contentEl.classList.add('hidden');
+
             try {
                 integrations = await api('/integrations');
                 renderIntegrations();
@@ -392,6 +497,9 @@
                 console.error('Failed to load integrations:', err);
                 integrations = [];
                 renderIntegrations();
+            } finally {
+                loadingEl.classList.add('hidden');
+                contentEl.classList.remove('hidden');
             }
         }
 
@@ -630,15 +738,38 @@
 
         // QSO Stats
         async function loadQsoStats() {
+            const loadingEl = document.getElementById('qsos-loading');
+            const contentEl = document.getElementById('qsos-content');
+
+            loadingEl.classList.remove('hidden');
+            contentEl.classList.add('hidden');
+
             try {
                 const stats = await api('/qsos/stats');
                 document.getElementById('qso-stats').innerHTML = `
-                    <p>Total QSOs: ${stats.total_qsos || 0}</p>
-                    <p>Synced to QRZ: ${stats.synced_qrz || 0}</p>
-                    <p>LotW Confirmed: ${stats.lotw_confirmed || 0}</p>
+                    <div class="stat-item">
+                        <div class="stat-value">${stats.total_qsos || 0}</div>
+                        <div class="stat-label">Total QSOs</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value">${stats.synced_qrz || 0}</div>
+                        <div class="stat-label">Synced to QRZ</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value">${stats.lotw_confirmed || 0}</div>
+                        <div class="stat-label">LotW Confirmed</div>
+                    </div>
                 `;
             } catch (err) {
                 console.error('Failed to load QSO stats:', err);
+                document.getElementById('qso-stats').innerHTML = `
+                    <div class="stat-item" style="grid-column: 1 / -1;">
+                        <div class="stat-label">Failed to load statistics</div>
+                    </div>
+                `;
+            } finally {
+                loadingEl.classList.add('hidden');
+                contentEl.classList.remove('hidden');
             }
         }
 
@@ -658,6 +789,24 @@
                 checkAuth();
             } catch {
                 alert('Failed to update profile');
+            }
+        });
+
+        // Theme selector
+        document.getElementById('theme-select').addEventListener('change', async (e) => {
+            const theme = e.target.value;
+            applyTheme(theme);
+            try {
+                await api('/users/me/theme', {
+                    method: 'PUT',
+                    body: JSON.stringify({ theme }),
+                });
+                currentUser.theme = theme;
+            } catch {
+                // Revert on error
+                applyTheme(currentUser.theme || 'light');
+                e.target.value = currentUser.theme || 'light';
+                alert('Failed to save theme preference');
             }
         });
 

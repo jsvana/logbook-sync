@@ -60,6 +60,7 @@ pub struct UserInfo {
     pub email: Option<String>,
     pub callsign: Option<String>,
     pub is_admin: bool,
+    pub theme: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +96,11 @@ pub struct UpdateProfileRequest {
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateThemeRequest {
+    pub theme: String,
 }
 
 // === Auth helpers ===
@@ -157,15 +163,29 @@ fn validate_session_token(token: &str, master_key: &MasterKey) -> Option<i64> {
 }
 
 /// Get current user from session cookie (returns full db user for internal use)
-fn get_current_user_full(
-    jar: &CookieJar,
-    state: &AppState,
-) -> Option<(users::User, Connection)> {
+fn get_current_user_full(jar: &CookieJar, state: &AppState) -> Option<(users::User, Connection)> {
     let cookie = jar.get(SESSION_COOKIE_NAME)?;
     let user_id = validate_session_token(cookie.value(), &state.master_key)?;
 
-    let conn = Connection::open(&state.db_path).ok()?;
-    let user = users::get_user_by_id(&conn, user_id).ok()??;
+    let conn = match Connection::open(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to open database in get_current_user_full: {}", e);
+            return None;
+        }
+    };
+
+    let user = match users::get_user_by_id(&conn, user_id) {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            tracing::debug!("User {} not found in database", user_id);
+            return None;
+        }
+        Err(e) => {
+            tracing::error!("Database error fetching user {}: {}", user_id, e);
+            return None;
+        }
+    };
 
     if !user.is_active {
         return None;
@@ -184,6 +204,7 @@ fn get_current_user(jar: &CookieJar, state: &AppState) -> Option<UserInfo> {
         email: user.email,
         callsign: user.callsign,
         is_admin: user.is_admin,
+        theme: user.theme,
     })
 }
 
@@ -193,13 +214,11 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../../static/index.html"))
 }
 
-async fn login(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> impl IntoResponse {
+async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> impl IntoResponse {
     let conn = match Connection::open(&state.db_path) {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
+            tracing::error!("Failed to open database: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [("", "".to_string())],
@@ -225,13 +244,29 @@ async fn login(
                 }),
             );
         }
-        _ => {
+        Ok(None) => {
             return (
                 StatusCode::UNAUTHORIZED,
                 [("", "".to_string())],
                 Json(LoginResponse {
                     success: false,
                     message: "Invalid username or password".into(),
+                    user: None,
+                }),
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "Database error during login for user '{}': {}",
+                req.username,
+                e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("", "".to_string())],
+                Json(LoginResponse {
+                    success: false,
+                    message: "Database error".into(),
                     user: None,
                 }),
             );
@@ -270,6 +305,7 @@ async fn login(
         email: user.email,
         callsign: user.callsign,
         is_admin: user.is_admin,
+        theme: user.theme,
     };
 
     (
@@ -387,6 +423,7 @@ async fn list_users(State(state): State<AppState>) -> impl IntoResponse {
                     email: u.email.clone(),
                     callsign: u.callsign.clone(),
                     is_admin: u.is_admin,
+                    theme: u.theme.clone(),
                 })
                 .collect();
             (StatusCode::OK, Json(info))
@@ -407,13 +444,15 @@ async fn health() -> impl IntoResponse {
 
 // === Integration handlers ===
 
-async fn list_integrations(
-    State(state): State<AppState>,
-    jar: CookieJar,
-) -> impl IntoResponse {
+async fn list_integrations(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
     let (user, conn) = match get_current_user_full(&jar, &state) {
         Some(u) => u,
-        None => return (StatusCode::UNAUTHORIZED, Json(Vec::<IntegrationInfo>::new())),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(Vec::<IntegrationInfo>::new()),
+            )
+        }
     };
 
     let user_salt = match users::get_user_encryption_salt(&user) {
@@ -613,18 +652,16 @@ async fn test_integration(
 
     // Parse and test based on integration type
     match integration_type.as_str() {
-        "qrz" => {
-            match serde_json::from_value::<integrations::QrzIntegrationConfig>(req.config) {
-                Ok(config) => test_qrz_connection(&config).await,
-                Err(e) => (
-                    StatusCode::BAD_REQUEST,
-                    Json(SuccessResponse {
-                        success: false,
-                        message: Some(format!("Invalid config: {}", e)),
-                    }),
-                ),
-            }
-        }
+        "qrz" => match serde_json::from_value::<integrations::QrzIntegrationConfig>(req.config) {
+            Ok(config) => test_qrz_connection(&config).await,
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some(format!("Invalid config: {}", e)),
+                }),
+            ),
+        },
         "lofi" => (
             StatusCode::OK,
             Json(SuccessResponse {
@@ -726,6 +763,42 @@ async fn update_profile(
             Json(SuccessResponse {
                 success: false,
                 message: Some(format!("Failed to update profile: {}", e)),
+            }),
+        ),
+    }
+}
+
+async fn update_theme(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(req): Json<UpdateThemeRequest>,
+) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("Unauthorized".into()),
+                }),
+            )
+        }
+    };
+
+    match users::update_user_theme(&conn, user.id, &req.theme) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(SuccessResponse {
+                success: true,
+                message: None,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(SuccessResponse {
+                success: false,
+                message: Some(format!("{}", e)),
             }),
         ),
     }
@@ -838,9 +911,7 @@ async fn upload_log(
         .unwrap_or_else(|| "upload.adi".to_string());
 
     // Validate file extension
-    if !filename.to_lowercase().ends_with(".adi")
-        && !filename.to_lowercase().ends_with(".adif")
-    {
+    if !filename.to_lowercase().ends_with(".adi") && !filename.to_lowercase().ends_with(".adif") {
         return (
             StatusCode::BAD_REQUEST,
             Json(SuccessResponse {
@@ -937,10 +1008,7 @@ async fn upload_log(
         StatusCode::OK,
         Json(SuccessResponse {
             success: true,
-            message: Some(format!(
-                "Uploaded {} with {} QSOs",
-                filename, qso_count
-            )),
+            message: Some(format!("Uploaded {} with {} QSOs", filename, qso_count)),
         }),
     )
 }
@@ -974,13 +1042,17 @@ pub async fn build_router(db_path: PathBuf, master_key: MasterKey) -> Router {
         .route("/users", get(list_users))
         .route("/users/me", put(update_profile))
         .route("/users/me/password", put(change_password))
+        .route("/users/me/theme", put(update_theme))
         // Integrations
         .route("/integrations", get(list_integrations))
         .route(
             "/integrations/:integration_type",
             put(save_integration).delete(delete_integration),
         )
-        .route("/integrations/:integration_type/test", post(test_integration))
+        .route(
+            "/integrations/:integration_type/test",
+            post(test_integration),
+        )
         // Log upload
         .route("/logs/upload", post(upload_log));
 
@@ -999,6 +1071,21 @@ pub async fn serve(
     master_key: MasterKey,
     bind: &str,
 ) -> std::result::Result<(), std::io::Error> {
+    // Run migrations before starting the server
+    tracing::info!("Running database migrations...");
+    match Database::open(&db_path) {
+        Ok(_db) => {
+            tracing::info!("Database migrations completed");
+        }
+        Err(e) => {
+            tracing::error!("Failed to run database migrations: {}", e);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ));
+        }
+    }
+
     let app = build_router(db_path, master_key).await;
 
     let listener = tokio::net::TcpListener::bind(bind).await?;

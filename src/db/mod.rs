@@ -291,6 +291,7 @@ impl Database {
                 callsign TEXT,
                 is_admin INTEGER NOT NULL DEFAULT 0,
                 is_active INTEGER NOT NULL DEFAULT 1,
+                theme TEXT NOT NULL DEFAULT 'light',  -- 'light' or 'dark'
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 last_login_at TEXT
@@ -379,6 +380,20 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_qsos_source ON qsos(source)",
             [],
         )?;
+
+        // Add theme column to users table (migration v3)
+        let user_columns: Vec<String> = self
+            .conn
+            .prepare("PRAGMA table_info(users)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if !user_columns.is_empty() && !user_columns.contains(&"theme".to_string()) {
+            self.conn.execute(
+                "ALTER TABLE users ADD COLUMN theme TEXT NOT NULL DEFAULT 'light'",
+                [],
+            )?;
+        }
 
         Ok(())
     }
