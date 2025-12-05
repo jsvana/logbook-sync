@@ -3,10 +3,30 @@
 //! Note: Downloading confirmations requires an eQSL AG (Authenticity Guaranteed) membership.
 
 use crate::adif::{Qso, parse_adif, write_adif};
-use crate::config::EqslConfig;
 use crate::{Error, Result};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
+
+/// Configuration for eQSL.cc integration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EqslConfig {
+    /// Whether eQSL integration is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// eQSL username (your callsign)
+    pub username: Option<String>,
+    /// eQSL password
+    pub password: Option<String>,
+    /// QTH nickname (optional, for multi-location stations)
+    pub qth_nickname: Option<String>,
+    /// Whether to upload to eQSL
+    #[serde(default)]
+    pub upload: bool,
+    /// Whether to download confirmations from eQSL (requires AG membership)
+    #[serde(default)]
+    pub download: bool,
+}
 
 /// eQSL client for uploading QSOs and downloading confirmations
 pub struct EqslClient {
@@ -280,7 +300,6 @@ mod tests {
             qth_nickname: None,
             upload: true,
             download: true,
-            download_interval: 86400,
         }
     }
 

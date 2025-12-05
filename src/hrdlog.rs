@@ -5,10 +5,22 @@
 //! obtained from your HRDLog.net account settings.
 
 use crate::adif::{Qso, write_adif};
-use crate::config::HrdlogConfig;
 use crate::{Error, Result};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+
+/// Configuration for HRDLog.net integration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HrdlogConfig {
+    /// Whether HRDLog integration is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// Your callsign for uploads
+    pub callsign: String,
+    /// HRDLog upload code (not your password)
+    pub upload_code: Option<String>,
+}
 
 const HRDLOG_API_URL: &str = "http://robot.hrdlog.net/NewEntry.aspx";
 const APP_NAME: &str = "logbook-sync";

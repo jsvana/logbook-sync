@@ -759,8 +759,8 @@ async fn lofi_setup(
     jar: CookieJar,
     Json(req): Json<LofiSetupRequest>,
 ) -> impl IntoResponse {
-    use crate::config::LofiConfig;
     use crate::lofi::LofiClient;
+    use crate::lofi::LofiConfig;
 
     let (user, conn) = match get_current_user_full(&jar, &state) {
         Some(u) => u,
@@ -997,8 +997,8 @@ async fn lofi_send_link(
     jar: CookieJar,
     Json(req): Json<LofiSendLinkRequest>,
 ) -> impl IntoResponse {
-    use crate::config::LofiConfig;
     use crate::lofi::LofiClient;
+    use crate::lofi::LofiConfig;
 
     let (user, conn) = match get_current_user_full(&jar, &state) {
         Some(u) => u,

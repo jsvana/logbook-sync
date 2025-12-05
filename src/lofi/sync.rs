@@ -2,7 +2,6 @@
 
 use crate::db::Database;
 use crate::error::Result;
-use crate::metrics;
 use crate::ntfy::NtfyClient;
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
@@ -54,7 +53,6 @@ impl<'a> LofiSyncService<'a> {
             }
             Err(e) => {
                 warn!(error = %e, "Failed to sync operations, continuing with QSOs");
-                metrics::record_sync_error("lofi", "operations_sync");
             }
         }
 
@@ -70,31 +68,17 @@ impl<'a> LofiSyncService<'a> {
             }
             Err(e) => {
                 warn!(error = %e, "Failed to sync QSOs");
-                metrics::record_sync_error("lofi", "qsos_sync");
                 return Err(e);
             }
         }
 
-        // Record metrics
         let duration = start_time.elapsed();
-        metrics::record_sync_duration("lofi", "full_sync", duration.as_secs_f64());
-
-        if stats.new_operations > 0 || stats.updated_operations > 0 {
-            metrics::record_qso_downloaded(
-                "lofi",
-                (stats.new_operations + stats.updated_operations) as u64,
-            );
-        }
-        if stats.new_qsos > 0 || stats.updated_qsos > 0 {
-            metrics::record_qso_downloaded("lofi", (stats.new_qsos + stats.updated_qsos) as u64);
-        }
 
         // Send notifications for new data (only if truly new)
-        if stats.new_qsos > 0 || stats.new_operations > 0 {
-            if let Err(e) = self.send_notifications(&stats).await {
-                warn!(error = %e, "Failed to send LoFi sync notifications");
-            }
-            metrics::record_sync_success("lofi");
+        if (stats.new_qsos > 0 || stats.new_operations > 0)
+            && let Err(e) = self.send_notifications(&stats).await
+        {
+            warn!(error = %e, "Failed to send LoFi sync notifications");
         }
 
         info!(
@@ -304,7 +288,6 @@ pub async fn run_lofi_sync_loop(
 
                 if let Err(e) = service.sync_all().await {
                     error!(error = %e, "LoFi sync failed");
-                    metrics::record_sync_error("lofi", "sync_loop");
                 }
             }
         }

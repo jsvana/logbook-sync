@@ -1,50 +1,5 @@
-# Test configuration for logbook-sync
-# Uses the provided QRZ API key and local directories
-
 [general]
-callsign = "W6JSV"
-sync_interval = 300
 log_level = "debug"
-
-[local]
-watch_dir = "/home/jsvana/projects/logbook-sync/test-logs"
-output_dir = "/home/jsvana/projects/logbook-sync/test-logs/downloaded"
-patterns = ["*.adi", "*.adif"]
-debounce_secs = 5
-process_existing = true
-
-[qrz]
-enabled = true
-api_key = "1929-BDD0-182F-5B67"
-upload = true
-download = true
-download_interval = 3600
-
-[pota]
-enabled = false
-
-[wavelog]
-enabled = true
-base_url = "https://wavelog.qrp.lol/"
-api_key = "wl5b39ed9de5a29"
-download_interval = 3600
-accept_invalid_certs = true
-station_id = "1"
-username = "jsvana"
-password = "LRHkvTkGTbu@ZWaPsNb6"
 
 [database]
 path = "/home/jsvana/projects/logbook-sync/test-state.db"
-
-[ntfy]
-enabled = true
-server = "https://ntfy.westpeninsulashould.works"
-topic = "OLst4lvVaUC2IADb"
-token = "tk_l2mjh51sy9zw09rgz513zduh5amx9"
-
-[lofi]
-enabled = true
-client_key = "6a756917-627b-465a-b42b-fc127954cea5"
-client_secret = "902b3cbc8f1a9464957a801419ae436df24bbbb9030a64ad4d8d3e17fb416330"
-callsign = "W6JSV"
-device_linked = true

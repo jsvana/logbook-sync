@@ -4,12 +4,36 @@
 //! This module focuses on downloading confirmations via HTTPS.
 
 use crate::adif::{Qso, parse_adif};
-use crate::config::LotwConfig;
 use crate::{Error, Result};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info, warn};
+
+/// Configuration for LoTW (Logbook of The World) integration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LotwConfig {
+    /// Whether LoTW integration is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// LoTW username (your callsign)
+    pub username: Option<String>,
+    /// LoTW password
+    pub password: Option<String>,
+    /// Your callsign for LoTW queries
+    pub callsign: Option<String>,
+    /// Path to TQSL executable (for uploads)
+    pub tqsl_path: Option<String>,
+    /// TQSL station location name
+    pub station_location: Option<String>,
+    /// Whether to upload to LoTW (requires TQSL)
+    #[serde(default)]
+    pub upload: bool,
+    /// Whether to download confirmations from LoTW
+    #[serde(default)]
+    pub download: bool,
+}
 
 /// LoTW client for downloading confirmations and optionally uploading via TQSL
 pub struct LotwClient {
@@ -209,7 +233,6 @@ mod tests {
             station_location: None,
             upload: false,
             download: true,
-            download_interval: 86400,
         }
     }
 

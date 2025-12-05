@@ -4,8 +4,24 @@
 //! An API key is required, which can be obtained by emailing ClubLog support.
 
 use crate::adif::{Qso, write_adif};
-use crate::config::ClublogConfig;
 use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
+
+/// Configuration for ClubLog integration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClublogConfig {
+    /// Whether ClubLog integration is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// ClubLog email address (not callsign)
+    pub email: Option<String>,
+    /// ClubLog application password
+    pub password: Option<String>,
+    /// Your callsign for uploads
+    pub callsign: String,
+    /// ClubLog API key (obtain from ClubLog support)
+    pub api_key: Option<String>,
+}
 use reqwest::Client;
 use tracing::{debug, info, warn};
 

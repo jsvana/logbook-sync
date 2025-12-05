@@ -1,11 +1,63 @@
 //! HTTP client for Ham2K LoFi API.
 
-use crate::config::LofiConfig;
 use crate::error::{Error, Result};
 use reqwest::{Client, header};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::models::*;
+
+/// Configuration for Ham2K LoFi client
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LofiConfig {
+    /// Whether LoFi integration is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// UUID v4 client key
+    pub client_key: Option<String>,
+    /// Random secret
+    pub client_secret: Option<String>,
+    /// User's amateur radio callsign
+    pub callsign: Option<String>,
+    /// Email for device linking
+    pub email: Option<String>,
+    /// Sync batch size
+    #[serde(default = "default_batch_size")]
+    pub sync_batch_size: u32,
+    /// Delay between pagination requests in milliseconds
+    #[serde(default = "default_loop_delay")]
+    pub sync_loop_delay_ms: u64,
+    /// Sync check period in milliseconds
+    #[serde(default = "default_check_period")]
+    pub sync_check_period_ms: u64,
+    /// Whether device has been linked via email confirmation
+    #[serde(default)]
+    pub device_linked: bool,
+}
+
+fn default_batch_size() -> u32 {
+    50
+}
+
+fn default_loop_delay() -> u64 {
+    10000
+}
+
+fn default_check_period() -> u64 {
+    300000 // 5 minutes
+}
+
+impl LofiConfig {
+    /// Check if the configuration has the required credentials for registration
+    pub fn has_credentials(&self) -> bool {
+        self.client_key.is_some() && self.client_secret.is_some() && self.callsign.is_some()
+    }
+
+    /// Check if ready for sync
+    pub fn is_ready_for_sync(&self) -> bool {
+        self.enabled && self.device_linked && self.has_credentials()
+    }
+}
 
 const LOFI_BASE_URL: &str = "https://lofi.ham2k.net";
 const USER_AGENT: &str = "logbook-sync-server";
