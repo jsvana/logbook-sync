@@ -380,7 +380,19 @@ async fn run_lofi_download(
     let mut cursor: Option<f64> = None;
 
     loop {
-        let response = client.fetch_qsos(cursor, Some(50)).await?;
+        let response = match client.fetch_qsos(cursor, Some(50)).await {
+            Ok(r) => r,
+            Err(crate::Error::Lofi(msg)) if msg.contains("404") => {
+                // 404 means the device is no longer linked on the LoFi server
+                // This is not a fatal error - the user just needs to re-link
+                debug!(
+                    user_id = user_id,
+                    "LoFi returned 404 - device may need to be re-linked"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         // Save QSOs to database (open/close connection for each batch)
         {
