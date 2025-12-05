@@ -524,6 +524,9 @@
             <div class="card" style="max-width: 700px; width: 100%; max-height: 80vh; overflow-y: auto;">
                 <h2>POTA Activation Upload</h2>
                 <div id="pota-summary" style="margin-bottom: 1rem; padding: 0.75rem; background: var(--surface); border-radius: 4px;"></div>
+                <div id="pota-selection-controls" style="margin-bottom: 0.5rem; display: none;">
+                    <button type="button" id="pota-toggle-all" onclick="toggleAllPotaActivations()" style="padding: 0.25rem 0.5rem; font-size: 0.875rem;">Deselect All</button>
+                </div>
                 <div id="pota-valid-activations" style="margin-bottom: 1rem;"></div>
                 <div id="pota-invalid-activations" style="margin-bottom: 1rem;"></div>
                 <div style="display: flex; gap: 1rem;">
@@ -1051,11 +1054,13 @@
             `;
 
             // Valid activations
+            const selectionControls = document.getElementById('pota-selection-controls');
             if (data.valid_activations.length > 0) {
+                selectionControls.style.display = 'block';
                 validList.innerHTML = data.valid_activations.map(a => `
                     <div class="pota-activation valid">
                         <label>
-                            <input type="checkbox" checked value="${a.park_ref}:${a.date}" class="pota-activation-checkbox">
+                            <input type="checkbox" checked value="${a.park_ref}:${a.date}" class="pota-activation-checkbox" onchange="updatePotaUploadButton(); updatePotaToggleButton();">
                             <strong>${a.park_ref}</strong> on ${formatPotaDate(a.date)} - ${a.qso_count} QSOs
                         </label>
                         <details>
@@ -1069,7 +1074,9 @@
                         </details>
                     </div>
                 `).join('');
+                updatePotaToggleButton();
             } else {
+                selectionControls.style.display = 'none';
                 validList.innerHTML = '<div class="no-activations">No valid activations found (need 10+ QSOs with POTA park reference)</div>';
             }
 
@@ -1115,6 +1122,30 @@
         function closePotaModal() {
             document.getElementById('pota-modal').classList.add('hidden');
             potaPreviewData = null;
+        }
+
+        function toggleAllPotaActivations() {
+            const checkboxes = document.querySelectorAll('.pota-activation-checkbox');
+            const checkedCount = document.querySelectorAll('.pota-activation-checkbox:checked').length;
+            const allChecked = checkedCount === checkboxes.length;
+
+            // If all are checked, uncheck all. Otherwise, check all.
+            checkboxes.forEach(cb => cb.checked = !allChecked);
+
+            updatePotaUploadButton();
+            updatePotaToggleButton();
+        }
+
+        function updatePotaToggleButton() {
+            const btn = document.getElementById('pota-toggle-all');
+            const checkboxes = document.querySelectorAll('.pota-activation-checkbox');
+            const checkedCount = document.querySelectorAll('.pota-activation-checkbox:checked').length;
+
+            if (checkedCount === checkboxes.length) {
+                btn.textContent = 'Deselect All';
+            } else {
+                btn.textContent = 'Select All';
+            }
         }
 
         async function uploadSelectedPota() {
