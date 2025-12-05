@@ -1577,9 +1577,7 @@ pub async fn serve(
         }
         Err(e) => {
             tracing::error!("Failed to run database migrations: {}", e);
-            return Err(std::io::Error::other(
-                e.to_string(),
-            ));
+            return Err(std::io::Error::other(e.to_string()));
         }
     }
 
