@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(cargo search:*)",
-      "Bash(cargo fmt:*)"
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)"
     ],
     "deny": [],
     "ask": []
