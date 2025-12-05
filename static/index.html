@@ -469,6 +469,7 @@
             eqsl: { name: 'eQSL', desc: 'eQSL.cc electronic QSL' },
             hrdlog: { name: 'HRDLog', desc: 'HRDLog.net logbook' },
             wavelog: { name: 'Wavelog', desc: 'Self-hosted Wavelog instance' },
+            ntfy: { name: 'ntfy', desc: 'Push notifications via ntfy.sh' },
         };
 
         // Integration field definitions (lofi has its own wizard)
@@ -499,6 +500,14 @@
             wavelog: [
                 { name: 'base_url', label: 'Base URL', type: 'url', required: true },
                 { name: 'api_key', label: 'API Key', type: 'password', required: true },
+            ],
+            ntfy: [
+                { name: 'server', label: 'Server URL', type: 'url', default: 'https://ntfy.sh' },
+                { name: 'topic', label: 'Topic', type: 'text', required: true },
+                { name: 'token', label: 'Access Token (optional)', type: 'password' },
+                { name: 'priority', label: 'Priority (1-5)', type: 'number', default: 3 },
+                { name: 'notify_on_sync', label: 'Notify on Sync', type: 'checkbox', default: true },
+                { name: 'notify_on_error', label: 'Notify on Error', type: 'checkbox', default: true },
             ],
         };
 
@@ -633,6 +642,7 @@
             eqsl: { upload: true, download: true },
             hrdlog: { upload: true, download: false },
             wavelog: { upload: true, download: true },
+            ntfy: { upload: false, download: false }, // Notifications only, no sync
         };
 
         function formatSyncTime(isoString) {
@@ -679,6 +689,25 @@
         function renderSyncStatus(type, syncState, config, syncIntervalSecs) {
             const caps = SYNC_CAPABILITIES[type] || {};
             const rows = [];
+
+            // Special case for ntfy - show test button instead of sync status
+            if (type === 'ntfy') {
+                return `<div class="sync-status">
+                    <div class="sync-row">
+                        <div class="sync-direction">
+                            <div class="sync-info">
+                                <span>Push Notifications</span>
+                                <span class="sync-time">Send a test notification to verify setup</span>
+                            </div>
+                        </div>
+                        <div class="sync-actions">
+                            <button class="sync-btn" onclick="testNtfy()" id="test-ntfy-btn">
+                                Test
+                            </button>
+                        </div>
+                    </div>
+                </div>`;
+            }
 
             // Check if upload/download is enabled in config
             const uploadEnabled = config?.upload_enabled !== false && caps.upload;
@@ -824,6 +853,33 @@
                 loadIntegrations();
             } catch (err) {
                 alert('Failed to remove integration');
+            }
+        }
+
+        // Test ntfy notification
+        async function testNtfy() {
+            const btn = document.getElementById('test-ntfy-btn');
+            if (!btn) return;
+
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Sending...';
+            btn.classList.add('syncing');
+
+            try {
+                const result = await api('/integrations/ntfy/test', { method: 'POST' });
+
+                if (result.success) {
+                    alert('Test notification sent! Check your ntfy app.');
+                } else {
+                    alert(`Test failed: ${result.message}`);
+                }
+            } catch (err) {
+                alert(`Test error: ${err.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+                btn.classList.remove('syncing');
             }
         }
 

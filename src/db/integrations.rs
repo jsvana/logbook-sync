@@ -89,6 +89,35 @@ pub struct WavelogIntegrationConfig {
     pub download_enabled: bool,
 }
 
+/// ntfy.sh notification integration configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtfyIntegrationConfig {
+    /// The ntfy server URL (default: https://ntfy.sh)
+    #[serde(default = "default_ntfy_server")]
+    pub server: String,
+    /// The topic to publish to
+    pub topic: String,
+    /// Optional authentication token
+    pub token: Option<String>,
+    /// Priority level (1-5, default 3)
+    #[serde(default = "default_ntfy_priority")]
+    pub priority: u8,
+    /// Notify on new QSOs synced
+    #[serde(default = "default_true")]
+    pub notify_on_sync: bool,
+    /// Notify on sync errors
+    #[serde(default = "default_true")]
+    pub notify_on_error: bool,
+}
+
+fn default_ntfy_server() -> String {
+    "https://ntfy.sh".to_string()
+}
+
+fn default_ntfy_priority() -> u8 {
+    3
+}
+
 /// Wrapper enum for all integration types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -100,6 +129,7 @@ pub enum IntegrationConfig {
     Eqsl(EqslIntegrationConfig),
     Hrdlog(HrdlogIntegrationConfig),
     Wavelog(WavelogIntegrationConfig),
+    Ntfy(NtfyIntegrationConfig),
 }
 
 impl IntegrationConfig {
@@ -113,6 +143,7 @@ impl IntegrationConfig {
             IntegrationConfig::Eqsl(_) => "eqsl",
             IntegrationConfig::Hrdlog(_) => "hrdlog",
             IntegrationConfig::Wavelog(_) => "wavelog",
+            IntegrationConfig::Ntfy(_) => "ntfy",
         }
     }
 }
