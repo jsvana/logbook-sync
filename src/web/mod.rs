@@ -697,6 +697,16 @@ fn parse_integration_config(
                 serde_json::from_value(config.clone()).map_err(|e| e.to_string())?;
             Ok(integrations::IntegrationConfig::Wavelog(c))
         }
+        "ntfy" => {
+            let c: integrations::NtfyIntegrationConfig =
+                serde_json::from_value(config.clone()).map_err(|e| e.to_string())?;
+            Ok(integrations::IntegrationConfig::Ntfy(c))
+        }
+        "pota" => {
+            let c: integrations::PotaIntegrationConfig =
+                serde_json::from_value(config.clone()).map_err(|e| e.to_string())?;
+            Ok(integrations::IntegrationConfig::Pota(c))
+        }
         _ => Err(format!("Unknown integration type: {}", integration_type)),
     }
 }
