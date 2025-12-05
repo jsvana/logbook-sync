@@ -451,6 +451,24 @@ mod tests {
     }
 
     #[test]
+    fn test_group_activations_deduplicates() {
+        let qsos = vec![
+            // Same QSO appearing twice (duplicate)
+            make_pota_qso("W1ABC", "20240101", "US-0001"),
+            make_pota_qso("W1ABC", "20240101", "US-0001"), // Duplicate - same call/date/time/band/mode
+            // Different QSO
+            make_pota_qso("W2DEF", "20240101", "US-0001"),
+        ];
+
+        let (activations, skipped) = group_pota_activations(&qsos);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(activations.len(), 1);
+        // Should only have 2 QSOs after deduplication, not 3
+        assert_eq!(activations[0].qsos.len(), 2);
+    }
+
+    #[test]
     fn test_preview_upload() {
         // Create 12 QSOs for a valid activation
         let mut qsos: Vec<Qso> = (1..=12)
@@ -548,9 +566,13 @@ pub struct PotaUploadResult {
 }
 
 /// Group QSOs into POTA activations by park reference and UTC date
+/// Deduplicates QSOs by call/date/time/band/mode within each activation
 pub fn group_pota_activations(qsos: &[Qso]) -> (Vec<PotaActivation>, usize) {
-    // Group by (park_ref, date)
+    use std::collections::HashSet;
+
+    // Group by (park_ref, date), with deduplication
     let mut groups: HashMap<(String, String), Vec<Qso>> = HashMap::new();
+    let mut seen_keys: HashMap<(String, String), HashSet<String>> = HashMap::new();
     let mut skipped = 0;
 
     for qso in qsos {
@@ -575,8 +597,23 @@ pub fn group_pota_activations(qsos: &[Qso]) -> (Vec<PotaActivation>, usize) {
             continue;
         }
 
-        let key = (park_ref, qso.qso_date.clone());
-        groups.entry(key).or_default().push(qso.clone());
+        let group_key = (park_ref, qso.qso_date.clone());
+        let dedup_key = qso.dedup_key();
+
+        // Check for duplicates within this activation
+        let seen = seen_keys.entry(group_key.clone()).or_default();
+        if seen.contains(&dedup_key) {
+            tracing::debug!(
+                call = %qso.call,
+                date = %qso.qso_date,
+                time = %qso.time_on,
+                "Skipping duplicate QSO in POTA activation"
+            );
+            continue;
+        }
+        seen.insert(dedup_key);
+
+        groups.entry(group_key).or_default().push(qso.clone());
     }
 
     // Convert to activations
