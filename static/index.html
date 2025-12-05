@@ -328,6 +328,66 @@
                 </form>
             </div>
         </div>
+
+        <!-- LoFi Setup Modal -->
+        <div id="lofi-modal" class="hidden" style="position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center;">
+            <div class="card" style="max-width: 500px; width: 100%;">
+                <h2>Ham2K LoFi Setup</h2>
+
+                <!-- Step 1: Setup -->
+                <div id="lofi-step-setup">
+                    <p style="color: var(--text-dim); margin-bottom: 1rem;">
+                        Enter your callsign and email to connect with LoFi. A confirmation email will be sent.
+                    </p>
+                    <div class="form-group">
+                        <label>Callsign</label>
+                        <input type="text" id="lofi-callsign" required placeholder="e.g., W1ABC">
+                    </div>
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" id="lofi-email" required placeholder="Your email for confirmation">
+                    </div>
+                    <div id="lofi-setup-error" class="status error hidden" style="margin-bottom: 1rem;"></div>
+                    <div style="display: flex; gap: 1rem;">
+                        <button type="button" id="lofi-setup-btn">Setup LoFi</button>
+                        <button type="button" id="lofi-cancel-btn" style="background: var(--primary);">Cancel</button>
+                    </div>
+                </div>
+
+                <!-- Step 2: Waiting for confirmation -->
+                <div id="lofi-step-pending" class="hidden">
+                    <div style="text-align: center; padding: 1rem;">
+                        <div style="font-size: 3rem; margin-bottom: 1rem;">&#9993;</div>
+                        <p style="margin-bottom: 1rem;">A confirmation email has been sent to:</p>
+                        <p style="color: var(--accent); font-weight: bold; margin-bottom: 1.5rem;" id="lofi-pending-email"></p>
+                        <p style="color: var(--text-dim); margin-bottom: 1.5rem;">
+                            Click the link in the email from Ham2K, then click "I've Confirmed" below.
+                        </p>
+                    </div>
+                    <div id="lofi-pending-error" class="status error hidden" style="margin-bottom: 1rem;"></div>
+                    <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
+                        <button type="button" id="lofi-confirm-btn">I've Confirmed</button>
+                        <button type="button" id="lofi-resend-btn" style="background: var(--primary);">Resend Email</button>
+                        <button type="button" id="lofi-pending-cancel-btn" style="background: var(--primary);">Cancel</button>
+                    </div>
+                </div>
+
+                <!-- Step 3: Active -->
+                <div id="lofi-step-active" class="hidden">
+                    <div style="text-align: center; padding: 1rem;">
+                        <div style="font-size: 3rem; margin-bottom: 1rem; color: var(--badge-enabled-text);">&#10003;</div>
+                        <p style="color: var(--badge-enabled-text); font-weight: bold; margin-bottom: 1rem;">LoFi Integration Active</p>
+                        <p style="color: var(--text-dim); margin-bottom: 1rem;">
+                            Your logbook is syncing with Ham2K LoFi.
+                        </p>
+                    </div>
+                    <div style="display: flex; gap: 1rem;">
+                        <button type="button" id="lofi-done-btn">Done</button>
+                        <button type="button" id="lofi-remove-btn" style="background: var(--primary);">Remove Integration</button>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -346,16 +406,12 @@
             wavelog: { name: 'Wavelog', desc: 'Self-hosted Wavelog instance' },
         };
 
-        // Integration field definitions
+        // Integration field definitions (lofi has its own wizard)
         const INTEGRATION_FIELDS = {
             qrz: [
                 { name: 'api_key', label: 'API Key', type: 'password', required: true },
                 { name: 'upload_enabled', label: 'Enable Upload', type: 'checkbox', default: true },
                 { name: 'download_enabled', label: 'Enable Download', type: 'checkbox', default: true },
-            ],
-            lofi: [
-                { name: 'client_key', label: 'Client Key (UUID)', type: 'text', required: true },
-                { name: 'client_secret', label: 'Client Secret', type: 'password', required: true },
             ],
             lotw: [
                 { name: 'station_callsign', label: 'Station Callsign', type: 'text', required: true },
@@ -557,7 +613,11 @@
 
         function addIntegration(type) {
             document.getElementById('add-integration-menu').classList.add('hidden');
-            configureIntegration(type);
+            if (type === 'lofi') {
+                openLofiModal();
+            } else {
+                configureIntegration(type);
+            }
         }
 
         async function deleteIntegration(type) {
@@ -588,6 +648,12 @@
         });
 
         function configureIntegration(type) {
+            // LoFi has its own modal
+            if (type === 'lofi') {
+                openLofiModal();
+                return;
+            }
+
             const modal = document.getElementById('integration-modal');
             const fields = document.getElementById('integration-fields');
             const existing = integrations.find(i => i.integration_type === type);
@@ -692,6 +758,155 @@
             } catch {
                 alert('Connection test failed');
             }
+        });
+
+        // LoFi Modal Functions
+        let lofiEmail = '';
+
+        function openLofiModal() {
+            const modal = document.getElementById('lofi-modal');
+            // Check if there's an existing lofi integration
+            const existing = integrations.find(i => i.integration_type === 'lofi');
+
+            if (existing && existing.config) {
+                // Show appropriate step based on status
+                if (existing.config.device_linked) {
+                    showLofiStep('active');
+                } else {
+                    lofiEmail = existing.config.email || '';
+                    document.getElementById('lofi-pending-email').textContent = lofiEmail;
+                    showLofiStep('pending');
+                }
+            } else {
+                // Fresh setup - prefill callsign from user profile
+                document.getElementById('lofi-callsign').value = currentUser.callsign || '';
+                document.getElementById('lofi-email').value = currentUser.email || '';
+                showLofiStep('setup');
+            }
+
+            modal.classList.remove('hidden');
+        }
+
+        function closeLofiModal() {
+            document.getElementById('lofi-modal').classList.add('hidden');
+            document.getElementById('lofi-setup-error').classList.add('hidden');
+            document.getElementById('lofi-pending-error').classList.add('hidden');
+        }
+
+        function showLofiStep(step) {
+            document.getElementById('lofi-step-setup').classList.add('hidden');
+            document.getElementById('lofi-step-pending').classList.add('hidden');
+            document.getElementById('lofi-step-active').classList.add('hidden');
+            document.getElementById(`lofi-step-${step}`).classList.remove('hidden');
+        }
+
+        // LoFi Setup button
+        document.getElementById('lofi-setup-btn').addEventListener('click', async () => {
+            const callsign = document.getElementById('lofi-callsign').value.trim().toUpperCase();
+            const email = document.getElementById('lofi-email').value.trim();
+            const errorEl = document.getElementById('lofi-setup-error');
+
+            if (!callsign || !email) {
+                errorEl.textContent = 'Callsign and email are required';
+                errorEl.classList.remove('hidden');
+                return;
+            }
+
+            errorEl.classList.add('hidden');
+            const btn = document.getElementById('lofi-setup-btn');
+            btn.disabled = true;
+            btn.textContent = 'Setting up...';
+
+            try {
+                const result = await api('/integrations/lofi/setup', {
+                    method: 'POST',
+                    body: JSON.stringify({ callsign, email }),
+                });
+
+                if (result.success) {
+                    lofiEmail = email;
+                    document.getElementById('lofi-pending-email').textContent = email;
+                    showLofiStep('pending');
+                    loadIntegrations();
+                } else {
+                    errorEl.textContent = result.message || 'Setup failed';
+                    errorEl.classList.remove('hidden');
+                }
+            } catch (e) {
+                errorEl.textContent = 'Setup failed: ' + e.message;
+                errorEl.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Setup LoFi';
+            }
+        });
+
+        // LoFi Cancel buttons
+        document.getElementById('lofi-cancel-btn').addEventListener('click', closeLofiModal);
+        document.getElementById('lofi-pending-cancel-btn').addEventListener('click', closeLofiModal);
+        document.getElementById('lofi-done-btn').addEventListener('click', closeLofiModal);
+
+        // LoFi Confirm button
+        document.getElementById('lofi-confirm-btn').addEventListener('click', async () => {
+            const errorEl = document.getElementById('lofi-pending-error');
+            const btn = document.getElementById('lofi-confirm-btn');
+            btn.disabled = true;
+            btn.textContent = 'Confirming...';
+
+            try {
+                const result = await api('/integrations/lofi/confirm', { method: 'POST' });
+
+                if (result.success) {
+                    showLofiStep('active');
+                    loadIntegrations();
+                } else {
+                    errorEl.textContent = result.message || 'Confirmation failed';
+                    errorEl.classList.remove('hidden');
+                }
+            } catch (e) {
+                errorEl.textContent = 'Confirmation failed: ' + e.message;
+                errorEl.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "I've Confirmed";
+            }
+        });
+
+        // LoFi Resend button
+        document.getElementById('lofi-resend-btn').addEventListener('click', async () => {
+            const email = prompt('Enter email address:', lofiEmail);
+            if (!email) return;
+
+            const btn = document.getElementById('lofi-resend-btn');
+            btn.disabled = true;
+            btn.textContent = 'Sending...';
+
+            try {
+                const result = await api('/integrations/lofi/send-link', {
+                    method: 'POST',
+                    body: JSON.stringify({ email }),
+                });
+
+                if (result.success) {
+                    lofiEmail = email;
+                    document.getElementById('lofi-pending-email').textContent = email;
+                    alert('Confirmation email sent!');
+                } else {
+                    alert(result.message || 'Failed to send email');
+                }
+            } catch (e) {
+                alert('Failed to send email: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Resend Email';
+            }
+        });
+
+        // LoFi Remove button
+        document.getElementById('lofi-remove-btn').addEventListener('click', async () => {
+            if (!confirm('Remove LoFi integration?')) return;
+            await deleteIntegration('lofi');
+            closeLofiModal();
         });
 
         // File Upload

@@ -103,6 +103,32 @@ pub struct UpdateThemeRequest {
     pub theme: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LofiSetupRequest {
+    pub callsign: String,
+    pub email: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LofiSetupResponse {
+    pub success: bool,
+    pub message: String,
+    pub status: Option<LofiStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LofiStatus {
+    pub client_key: String,
+    pub registered: bool,
+    pub email_sent: bool,
+    pub device_linked: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LofiSendLinkRequest {
+    pub email: String,
+}
+
 // === Auth helpers ===
 
 /// Create a simple signed session token: user_id:timestamp:signature
@@ -725,6 +751,473 @@ async fn test_qrz_connection(
     }
 }
 
+// === LoFi integration handlers ===
+
+/// Setup LoFi integration: generate keys, register with LoFi, and send email link
+async fn lofi_setup(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(req): Json<LofiSetupRequest>,
+) -> impl IntoResponse {
+    use crate::config::LofiConfig;
+    use crate::lofi::LofiClient;
+
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(LofiSetupResponse {
+                    success: false,
+                    message: "Unauthorized".into(),
+                    status: None,
+                }),
+            );
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to get user salt: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(LofiSetupResponse {
+                    success: false,
+                    message: "Internal error".into(),
+                    status: None,
+                }),
+            );
+        }
+    };
+
+    // Generate client key and secret
+    let client_key = LofiClient::generate_client_key();
+    let client_secret = LofiClient::generate_client_secret();
+
+    tracing::info!("Generated LoFi client_key: {}", client_key);
+
+    // Create LoFi config for registration
+    let lofi_config = LofiConfig {
+        enabled: true,
+        client_key: Some(client_key.clone()),
+        client_secret: Some(client_secret.clone()),
+        callsign: Some(req.callsign.clone()),
+        email: Some(req.email.clone()),
+        sync_batch_size: 50,
+        sync_loop_delay_ms: 10000,
+        sync_check_period_ms: 300000, // 5 minutes
+        device_linked: false,
+    };
+
+    // Create client and register
+    let mut client = match LofiClient::new(lofi_config) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to create LoFi client: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(LofiSetupResponse {
+                    success: false,
+                    message: format!("Failed to create LoFi client: {}", e),
+                    status: None,
+                }),
+            );
+        }
+    };
+
+    // Register with LoFi
+    let registration = match client.register().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to register with LoFi: {}", e);
+            return (
+                StatusCode::OK,
+                Json(LofiSetupResponse {
+                    success: false,
+                    message: format!("Failed to register with LoFi: {}", e),
+                    status: None,
+                }),
+            );
+        }
+    };
+
+    let bearer_token = registration.token;
+    client.set_bearer_token(bearer_token.clone());
+
+    // Send device link email
+    if let Err(e) = client.link_device(&req.email).await {
+        tracing::error!("Failed to send LoFi link email: {}", e);
+        // Continue anyway - user can resend
+    }
+
+    // Save the integration config
+    let config = integrations::LofiIntegrationConfig {
+        client_key: client_key.clone(),
+        client_secret,
+        bearer_token: Some(bearer_token),
+        account_uuid: Some(registration.account.uuid),
+        device_linked: false,
+        sync_batch_size: 50,
+        sync_loop_delay_ms: 10000,
+    };
+
+    if let Err(e) = integrations::save_integration(
+        &conn,
+        &state.master_key,
+        user.id,
+        &user_salt,
+        "lofi",
+        &integrations::IntegrationConfig::Lofi(config),
+        false, // Not enabled until device is linked
+    ) {
+        tracing::error!("Failed to save LoFi integration: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(LofiSetupResponse {
+                success: false,
+                message: "Failed to save integration".into(),
+                status: None,
+            }),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(LofiSetupResponse {
+            success: true,
+            message: format!(
+                "LoFi registered! Check {} for a confirmation email from Ham2K.",
+                req.email
+            ),
+            status: Some(LofiStatus {
+                client_key,
+                registered: true,
+                email_sent: true,
+                device_linked: false,
+            }),
+        }),
+    )
+}
+
+/// Get current LoFi integration status
+async fn lofi_status(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(LofiSetupResponse {
+                    success: false,
+                    message: "Unauthorized".into(),
+                    status: None,
+                }),
+            );
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(LofiSetupResponse {
+                    success: false,
+                    message: "Internal error".into(),
+                    status: None,
+                }),
+            );
+        }
+    };
+
+    let integration = match integrations::get_integration(
+        &conn,
+        &state.master_key,
+        user.id,
+        &user_salt,
+        "lofi",
+    ) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return (
+                StatusCode::OK,
+                Json(LofiSetupResponse {
+                    success: true,
+                    message: "No LoFi integration configured".into(),
+                    status: None,
+                }),
+            );
+        }
+        Err(e) => {
+            tracing::error!("Failed to get LoFi integration: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(LofiSetupResponse {
+                    success: false,
+                    message: "Failed to get integration".into(),
+                    status: None,
+                }),
+            );
+        }
+    };
+
+    if let integrations::IntegrationConfig::Lofi(config) = integration.config {
+        (
+            StatusCode::OK,
+            Json(LofiSetupResponse {
+                success: true,
+                message: if config.device_linked {
+                    "LoFi integration is active".into()
+                } else {
+                    "Waiting for email confirmation".into()
+                },
+                status: Some(LofiStatus {
+                    client_key: config.client_key,
+                    registered: config.bearer_token.is_some(),
+                    email_sent: true,
+                    device_linked: config.device_linked,
+                }),
+            }),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(LofiSetupResponse {
+                success: false,
+                message: "Invalid integration type".into(),
+                status: None,
+            }),
+        )
+    }
+}
+
+/// Resend LoFi device link email
+async fn lofi_send_link(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(req): Json<LofiSendLinkRequest>,
+) -> impl IntoResponse {
+    use crate::config::LofiConfig;
+    use crate::lofi::LofiClient;
+
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("Unauthorized".into()),
+                }),
+            );
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("Internal error".into()),
+                }),
+            );
+        }
+    };
+
+    let integration = match integrations::get_integration(
+        &conn,
+        &state.master_key,
+        user.id,
+        &user_salt,
+        "lofi",
+    ) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("LoFi integration not set up yet".into()),
+                }),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("Failed to get integration".into()),
+                }),
+            );
+        }
+    };
+
+    if let integrations::IntegrationConfig::Lofi(config) = integration.config {
+        let bearer_token = match config.bearer_token {
+            Some(t) => t,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(SuccessResponse {
+                        success: false,
+                        message: Some("LoFi not registered yet".into()),
+                    }),
+                );
+            }
+        };
+
+        let lofi_config = LofiConfig {
+            enabled: true,
+            client_key: Some(config.client_key),
+            client_secret: Some(config.client_secret),
+            callsign: None,
+            email: None,
+            sync_batch_size: config.sync_batch_size,
+            sync_loop_delay_ms: config.sync_loop_delay_ms,
+            sync_check_period_ms: 300000,
+            device_linked: false,
+        };
+
+        let client = match LofiClient::with_token(lofi_config, bearer_token) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SuccessResponse {
+                        success: false,
+                        message: Some(format!("Failed to create client: {}", e)),
+                    }),
+                );
+            }
+        };
+
+        match client.link_device(&req.email).await {
+            Ok(_) => (
+                StatusCode::OK,
+                Json(SuccessResponse {
+                    success: true,
+                    message: Some(format!("Confirmation email sent to {}", req.email)),
+                }),
+            ),
+            Err(e) => (
+                StatusCode::OK,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some(format!("Failed to send email: {}", e)),
+                }),
+            ),
+        }
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SuccessResponse {
+                success: false,
+                message: Some("Invalid integration type".into()),
+            }),
+        )
+    }
+}
+
+/// Confirm LoFi device link (user clicked email)
+async fn lofi_confirm(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("Unauthorized".into()),
+                }),
+            );
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("Internal error".into()),
+                }),
+            );
+        }
+    };
+
+    let integration = match integrations::get_integration(
+        &conn,
+        &state.master_key,
+        user.id,
+        &user_salt,
+        "lofi",
+    ) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("LoFi integration not set up yet".into()),
+                }),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("Failed to get integration".into()),
+                }),
+            );
+        }
+    };
+
+    if let integrations::IntegrationConfig::Lofi(mut config) = integration.config {
+        // Mark device as linked
+        config.device_linked = true;
+
+        // Save updated config
+        if let Err(e) = integrations::save_integration(
+            &conn,
+            &state.master_key,
+            user.id,
+            &user_salt,
+            "lofi",
+            &integrations::IntegrationConfig::Lofi(config),
+            true, // Enable the integration
+        ) {
+            tracing::error!("Failed to save LoFi integration: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some("Failed to save integration".into()),
+                }),
+            );
+        }
+
+        (
+            StatusCode::OK,
+            Json(SuccessResponse {
+                success: true,
+                message: Some("LoFi integration activated!".into()),
+            }),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SuccessResponse {
+                success: false,
+                message: Some("Invalid integration type".into()),
+            }),
+        )
+    }
+}
+
 // === User profile handlers ===
 
 async fn update_profile(
@@ -1053,6 +1546,11 @@ pub async fn build_router(db_path: PathBuf, master_key: MasterKey) -> Router {
             "/integrations/:integration_type/test",
             post(test_integration),
         )
+        // LoFi specific endpoints
+        .route("/integrations/lofi/setup", post(lofi_setup))
+        .route("/integrations/lofi/status", get(lofi_status))
+        .route("/integrations/lofi/send-link", post(lofi_send_link))
+        .route("/integrations/lofi/confirm", post(lofi_confirm))
         // Log upload
         .route("/logs/upload", post(upload_log));
 
