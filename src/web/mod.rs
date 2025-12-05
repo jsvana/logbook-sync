@@ -1529,7 +1529,7 @@ pub async fn build_router(db_path: PathBuf, master_key: MasterKey) -> Router {
         .route("/auth/me", get(get_me))
         // Health/stats
         .route("/health", get(health))
-        .route("/stats", get(get_stats.clone()))
+        .route("/stats", get(get_stats))
         .route("/qsos/stats", get(get_stats))
         // Users
         .route("/users", get(list_users))
@@ -1577,8 +1577,7 @@ pub async fn serve(
         }
         Err(e) => {
             tracing::error!("Failed to run database migrations: {}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 e.to_string(),
             ));
         }
