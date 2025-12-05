@@ -798,6 +798,16 @@ async fn test_integration(
                 }),
             ),
         },
+        "pota" => match serde_json::from_value::<integrations::PotaIntegrationConfig>(req.config) {
+            Ok(config) => test_pota_connection(&config).await,
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some(format!("Invalid config: {}", e)),
+                }),
+            ),
+        },
         _ => (
             StatusCode::OK,
             Json(SuccessResponse {
@@ -893,6 +903,72 @@ async fn test_ntfy_connection(
             Json(SuccessResponse {
                 success: false,
                 message: Some(format!("Failed to send notification: {}", e)),
+            }),
+        ),
+    }
+}
+
+async fn test_pota_connection(
+    config: &integrations::PotaIntegrationConfig,
+) -> (StatusCode, Json<SuccessResponse>) {
+    use pota_adif_upload::PotaClient;
+
+    if config.email.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SuccessResponse {
+                success: false,
+                message: Some("Email is required".into()),
+            }),
+        );
+    }
+
+    if config.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SuccessResponse {
+                success: false,
+                message: Some("Password is required".into()),
+            }),
+        );
+    }
+
+    // Try to authenticate with POTA
+    match PotaClient::authenticate(&config.email, &config.password).await {
+        Ok(client) => {
+            // Try to get user's callsigns to verify the connection works
+            match client.get_callsigns().await {
+                Ok(callsigns) => {
+                    let msg = if callsigns.is_empty() {
+                        "Connected successfully! No callsigns registered.".to_string()
+                    } else {
+                        format!(
+                            "Connected successfully! Registered callsigns: {}",
+                            callsigns.join(", ")
+                        )
+                    };
+                    (
+                        StatusCode::OK,
+                        Json(SuccessResponse {
+                            success: true,
+                            message: Some(msg),
+                        }),
+                    )
+                }
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(SuccessResponse {
+                        success: false,
+                        message: Some(format!("Authenticated but failed to get callsigns: {}", e)),
+                    }),
+                ),
+            }
+        }
+        Err(e) => (
+            StatusCode::OK,
+            Json(SuccessResponse {
+                success: false,
+                message: Some(format!("Authentication failed: {}", e)),
             }),
         ),
     }
