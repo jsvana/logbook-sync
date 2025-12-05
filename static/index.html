@@ -163,8 +163,22 @@
             <!-- QSOs Tab -->
             <div id="tab-qsos" class="tab-content hidden">
                 <div class="card">
-                    <h2>Recent QSOs</h2>
+                    <h2>Upload Log</h2>
+                    <p style="color: var(--text-dim); margin-bottom: 1rem;">Upload an ADIF file to import QSOs</p>
+                    <div style="display: flex; gap: 1rem; align-items: center;">
+                        <input type="file" id="adif-file" accept=".adi,.adif" style="flex: 1;">
+                        <button id="upload-btn">Upload</button>
+                    </div>
+                    <div id="upload-status" class="status hidden" style="margin-top: 1rem;"></div>
+                </div>
+
+                <div class="card">
+                    <h2>QSO Statistics</h2>
                     <div id="qso-stats" style="margin-bottom: 1rem;"></div>
+                </div>
+
+                <div class="card">
+                    <h2>Recent QSOs</h2>
                     <table id="qso-table">
                         <thead>
                             <tr><th>Date</th><th>Call</th><th>Band</th><th>Mode</th><th>Sync Status</th></tr>
@@ -188,17 +202,6 @@
                             <input type="email" name="email" id="settings-email">
                         </div>
                         <button type="submit">Save Changes</button>
-                    </form>
-                </div>
-
-                <div class="card">
-                    <h2>Watch Directories</h2>
-                    <div id="watch-paths-list"></div>
-                    <form id="add-watch-path-form" style="margin-top: 1rem;">
-                        <div style="display: flex; gap: 0.5rem;">
-                            <input type="text" name="path" placeholder="/path/to/adif/files" style="flex: 1;">
-                            <button type="submit">Add</button>
-                        </div>
                     </form>
                 </div>
 
@@ -555,12 +558,73 @@
         });
 
         document.getElementById('modal-test').addEventListener('click', async () => {
-            const type = document.getElementById('integration-modal').dataset.type;
+            const modal = document.getElementById('integration-modal');
+            const type = modal.dataset.type;
+            const form = document.getElementById('integration-form');
+            const formData = new FormData(form);
+
+            // Build config from current form values
+            const fieldDefs = INTEGRATION_FIELDS[type] || [];
+            const config = { type };
+            fieldDefs.forEach(field => {
+                if (field.type === 'checkbox') {
+                    config[field.name] = formData.has(field.name);
+                } else {
+                    const value = formData.get(field.name);
+                    if (value) config[field.name] = value;
+                }
+            });
+
             try {
-                const result = await api(`/integrations/${type}/test`, { method: 'POST' });
-                alert(result.success ? 'Connection successful!' : `Test failed: ${result.message}`);
+                const result = await api(`/integrations/${type}/test`, {
+                    method: 'POST',
+                    body: JSON.stringify({ config }),
+                });
+                alert(result.success ? result.message : `Test failed: ${result.message}`);
             } catch {
                 alert('Connection test failed');
+            }
+        });
+
+        // File Upload
+        document.getElementById('upload-btn').addEventListener('click', async () => {
+            const fileInput = document.getElementById('adif-file');
+            const status = document.getElementById('upload-status');
+
+            if (!fileInput.files.length) {
+                status.textContent = 'Please select a file';
+                status.className = 'status error';
+                status.classList.remove('hidden');
+                return;
+            }
+
+            const file = fileInput.files[0];
+            const formData = new FormData();
+            formData.append('file', file);
+
+            status.textContent = 'Uploading...';
+            status.className = 'status';
+            status.classList.remove('hidden');
+
+            try {
+                const res = await fetch('/api/logs/upload', {
+                    method: 'POST',
+                    body: formData,
+                });
+                const result = await res.json();
+
+                if (result.success) {
+                    status.textContent = result.message || 'Upload successful!';
+                    status.className = 'status success';
+                    fileInput.value = '';
+                    loadQsoStats();
+                } else {
+                    status.textContent = result.message || 'Upload failed';
+                    status.className = 'status error';
+                }
+            } catch (err) {
+                status.textContent = 'Upload failed: ' + err.message;
+                status.className = 'status error';
             }
         });
 

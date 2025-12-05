@@ -1,3 +1,4 @@
 /target
 test-logs/
 test-state.db
+uploads/

@@ -68,7 +68,7 @@ urlencoding = "2.1"
 
 # Metrics and HTTP server for health checks
 prometheus = "0.13"
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "multipart"] }
 axum-extra = { version = "0.9", features = ["typed-header", "cookie"] }
 lazy_static = "1.4"
 
