@@ -933,37 +933,15 @@ async fn test_pota_connection(
         );
     }
 
-    // Try to authenticate with POTA
+    // Try to authenticate with POTA - successful auth is sufficient to verify credentials
     match PotaClient::authenticate(&config.email, &config.password).await {
-        Ok(client) => {
-            // Try to get user's callsigns to verify the connection works
-            match client.get_callsigns().await {
-                Ok(callsigns) => {
-                    let msg = if callsigns.is_empty() {
-                        "Connected successfully! No callsigns registered.".to_string()
-                    } else {
-                        format!(
-                            "Connected successfully! Registered callsigns: {}",
-                            callsigns.join(", ")
-                        )
-                    };
-                    (
-                        StatusCode::OK,
-                        Json(SuccessResponse {
-                            success: true,
-                            message: Some(msg),
-                        }),
-                    )
-                }
-                Err(e) => (
-                    StatusCode::OK,
-                    Json(SuccessResponse {
-                        success: false,
-                        message: Some(format!("Authenticated but failed to get callsigns: {}", e)),
-                    }),
-                ),
-            }
-        }
+        Ok(_client) => (
+            StatusCode::OK,
+            Json(SuccessResponse {
+                success: true,
+                message: Some("Authentication successful!".into()),
+            }),
+        ),
         Err(e) => (
             StatusCode::OK,
             Json(SuccessResponse {

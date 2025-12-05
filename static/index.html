@@ -214,6 +214,22 @@
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+        /* Button spinner for inline loading states */
+        .btn-spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            margin-right: 0.5rem;
+            vertical-align: middle;
+        }
+        button:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+        }
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -1284,6 +1300,7 @@
             const type = modal.dataset.type;
             const form = document.getElementById('integration-form');
             const formData = new FormData(form);
+            const testBtn = document.getElementById('modal-test');
 
             // Build config from current form values
             const fieldDefs = INTEGRATION_FIELDS[type] || [];
@@ -1297,6 +1314,11 @@
                 }
             });
 
+            // Show loading state
+            const originalText = testBtn.innerHTML;
+            testBtn.innerHTML = '<span class="btn-spinner"></span>Testing...';
+            testBtn.disabled = true;
+
             try {
                 const result = await api(`/integrations/${type}/test`, {
                     method: 'POST',
@@ -1305,6 +1327,10 @@
                 alert(result.success ? result.message : `Test failed: ${result.message}`);
             } catch {
                 alert('Connection test failed');
+            } finally {
+                // Restore button state
+                testBtn.innerHTML = originalText;
+                testBtn.disabled = false;
             }
         });
 
