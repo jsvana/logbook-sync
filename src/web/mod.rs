@@ -778,6 +778,16 @@ async fn test_integration(
                 message: Some("LoFi test not implemented yet".into()),
             }),
         ),
+        "ntfy" => match serde_json::from_value::<integrations::NtfyIntegrationConfig>(req.config) {
+            Ok(config) => test_ntfy_connection(&config).await,
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(SuccessResponse {
+                    success: false,
+                    message: Some(format!("Invalid config: {}", e)),
+                }),
+            ),
+        },
         _ => (
             StatusCode::OK,
             Json(SuccessResponse {
@@ -829,6 +839,50 @@ async fn test_qrz_connection(
             Json(SuccessResponse {
                 success: false,
                 message: Some(format!("Connection failed: {}", e)),
+            }),
+        ),
+    }
+}
+
+async fn test_ntfy_connection(
+    config: &integrations::NtfyIntegrationConfig,
+) -> (StatusCode, Json<SuccessResponse>) {
+    if config.topic.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SuccessResponse {
+                success: false,
+                message: Some("Topic is required".into()),
+            }),
+        );
+    }
+
+    let client_config = NtfyConfig {
+        enabled: true,
+        server: config.server.clone(),
+        topic: config.topic.clone(),
+        token: config.token.clone(),
+        priority: config.priority,
+    };
+
+    let client = NtfyClient::new(client_config);
+
+    let title = "logbook-sync - Test Notification";
+    let message = "This is a test notification from logbook-sync. If you see this, ntfy is configured correctly!";
+
+    match client.send(title, message).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SuccessResponse {
+                success: true,
+                message: Some("Test notification sent successfully".into()),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::OK,
+            Json(SuccessResponse {
+                success: false,
+                message: Some(format!("Failed to send notification: {}", e)),
             }),
         ),
     }
@@ -1913,111 +1967,6 @@ async fn sync_qrz_download(State(state): State<AppState>, jar: CookieJar) -> imp
     )
 }
 
-// === Ntfy test handler ===
-
-async fn test_ntfy(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
-    let (user, conn) = match get_current_user_full(&jar, &state) {
-        Some(u) => u,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(SuccessResponse {
-                    success: false,
-                    message: Some("Unauthorized".into()),
-                }),
-            );
-        }
-    };
-
-    let user_salt = match users::get_user_encryption_salt(&user) {
-        Ok(s) => s,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(SuccessResponse {
-                    success: false,
-                    message: Some("Internal error".into()),
-                }),
-            );
-        }
-    };
-
-    // Get ntfy integration config
-    let integration = match integrations::get_integration(
-        &conn,
-        &state.master_key,
-        user.id,
-        &user_salt,
-        "ntfy",
-    ) {
-        Ok(Some(i)) => i,
-        Ok(None) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(SuccessResponse {
-                    success: false,
-                    message: Some("ntfy integration not configured".into()),
-                }),
-            );
-        }
-        Err(e) => {
-            tracing::error!("Failed to get ntfy integration: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(SuccessResponse {
-                    success: false,
-                    message: Some("Failed to get integration config".into()),
-                }),
-            );
-        }
-    };
-
-    let ntfy_config = match integration.config {
-        integrations::IntegrationConfig::Ntfy(c) => c,
-        _ => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(SuccessResponse {
-                    success: false,
-                    message: Some("Invalid integration config".into()),
-                }),
-            );
-        }
-    };
-
-    // Create ntfy client and send test notification
-    let client_config = NtfyConfig {
-        enabled: true,
-        server: ntfy_config.server,
-        topic: ntfy_config.topic,
-        token: ntfy_config.token,
-        priority: ntfy_config.priority,
-    };
-
-    let client = NtfyClient::new(client_config);
-
-    let callsign = user.callsign.as_deref().unwrap_or(&user.username);
-    let title = format!("{} - Test Notification", callsign);
-    let message = "This is a test notification from logbook-sync. If you see this, ntfy is configured correctly!";
-
-    match client.send(&title, message).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(SuccessResponse {
-                success: true,
-                message: Some("Test notification sent successfully".into()),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SuccessResponse {
-                success: false,
-                message: Some(format!("Failed to send notification: {}", e)),
-            }),
-        ),
-    }
-}
-
 // === User profile handlers ===
 
 async fn update_profile(
@@ -2361,8 +2310,6 @@ pub async fn build_router(
         .route("/sync/lofi", post(sync_lofi))
         .route("/sync/qrz/upload", post(sync_qrz_upload))
         .route("/sync/qrz/download", post(sync_qrz_download))
-        // Ntfy test endpoint
-        .route("/integrations/ntfy/test", post(test_ntfy))
         // Log upload
         .route("/logs/upload", post(upload_log));
 

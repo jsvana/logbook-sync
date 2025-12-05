@@ -861,13 +861,23 @@
             const btn = document.getElementById('test-ntfy-btn');
             if (!btn) return;
 
+            // Get ntfy config from current integrations
+            const ntfyIntegration = integrations.find(i => i.integration_type === 'ntfy');
+            if (!ntfyIntegration || !ntfyIntegration.config) {
+                alert('ntfy integration not configured');
+                return;
+            }
+
             const originalText = btn.textContent;
             btn.disabled = true;
             btn.textContent = 'Sending...';
             btn.classList.add('syncing');
 
             try {
-                const result = await api('/integrations/ntfy/test', { method: 'POST' });
+                const result = await api('/integrations/ntfy/test', {
+                    method: 'POST',
+                    body: JSON.stringify({ config: ntfyIntegration.config }),
+                });
 
                 if (result.success) {
                     alert('Test notification sent! Check your ntfy app.');
