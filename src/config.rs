@@ -12,6 +12,8 @@ pub struct Config {
     pub general: GeneralConfig,
     #[serde(default)]
     pub resilience: ResilienceConfig,
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -116,6 +118,102 @@ fn default_backoff_multiplier() -> f64 {
 
 fn default_true() -> bool {
     true
+}
+
+/// Configuration for background sync intervals (in seconds)
+#[derive(Debug, Deserialize, Clone)]
+pub struct SyncConfig {
+    /// Whether background sync is enabled
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Number of worker threads for background sync
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
+    /// QRZ sync interval in seconds (default: 15 minutes)
+    #[serde(default = "default_qrz_interval")]
+    pub qrz_interval_secs: u64,
+    /// LoFi sync interval in seconds (default: 5 minutes)
+    #[serde(default = "default_lofi_interval")]
+    pub lofi_interval_secs: u64,
+    /// LotW sync interval in seconds (default: 1 hour)
+    #[serde(default = "default_lotw_interval")]
+    pub lotw_interval_secs: u64,
+    /// eQSL sync interval in seconds (default: 30 minutes)
+    #[serde(default = "default_eqsl_interval")]
+    pub eqsl_interval_secs: u64,
+    /// ClubLog sync interval in seconds (default: 30 minutes)
+    #[serde(default = "default_clublog_interval")]
+    pub clublog_interval_secs: u64,
+    /// HRDLog sync interval in seconds (default: 30 minutes)
+    #[serde(default = "default_hrdlog_interval")]
+    pub hrdlog_interval_secs: u64,
+    /// Wavelog sync interval in seconds (default: 10 minutes)
+    #[serde(default = "default_wavelog_interval")]
+    pub wavelog_interval_secs: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            worker_threads: default_worker_threads(),
+            qrz_interval_secs: default_qrz_interval(),
+            lofi_interval_secs: default_lofi_interval(),
+            lotw_interval_secs: default_lotw_interval(),
+            eqsl_interval_secs: default_eqsl_interval(),
+            clublog_interval_secs: default_clublog_interval(),
+            hrdlog_interval_secs: default_hrdlog_interval(),
+            wavelog_interval_secs: default_wavelog_interval(),
+        }
+    }
+}
+
+impl SyncConfig {
+    /// Get the sync interval for a given integration type
+    pub fn interval_for(&self, integration_type: &str) -> u64 {
+        match integration_type {
+            "qrz" => self.qrz_interval_secs,
+            "lofi" => self.lofi_interval_secs,
+            "lotw" => self.lotw_interval_secs,
+            "eqsl" => self.eqsl_interval_secs,
+            "clublog" => self.clublog_interval_secs,
+            "hrdlog" => self.hrdlog_interval_secs,
+            "wavelog" => self.wavelog_interval_secs,
+            _ => 900, // Default 15 minutes for unknown types
+        }
+    }
+}
+
+fn default_worker_threads() -> usize {
+    2
+}
+
+fn default_qrz_interval() -> u64 {
+    900 // 15 minutes
+}
+
+fn default_lofi_interval() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_lotw_interval() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_eqsl_interval() -> u64 {
+    1800 // 30 minutes
+}
+
+fn default_clublog_interval() -> u64 {
+    1800 // 30 minutes
+}
+
+fn default_hrdlog_interval() -> u64 {
+    1800 // 30 minutes
+}
+
+fn default_wavelog_interval() -> u64 {
+    600 // 10 minutes
 }
 
 impl Config {

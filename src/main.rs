@@ -499,7 +499,8 @@ fn run_generate_master_key(format: &str) {
 }
 
 async fn run_web_server(config: Config, bind_override: Option<String>) -> Result<()> {
-    use logbook_sync::web;
+    use logbook_sync::{start_sync_workers, web};
+    use std::sync::Arc;
 
     let master_key = MasterKey::from_env().context(
         "LOGBOOK_SYNC_MASTER_KEY environment variable not set or invalid. \
@@ -511,7 +512,24 @@ async fn run_web_server(config: Config, bind_override: Option<String>) -> Result
     println!("Starting web server on {}", bind);
     println!("Database: {}", config.database.path.display());
 
-    web::serve(config.database.path, master_key, &bind)
+    // Start background sync workers
+    if config.sync.enabled {
+        println!(
+            "Starting background sync workers ({} threads)",
+            config.sync.worker_threads
+        );
+        let master_key_arc = Arc::new(master_key.clone());
+        start_sync_workers(
+            config.database.path.clone(),
+            master_key_arc,
+            config.sync.clone(),
+        )
+        .await;
+    } else {
+        println!("Background sync is disabled");
+    }
+
+    web::serve(config.database.path, master_key, config.sync, &bind)
         .await
         .context("Web server error")?;
 

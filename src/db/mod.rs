@@ -334,6 +334,21 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expiry_date);
+
+            -- User sync state tracking (per user/integration/direction)
+            CREATE TABLE IF NOT EXISTS user_sync_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                integration_type TEXT NOT NULL,  -- 'qrz', 'lofi', 'lotw', etc.
+                direction TEXT NOT NULL,         -- 'upload' or 'download'
+                last_sync_at TEXT,               -- ISO timestamp of last successful sync
+                last_sync_result TEXT,           -- 'success', 'error', or null if never synced
+                last_sync_message TEXT,          -- Details or error message
+                items_synced INTEGER DEFAULT 0,  -- Count of items synced in last sync
+                UNIQUE(user_id, integration_type, direction)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_sync_state_user ON user_sync_state(user_id);
             "#,
         )?;
         Ok(())

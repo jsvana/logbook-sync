@@ -17,8 +17,11 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tower_http::services::ServeDir;
 
+use crate::config::SyncConfig;
 use crate::crypto::MasterKey;
 use crate::db::{Database, integrations, users};
+use crate::lofi::{LofiClient, LofiConfig};
+use crate::qrz::QrzClient;
 use rusqlite::Connection;
 
 const SESSION_COOKIE_NAME: &str = "logbook_session";
@@ -28,6 +31,7 @@ const SESSION_COOKIE_NAME: &str = "logbook_session";
 pub struct AppState {
     pub db_path: PathBuf,
     pub master_key: Arc<MasterKey>,
+    pub sync_config: SyncConfig,
 }
 
 // === Request/Response types ===
@@ -78,6 +82,18 @@ pub struct IntegrationInfo {
     pub integration_type: String,
     pub enabled: bool,
     pub config: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_state: Option<IntegrationSyncState>,
+    /// Sync interval in seconds (from server config)
+    pub sync_interval_secs: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IntegrationSyncState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload: Option<SyncDirectionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download: Option<SyncDirectionState>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +143,28 @@ pub struct LofiStatus {
 #[derive(Debug, Deserialize)]
 pub struct LofiSendLinkRequest {
     pub email: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncStateResponse {
+    pub integration_type: String,
+    pub upload: Option<SyncDirectionState>,
+    pub download: Option<SyncDirectionState>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncDirectionState {
+    pub last_sync_at: Option<String>,
+    pub last_sync_result: Option<String>,
+    pub last_sync_message: Option<String>,
+    pub items_synced: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncResponse {
+    pub success: bool,
+    pub message: String,
+    pub items_synced: i64,
 }
 
 // === Auth helpers ===
@@ -486,14 +524,58 @@ async fn list_integrations(State(state): State<AppState>, jar: CookieJar) -> imp
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::new())),
     };
 
+    // Get all sync states for user
+    let all_sync_states = integrations::get_all_sync_states(&conn, user.id).unwrap_or_default();
+
     match integrations::get_user_integrations(&conn, &state.master_key, user.id, &user_salt) {
         Ok(ints) => {
             let info: Vec<IntegrationInfo> = ints
                 .into_iter()
-                .map(|i| IntegrationInfo {
-                    integration_type: i.integration_type,
-                    enabled: i.enabled,
-                    config: serde_json::to_value(&i.config).unwrap_or(Value::Null),
+                .map(|i| {
+                    // Find sync states for this integration
+                    let integration_states: Vec<_> = all_sync_states
+                        .iter()
+                        .filter(|s| s.integration_type == i.integration_type)
+                        .collect();
+
+                    let upload_state = integration_states
+                        .iter()
+                        .find(|s| s.direction == "upload")
+                        .map(|s| SyncDirectionState {
+                            last_sync_at: s.last_sync_at.clone(),
+                            last_sync_result: s.last_sync_result.clone(),
+                            last_sync_message: s.last_sync_message.clone(),
+                            items_synced: s.items_synced,
+                        });
+
+                    let download_state = integration_states
+                        .iter()
+                        .find(|s| s.direction == "download")
+                        .map(|s| SyncDirectionState {
+                            last_sync_at: s.last_sync_at.clone(),
+                            last_sync_result: s.last_sync_result.clone(),
+                            last_sync_message: s.last_sync_message.clone(),
+                            items_synced: s.items_synced,
+                        });
+
+                    let sync_state = if upload_state.is_some() || download_state.is_some() {
+                        Some(IntegrationSyncState {
+                            upload: upload_state,
+                            download: download_state,
+                        })
+                    } else {
+                        None
+                    };
+
+                    let sync_interval_secs = state.sync_config.interval_for(&i.integration_type);
+
+                    IntegrationInfo {
+                        integration_type: i.integration_type,
+                        enabled: i.enabled,
+                        config: serde_json::to_value(&i.config).unwrap_or(Value::Null),
+                        sync_state,
+                        sync_interval_secs,
+                    }
                 })
                 .collect();
             (StatusCode::OK, Json(info))
@@ -1218,6 +1300,618 @@ async fn lofi_confirm(State(state): State<AppState>, jar: CookieJar) -> impl Int
     }
 }
 
+// === Sync handlers ===
+
+/// Get sync state for all integrations
+async fn get_sync_states(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(Vec::<SyncStateResponse>::new()),
+            );
+        }
+    };
+
+    let states = match integrations::get_all_sync_states(&conn, user.id) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Vec::<SyncStateResponse>::new()),
+            );
+        }
+    };
+
+    // Group by integration type
+    let mut grouped: std::collections::HashMap<String, SyncStateResponse> =
+        std::collections::HashMap::new();
+
+    for state in states {
+        let entry = grouped
+            .entry(state.integration_type.clone())
+            .or_insert_with(|| SyncStateResponse {
+                integration_type: state.integration_type.clone(),
+                upload: None,
+                download: None,
+            });
+
+        let direction_state = SyncDirectionState {
+            last_sync_at: state.last_sync_at,
+            last_sync_result: state.last_sync_result,
+            last_sync_message: state.last_sync_message,
+            items_synced: state.items_synced,
+        };
+
+        match state.direction.as_str() {
+            "upload" => entry.upload = Some(direction_state),
+            "download" => entry.download = Some(direction_state),
+            _ => {}
+        }
+    }
+
+    let response: Vec<SyncStateResponse> = grouped.into_values().collect();
+    (StatusCode::OK, Json(response))
+}
+
+/// Sync from LoFi (download only - read-only integration)
+async fn sync_lofi(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Unauthorized".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Internal error".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    // Get LoFi integration config
+    let integration = match integrations::get_integration(
+        &conn,
+        &state.master_key,
+        user.id,
+        &user_salt,
+        "lofi",
+    ) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SyncResponse {
+                    success: false,
+                    message: "LoFi integration not configured".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+        Err(e) => {
+            tracing::error!("Failed to get LoFi integration: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Failed to get integration config".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    let lofi_config = match integration.config {
+        integrations::IntegrationConfig::Lofi(c) => c,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Invalid integration type".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    if !lofi_config.device_linked {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SyncResponse {
+                success: false,
+                message: "Device not linked. Please complete email confirmation.".into(),
+                items_synced: 0,
+            }),
+        );
+    }
+
+    // Convert to client config
+    let client_config = LofiConfig {
+        enabled: true,
+        client_key: Some(lofi_config.client_key),
+        client_secret: Some(lofi_config.client_secret),
+        callsign: user.callsign.clone(),
+        email: None,
+        sync_batch_size: lofi_config.sync_batch_size,
+        sync_loop_delay_ms: lofi_config.sync_loop_delay_ms,
+        sync_check_period_ms: 0,
+        device_linked: lofi_config.device_linked,
+    };
+
+    // Create client
+    let client = match LofiClient::new(client_config) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ =
+                integrations::record_sync_error(&conn, user.id, "lofi", "download", &e.to_string());
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: format!("Failed to create LoFi client: {}", e),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    // Set bearer token if we have one
+    let mut client = client;
+    if let Some(token) = lofi_config.bearer_token {
+        client.set_bearer_token(token);
+    }
+
+    // Open database for writing QSOs
+    let db = match Database::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            let _ =
+                integrations::record_sync_error(&conn, user.id, "lofi", "download", &e.to_string());
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: format!("Database error: {}", e),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    // Fetch QSOs from LoFi
+    let mut total_qsos = 0i64;
+    let mut cursor: Option<f64> = None;
+
+    loop {
+        let response = match client.fetch_qsos(cursor, Some(50)).await {
+            Ok(r) => r,
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ =
+                    integrations::record_sync_error(&conn, user.id, "lofi", "download", &err_msg);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SyncResponse {
+                        success: false,
+                        message: format!("Failed to fetch from LoFi: {}", err_msg),
+                        items_synced: total_qsos,
+                    }),
+                );
+            }
+        };
+
+        for qso in &response.qsos {
+            if qso.deleted != 0 {
+                continue;
+            }
+
+            if let Err(e) = db.upsert_lofi_qso(qso) {
+                tracing::warn!("Failed to save LoFi QSO: {}", e);
+            } else {
+                total_qsos += 1;
+            }
+        }
+
+        if response.meta.qsos.records_left == 0 {
+            break;
+        }
+
+        cursor = Some(response.meta.qsos.synced_until_millis);
+
+        // Small delay between requests
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    // Record success
+    let _ = integrations::record_sync_success(
+        &conn,
+        user.id,
+        "lofi",
+        "download",
+        total_qsos,
+        Some(&format!("Downloaded {} QSOs", total_qsos)),
+    );
+
+    (
+        StatusCode::OK,
+        Json(SyncResponse {
+            success: true,
+            message: format!("Downloaded {} QSOs from LoFi", total_qsos),
+            items_synced: total_qsos,
+        }),
+    )
+}
+
+/// Sync QRZ - upload QSOs
+async fn sync_qrz_upload(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Unauthorized".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Internal error".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    // Get QRZ integration config
+    let integration =
+        match integrations::get_integration(&conn, &state.master_key, user.id, &user_salt, "qrz") {
+            Ok(Some(i)) => i,
+            Ok(None) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(SyncResponse {
+                        success: false,
+                        message: "QRZ integration not configured".into(),
+                        items_synced: 0,
+                    }),
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to get QRZ integration: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SyncResponse {
+                        success: false,
+                        message: "Failed to get integration config".into(),
+                        items_synced: 0,
+                    }),
+                );
+            }
+        };
+
+    let qrz_config = match integration.config {
+        integrations::IntegrationConfig::Qrz(c) => c,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Invalid integration type".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    if !qrz_config.upload_enabled {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SyncResponse {
+                success: false,
+                message: "QRZ upload is disabled".into(),
+                items_synced: 0,
+            }),
+        );
+    }
+
+    // Create QRZ client
+    let client = QrzClient::new(qrz_config.api_key.clone(), qrz_config.user_agent.clone());
+
+    // Get unsynced QSOs
+    let db = match Database::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let _ = integrations::record_sync_error(&conn, user.id, "qrz", "upload", &err_msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: format!("Database error: {}", err_msg),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    let unsynced = match db.get_unsynced_qrz() {
+        Ok(q) => q,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let _ = integrations::record_sync_error(&conn, user.id, "qrz", "upload", &err_msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: format!("Failed to get unsynced QSOs: {}", err_msg),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    if unsynced.is_empty() {
+        let _ = integrations::record_sync_success(
+            &conn,
+            user.id,
+            "qrz",
+            "upload",
+            0,
+            Some("No QSOs to upload"),
+        );
+        return (
+            StatusCode::OK,
+            Json(SyncResponse {
+                success: true,
+                message: "No QSOs to upload".into(),
+                items_synced: 0,
+            }),
+        );
+    }
+
+    let mut uploaded = 0i64;
+    let mut errors = Vec::new();
+
+    for stored_qso in &unsynced {
+        // Parse the stored ADIF record to get the original Qso
+        let qso: crate::adif::Qso = match serde_json::from_str(&stored_qso.adif_record) {
+            Ok(q) => q,
+            Err(e) => {
+                errors.push(format!("{}: Failed to parse QSO: {}", stored_qso.call, e));
+                continue;
+            }
+        };
+
+        match client.upload_qso(&qso).await {
+            Ok(result) => {
+                if let Some(logid) = result.logid {
+                    let _ = db.mark_qrz_synced(stored_qso.id, logid);
+                }
+                if !result.is_duplicate {
+                    uploaded += 1;
+                }
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", stored_qso.call, e));
+                if errors.len() >= 5 {
+                    break; // Stop after 5 errors
+                }
+            }
+        }
+
+        // Small delay between uploads
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    let message = if errors.is_empty() {
+        format!("Uploaded {} QSOs to QRZ", uploaded)
+    } else {
+        format!(
+            "Uploaded {} QSOs with {} errors: {}",
+            uploaded,
+            errors.len(),
+            errors.join(", ")
+        )
+    };
+
+    if errors.is_empty() {
+        let _ = integrations::record_sync_success(
+            &conn,
+            user.id,
+            "qrz",
+            "upload",
+            uploaded,
+            Some(&message),
+        );
+    } else {
+        let _ = integrations::record_sync_error(&conn, user.id, "qrz", "upload", &message);
+    }
+
+    (
+        StatusCode::OK,
+        Json(SyncResponse {
+            success: errors.is_empty(),
+            message,
+            items_synced: uploaded,
+        }),
+    )
+}
+
+/// Sync QRZ - download QSOs
+async fn sync_qrz_download(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Unauthorized".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Internal error".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    // Get QRZ integration config
+    let integration =
+        match integrations::get_integration(&conn, &state.master_key, user.id, &user_salt, "qrz") {
+            Ok(Some(i)) => i,
+            Ok(None) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(SyncResponse {
+                        success: false,
+                        message: "QRZ integration not configured".into(),
+                        items_synced: 0,
+                    }),
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to get QRZ integration: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SyncResponse {
+                        success: false,
+                        message: "Failed to get integration config".into(),
+                        items_synced: 0,
+                    }),
+                );
+            }
+        };
+
+    let qrz_config = match integration.config {
+        integrations::IntegrationConfig::Qrz(c) => c,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: "Invalid integration type".into(),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    if !qrz_config.download_enabled {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SyncResponse {
+                success: false,
+                message: "QRZ download is disabled".into(),
+                items_synced: 0,
+            }),
+        );
+    }
+
+    // Create QRZ client
+    let client = QrzClient::new(qrz_config.api_key.clone(), qrz_config.user_agent.clone());
+
+    let db = match Database::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let _ = integrations::record_sync_error(&conn, user.id, "qrz", "download", &err_msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: format!("Database error: {}", err_msg),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    // Fetch all QSOs from QRZ
+    let fetched_qsos = match client.fetch_all().await {
+        Ok(q) => q,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let _ = integrations::record_sync_error(&conn, user.id, "qrz", "download", &err_msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: format!("Failed to fetch from QRZ: {}", err_msg),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    let mut imported = 0i64;
+    for fetched in &fetched_qsos {
+        let source_id = fetched.qrz_logid.map(|id| id.to_string());
+        if let Err(e) = db.upsert_qso_with_source(&fetched.qso, None, "qrz", source_id.as_deref()) {
+            tracing::warn!("Failed to save QRZ QSO: {}", e);
+        } else {
+            imported += 1;
+        }
+    }
+
+    let message = format!("Downloaded {} QSOs from QRZ", imported);
+    let _ = integrations::record_sync_success(
+        &conn,
+        user.id,
+        "qrz",
+        "download",
+        imported,
+        Some(&message),
+    );
+
+    (
+        StatusCode::OK,
+        Json(SyncResponse {
+            success: true,
+            message,
+            items_synced: imported,
+        }),
+    )
+}
+
 // === User profile handlers ===
 
 async fn update_profile(
@@ -1515,10 +2209,15 @@ fn sanitize_filename(filename: &str) -> String {
 }
 
 /// Build the web application router
-pub async fn build_router(db_path: PathBuf, master_key: MasterKey) -> Router {
+pub async fn build_router(
+    db_path: PathBuf,
+    master_key: MasterKey,
+    sync_config: SyncConfig,
+) -> Router {
     let state = AppState {
         db_path,
         master_key: Arc::new(master_key),
+        sync_config,
     };
 
     // API routes
@@ -1551,6 +2250,11 @@ pub async fn build_router(db_path: PathBuf, master_key: MasterKey) -> Router {
         .route("/integrations/lofi/status", get(lofi_status))
         .route("/integrations/lofi/send-link", post(lofi_send_link))
         .route("/integrations/lofi/confirm", post(lofi_confirm))
+        // Sync endpoints
+        .route("/sync/status", get(get_sync_states))
+        .route("/sync/lofi", post(sync_lofi))
+        .route("/sync/qrz/upload", post(sync_qrz_upload))
+        .route("/sync/qrz/download", post(sync_qrz_download))
         // Log upload
         .route("/logs/upload", post(upload_log));
 
@@ -1567,6 +2271,7 @@ pub async fn build_router(db_path: PathBuf, master_key: MasterKey) -> Router {
 pub async fn serve(
     db_path: PathBuf,
     master_key: MasterKey,
+    sync_config: SyncConfig,
     bind: &str,
 ) -> std::result::Result<(), std::io::Error> {
     // Run migrations before starting the server
@@ -1581,7 +2286,7 @@ pub async fn serve(
         }
     }
 
-    let app = build_router(db_path, master_key).await;
+    let app = build_router(db_path, master_key, sync_config).await;
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("Web server listening on {}", bind);

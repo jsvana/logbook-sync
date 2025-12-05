@@ -10,11 +10,13 @@ pub mod lofi;
 pub mod lotw;
 pub mod ntfy;
 pub mod qrz;
+pub mod sync_worker;
 pub mod wavelog;
 pub mod web;
 
-pub use config::Config;
+pub use config::{Config, SyncConfig};
 pub use crypto::{CryptoError, MasterKey, UserCrypto};
 pub use db::qso_source;
 pub use error::{Error, Result};
 pub use lofi::{LofiClient, LofiConfig};
+pub use sync_worker::start_sync_workers;

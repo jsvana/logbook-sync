@@ -408,3 +408,120 @@ pub fn set_watch_path_enabled(
     )?;
     Ok(())
 }
+
+// === Sync State Tracking ===
+
+/// Sync state record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncState {
+    pub integration_type: String,
+    pub direction: String,
+    pub last_sync_at: Option<String>,
+    pub last_sync_result: Option<String>,
+    pub last_sync_message: Option<String>,
+    pub items_synced: i64,
+}
+
+/// Record a successful sync
+pub fn record_sync_success(
+    conn: &Connection,
+    user_id: i64,
+    integration_type: &str,
+    direction: &str,
+    items_synced: i64,
+    message: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO user_sync_state (user_id, integration_type, direction, last_sync_at, last_sync_result, last_sync_message, items_synced)
+        VALUES (?1, ?2, ?3, datetime('now'), 'success', ?4, ?5)
+        ON CONFLICT(user_id, integration_type, direction) DO UPDATE SET
+            last_sync_at = datetime('now'),
+            last_sync_result = 'success',
+            last_sync_message = excluded.last_sync_message,
+            items_synced = excluded.items_synced
+        "#,
+        params![user_id, integration_type, direction, message, items_synced],
+    )?;
+    Ok(())
+}
+
+/// Record a failed sync
+pub fn record_sync_error(
+    conn: &Connection,
+    user_id: i64,
+    integration_type: &str,
+    direction: &str,
+    error_message: &str,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO user_sync_state (user_id, integration_type, direction, last_sync_at, last_sync_result, last_sync_message, items_synced)
+        VALUES (?1, ?2, ?3, datetime('now'), 'error', ?4, 0)
+        ON CONFLICT(user_id, integration_type, direction) DO UPDATE SET
+            last_sync_at = datetime('now'),
+            last_sync_result = 'error',
+            last_sync_message = excluded.last_sync_message,
+            items_synced = 0
+        "#,
+        params![user_id, integration_type, direction, error_message],
+    )?;
+    Ok(())
+}
+
+/// Get sync state for a user and integration
+pub fn get_sync_state(
+    conn: &Connection,
+    user_id: i64,
+    integration_type: &str,
+) -> Result<Vec<SyncState>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT integration_type, direction, last_sync_at, last_sync_result, last_sync_message, items_synced
+        FROM user_sync_state
+        WHERE user_id = ?1 AND integration_type = ?2
+        "#,
+    )?;
+
+    let states = stmt
+        .query_map(params![user_id, integration_type], |row| {
+            Ok(SyncState {
+                integration_type: row.get(0)?,
+                direction: row.get(1)?,
+                last_sync_at: row.get(2)?,
+                last_sync_result: row.get(3)?,
+                last_sync_message: row.get(4)?,
+                items_synced: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(states)
+}
+
+/// Get all sync states for a user
+pub fn get_all_sync_states(conn: &Connection, user_id: i64) -> Result<Vec<SyncState>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT integration_type, direction, last_sync_at, last_sync_result, last_sync_message, items_synced
+        FROM user_sync_state
+        WHERE user_id = ?1
+        ORDER BY integration_type, direction
+        "#,
+    )?;
+
+    let states = stmt
+        .query_map([user_id], |row| {
+            Ok(SyncState {
+                integration_type: row.get(0)?,
+                direction: row.get(1)?,
+                last_sync_at: row.get(2)?,
+                last_sync_result: row.get(3)?,
+                last_sync_message: row.get(4)?,
+                items_synced: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(states)
+}

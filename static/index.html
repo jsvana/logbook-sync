@@ -106,6 +106,8 @@
         .dropdown-item:hover { background: var(--primary); }
         .dropdown-item .desc { font-size: 0.85rem; color: var(--text-dim); margin-top: 0.25rem; }
         .integration-card.configured { border-color: var(--accent); }
+        .integration-card-content { flex: 1; }
+        .integration-card-actions { display: flex; gap: 0.5rem; align-items: flex-start; }
         .badge {
             display: inline-block;
             padding: 0.2rem 0.5rem;
@@ -115,6 +117,69 @@
         }
         .badge.enabled { background: var(--badge-enabled-bg); color: var(--badge-enabled-text); }
         .badge.disabled { background: var(--badge-disabled-bg); color: var(--badge-disabled-text); }
+        .sync-status {
+            margin-top: 0.75rem;
+            padding: 0.75rem;
+            background: var(--bg);
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+        .sync-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid var(--primary);
+        }
+        .sync-row:last-child { border-bottom: none; }
+        .sync-direction {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .sync-direction-icon {
+            font-size: 1rem;
+            width: 1.5rem;
+            text-align: center;
+        }
+        .sync-info {
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+        }
+        .sync-time {
+            color: var(--text-dim);
+            font-size: 0.8rem;
+        }
+        .sync-result {
+            font-size: 0.75rem;
+        }
+        .sync-result.success { color: var(--badge-enabled-text); }
+        .sync-result.error { color: var(--badge-disabled-text); }
+        .sync-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+        .sync-btn {
+            padding: 0.25rem 0.5rem;
+            font-size: 0.75rem;
+            background: var(--primary);
+        }
+        .sync-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .sync-btn.syncing {
+            background: var(--text-dim);
+        }
+        .sync-interval-info {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            text-align: center;
+            margin-top: 0.5rem;
+            padding-top: 0.5rem;
+            border-top: 1px solid var(--primary);
+        }
         #add-integration-menu {
             position: absolute;
             right: 0;
@@ -559,6 +624,130 @@
             }
         }
 
+        // Sync capabilities per integration type
+        const SYNC_CAPABILITIES = {
+            qrz: { upload: true, download: true },
+            lofi: { upload: false, download: true },
+            lotw: { upload: true, download: true },
+            clublog: { upload: true, download: false },
+            eqsl: { upload: true, download: true },
+            hrdlog: { upload: true, download: false },
+            wavelog: { upload: true, download: true },
+        };
+
+        function formatSyncTime(isoString) {
+            if (!isoString) return 'Never';
+            const date = new Date(isoString);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffMins = Math.floor(diffMs / 60000);
+            const diffHours = Math.floor(diffMs / 3600000);
+            const diffDays = Math.floor(diffMs / 86400000);
+
+            if (diffMins < 1) return 'Just now';
+            if (diffMins < 60) return `${diffMins}m ago`;
+            if (diffHours < 24) return `${diffHours}h ago`;
+            if (diffDays < 7) return `${diffDays}d ago`;
+            return date.toLocaleDateString();
+        }
+
+        function formatNextSyncTime(lastSyncIso, intervalSecs) {
+            if (!lastSyncIso || !intervalSecs) return null;
+            const lastSync = new Date(lastSyncIso);
+            const nextSync = new Date(lastSync.getTime() + intervalSecs * 1000);
+            const now = new Date();
+            const diffMs = nextSync - now;
+
+            if (diffMs <= 0) return 'Now';
+
+            const diffMins = Math.floor(diffMs / 60000);
+            const diffHours = Math.floor(diffMs / 3600000);
+
+            if (diffMins < 1) return '< 1m';
+            if (diffMins < 60) return `${diffMins}m`;
+            if (diffHours < 24) return `${diffHours}h ${diffMins % 60}m`;
+            return `${Math.floor(diffHours / 24)}d`;
+        }
+
+        function formatIntervalSecs(secs) {
+            if (!secs) return '';
+            if (secs < 60) return `${secs}s`;
+            if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+            return `${Math.floor(secs / 3600)}h`;
+        }
+
+        function renderSyncStatus(type, syncState, config, syncIntervalSecs) {
+            const caps = SYNC_CAPABILITIES[type] || {};
+            const rows = [];
+
+            // Check if upload/download is enabled in config
+            const uploadEnabled = config?.upload_enabled !== false && caps.upload;
+            const downloadEnabled = config?.download_enabled !== false && caps.download;
+
+            if (caps.download && downloadEnabled) {
+                const dlState = syncState?.download;
+                const lastSync = dlState?.last_sync_at;
+                const result = dlState?.last_sync_result;
+                const resultClass = result === 'success' ? 'success' : (result === 'error' ? 'error' : '');
+                const itemsSynced = dlState?.items_synced || 0;
+                const nextSync = formatNextSyncTime(lastSync, syncIntervalSecs);
+
+                rows.push(`
+                    <div class="sync-row">
+                        <div class="sync-direction">
+                            <span class="sync-direction-icon">&#8595;</span>
+                            <div class="sync-info">
+                                <span>Download</span>
+                                <span class="sync-time">Last: ${formatSyncTime(lastSync)}${nextSync ? ` · Next: ${nextSync}` : ''}</span>
+                                ${result ? `<span class="sync-result ${resultClass}">${itemsSynced} items</span>` : ''}
+                            </div>
+                        </div>
+                        <div class="sync-actions">
+                            <button class="sync-btn" onclick="forceSync('${type}', 'download')" id="sync-${type}-download">
+                                Sync Now
+                            </button>
+                        </div>
+                    </div>
+                `);
+            }
+
+            if (caps.upload && uploadEnabled) {
+                const ulState = syncState?.upload;
+                const lastSync = ulState?.last_sync_at;
+                const result = ulState?.last_sync_result;
+                const resultClass = result === 'success' ? 'success' : (result === 'error' ? 'error' : '');
+                const itemsSynced = ulState?.items_synced || 0;
+                const nextSync = formatNextSyncTime(lastSync, syncIntervalSecs);
+
+                rows.push(`
+                    <div class="sync-row">
+                        <div class="sync-direction">
+                            <span class="sync-direction-icon">&#8593;</span>
+                            <div class="sync-info">
+                                <span>Upload</span>
+                                <span class="sync-time">Last: ${formatSyncTime(lastSync)}${nextSync ? ` · Next: ${nextSync}` : ''}</span>
+                                ${result ? `<span class="sync-result ${resultClass}">${itemsSynced} items</span>` : ''}
+                            </div>
+                        </div>
+                        <div class="sync-actions">
+                            <button class="sync-btn" onclick="forceSync('${type}', 'upload')" id="sync-${type}-upload">
+                                Sync Now
+                            </button>
+                        </div>
+                    </div>
+                `);
+            }
+
+            if (rows.length === 0) return '';
+
+            // Add sync interval info at the bottom
+            const intervalStr = formatIntervalSecs(syncIntervalSecs);
+            return `<div class="sync-status">
+                ${rows.join('')}
+                <div class="sync-interval-info">Auto-sync every ${intervalStr}</div>
+            </div>`;
+        }
+
         function renderIntegrations() {
             const configuredContainer = document.getElementById('configured-integrations');
             const noIntegrationsMsg = document.getElementById('no-integrations');
@@ -578,17 +767,23 @@
                     const type = integration.integration_type;
                     const meta = INTEGRATION_TYPES[type] || { name: type.toUpperCase(), desc: '' };
                     const enabled = integration.enabled;
+                    const syncStatusHtml = enabled ? renderSyncStatus(type, integration.sync_state, integration.config, integration.sync_interval_secs) : '';
 
                     return `
                         <div class="integration-card configured">
-                            <div>
-                                <strong>${meta.name}</strong>
-                                <span class="badge ${enabled ? 'enabled' : 'disabled'}">${enabled ? 'Enabled' : 'Disabled'}</span>
-                                <div style="color: var(--text-dim); font-size: 0.85rem; margin-top: 0.25rem;">${meta.desc}</div>
-                            </div>
-                            <div style="display: flex; gap: 0.5rem;">
-                                <button onclick="configureIntegration('${type}')">Edit</button>
-                                <button onclick="deleteIntegration('${type}')" style="background: var(--primary);">Remove</button>
+                            <div class="integration-card-content">
+                                <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                                    <div>
+                                        <strong>${meta.name}</strong>
+                                        <span class="badge ${enabled ? 'enabled' : 'disabled'}">${enabled ? 'Enabled' : 'Disabled'}</span>
+                                        <div style="color: var(--text-dim); font-size: 0.85rem; margin-top: 0.25rem;">${meta.desc}</div>
+                                    </div>
+                                    <div class="integration-card-actions">
+                                        <button onclick="configureIntegration('${type}')">Edit</button>
+                                        <button onclick="deleteIntegration('${type}')" style="background: var(--primary);">Remove</button>
+                                    </div>
+                                </div>
+                                ${syncStatusHtml}
                             </div>
                         </div>
                     `;
@@ -629,6 +824,46 @@
                 loadIntegrations();
             } catch (err) {
                 alert('Failed to remove integration');
+            }
+        }
+
+        // Force sync function
+        async function forceSync(type, direction) {
+            const btn = document.getElementById(`sync-${type}-${direction}`);
+            if (!btn) return;
+
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Syncing...';
+            btn.classList.add('syncing');
+
+            try {
+                let endpoint;
+                if (type === 'lofi') {
+                    endpoint = '/sync/lofi';
+                } else if (type === 'qrz') {
+                    endpoint = direction === 'upload' ? '/sync/qrz/upload' : '/sync/qrz/download';
+                } else {
+                    // Future integrations
+                    endpoint = `/sync/${type}/${direction}`;
+                }
+
+                const result = await api(endpoint, { method: 'POST' });
+
+                if (result.success) {
+                    // Refresh integrations to show updated sync state
+                    await loadIntegrations();
+                } else {
+                    alert(`Sync failed: ${result.message}`);
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                    btn.classList.remove('syncing');
+                }
+            } catch (err) {
+                alert(`Sync error: ${err.message}`);
+                btn.disabled = false;
+                btn.textContent = originalText;
+                btn.classList.remove('syncing');
             }
         }
 
