@@ -534,7 +534,8 @@
 
         <!-- POTA Preview/Upload Modal -->
         <div id="pota-modal" class="hidden" style="position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 1000;">
-            <div class="card" style="max-width: 700px; width: 100%; max-height: 80vh; overflow-y: auto;">
+            <div class="card" style="max-width: 700px; width: 100%; max-height: 80vh; overflow-y: auto; position: relative;">
+                <button type="button" onclick="closePotaModal()" style="position: absolute; top: 0.75rem; right: 0.75rem; background: transparent; border: none; color: var(--text-dim); font-size: 1.5rem; cursor: pointer; padding: 0.25rem 0.5rem; line-height: 1;" title="Close">&times;</button>
                 <h2>POTA Activation Upload</h2>
                 <div id="pota-summary" style="margin-bottom: 1rem; padding: 0.75rem; background: var(--surface); border-radius: 4px;"></div>
                 <div id="pota-selection-controls" style="margin-bottom: 0.5rem; display: none;">
