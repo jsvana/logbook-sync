@@ -2418,6 +2418,108 @@ async fn pota_upload(
     )
 }
 
+#[derive(Debug, Serialize)]
+pub struct PotaJobsResponse {
+    pub success: bool,
+    pub jobs: Vec<crate::pota::PotaJobInfo>,
+    pub message: Option<String>,
+}
+
+async fn pota_jobs(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(PotaJobsResponse {
+                    success: false,
+                    jobs: vec![],
+                    message: Some("Unauthorized".into()),
+                }),
+            );
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaJobsResponse {
+                    success: false,
+                    jobs: vec![],
+                    message: Some("Internal error".into()),
+                }),
+            );
+        }
+    };
+
+    // Get POTA integration config
+    let integration = match integrations::get_integration(
+        &conn,
+        &state.master_key,
+        user.id,
+        &user_salt,
+        "pota",
+    ) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(PotaJobsResponse {
+                    success: false,
+                    jobs: vec![],
+                    message: Some("POTA integration not configured".into()),
+                }),
+            );
+        }
+        Err(e) => {
+            tracing::error!("Failed to get POTA integration: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaJobsResponse {
+                    success: false,
+                    jobs: vec![],
+                    message: Some("Failed to get integration config".into()),
+                }),
+            );
+        }
+    };
+
+    let pota_config = match integration.config {
+        integrations::IntegrationConfig::Pota(c) => c,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaJobsResponse {
+                    success: false,
+                    jobs: vec![],
+                    message: Some("Invalid integration type".into()),
+                }),
+            );
+        }
+    };
+
+    match crate::pota::get_upload_jobs(&pota_config.email, &pota_config.password).await {
+        Ok(jobs) => (
+            StatusCode::OK,
+            Json(PotaJobsResponse {
+                success: true,
+                jobs,
+                message: None,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(PotaJobsResponse {
+                success: false,
+                jobs: vec![],
+                message: Some(format!("Failed to get jobs: {}", e)),
+            }),
+        ),
+    }
+}
+
 // === User profile handlers ===
 
 async fn update_profile(
@@ -2764,6 +2866,7 @@ pub async fn build_router(
         // POTA endpoints
         .route("/sync/pota/preview", get(pota_preview))
         .route("/sync/pota/upload", post(pota_upload))
+        .route("/sync/pota/jobs", get(pota_jobs))
         // Log upload
         .route("/logs/upload", post(upload_log));
 

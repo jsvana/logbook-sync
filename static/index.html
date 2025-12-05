@@ -301,6 +301,19 @@
         .text-muted {
             color: var(--text-dim);
         }
+        /* Job status colors */
+        .status-success {
+            background: var(--badge-enabled-bg);
+            color: var(--badge-enabled-text);
+        }
+        .status-error {
+            background: #3d2020;
+            color: #ff6b6b;
+        }
+        .status-pending {
+            background: #3d3520;
+            color: #ffbb33;
+        }
     </style>
 </head>
 <body>
@@ -529,8 +542,13 @@
                 </div>
                 <div id="pota-valid-activations" style="margin-bottom: 1rem;"></div>
                 <div id="pota-invalid-activations" style="margin-bottom: 1rem;"></div>
-                <div style="display: flex; gap: 1rem;">
+                <div id="pota-jobs-section" style="margin-bottom: 1rem; display: none;">
+                    <h3 style="margin-bottom: 0.5rem;">Recent Upload Jobs</h3>
+                    <div id="pota-jobs-list"></div>
+                </div>
+                <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
                     <button type="button" id="pota-upload-btn" onclick="uploadSelectedPota()">Upload Selected</button>
+                    <button type="button" id="pota-check-status-btn" onclick="checkPotaJobStatus()" style="background: var(--primary);">Check Upload Status</button>
                     <button type="button" onclick="closePotaModal()" style="background: var(--primary);">Cancel</button>
                 </div>
             </div>
@@ -1121,7 +1139,57 @@
 
         function closePotaModal() {
             document.getElementById('pota-modal').classList.add('hidden');
+            document.getElementById('pota-jobs-section').style.display = 'none';
             potaPreviewData = null;
+        }
+
+        async function checkPotaJobStatus() {
+            const btn = document.getElementById('pota-check-status-btn');
+            const jobsSection = document.getElementById('pota-jobs-section');
+            const jobsList = document.getElementById('pota-jobs-list');
+
+            // Show loading state
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '<span class="btn-spinner"></span>Loading...';
+            btn.disabled = true;
+
+            try {
+                const result = await api('/sync/pota/jobs');
+                if (result.success) {
+                    if (result.jobs.length === 0) {
+                        jobsList.innerHTML = '<div class="text-muted">No upload jobs found</div>';
+                    } else {
+                        jobsList.innerHTML = result.jobs.slice(0, 10).map(job => {
+                            const statusClass = job.status === 'Completed' ? 'status-success' :
+                                               job.status === 'Failed' ? 'status-error' :
+                                               'status-pending';
+                            return `
+                                <div class="pota-job" style="padding: 0.5rem; margin-bottom: 0.5rem; background: var(--surface); border-radius: 4px;">
+                                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                                        <strong>${job.park_ref}</strong>
+                                        <span class="${statusClass}" style="padding: 0.125rem 0.5rem; border-radius: 4px; font-size: 0.875rem;">${job.status}</span>
+                                    </div>
+                                    <div style="font-size: 0.875rem; color: var(--text-dim);">
+                                        ${job.park_name || ''} ${job.callsign ? '(' + job.callsign + ')' : ''}
+                                    </div>
+                                    <div style="font-size: 0.875rem;">
+                                        ${job.inserted_qsos}/${job.total_qsos} QSOs inserted
+                                        ${job.processed ? ' • Processed: ' + job.processed : ' • Submitted: ' + job.submitted}
+                                    </div>
+                                </div>
+                            `;
+                        }).join('');
+                    }
+                    jobsSection.style.display = 'block';
+                } else {
+                    alert(`Failed to get job status: ${result.message}`);
+                }
+            } catch (err) {
+                alert(`Error: ${err.message}`);
+            } finally {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            }
         }
 
         function toggleAllPotaActivations() {

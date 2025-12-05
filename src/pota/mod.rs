@@ -722,3 +722,44 @@ pub async fn upload_to_pota(
         errors,
     })
 }
+
+/// POTA upload job information
+#[derive(Debug, Clone, Serialize)]
+pub struct PotaJobInfo {
+    pub job_id: u64,
+    pub status: String,
+    pub park_ref: String,
+    pub park_name: Option<String>,
+    pub submitted: String,
+    pub processed: Option<String>,
+    pub total_qsos: u32,
+    pub inserted_qsos: u32,
+    pub callsign: Option<String>,
+}
+
+/// Get POTA upload job status
+pub async fn get_upload_jobs(email: &str, password: &str) -> Result<Vec<PotaJobInfo>> {
+    let client = PotaClient::authenticate(email, password)
+        .await
+        .map_err(|e| Error::Other(format!("POTA authentication failed: {}", e)))?;
+
+    let jobs = client
+        .get_jobs()
+        .await
+        .map_err(|e| Error::Other(format!("Failed to get POTA jobs: {}", e)))?;
+
+    Ok(jobs
+        .into_iter()
+        .map(|j| PotaJobInfo {
+            job_id: j.job_id,
+            status: j.status_str().to_string(),
+            park_ref: j.reference,
+            park_name: j.park_name,
+            submitted: j.submitted,
+            processed: j.processed,
+            total_qsos: j.total,
+            inserted_qsos: j.inserted,
+            callsign: j.callsign_used,
+        })
+        .collect())
+}
