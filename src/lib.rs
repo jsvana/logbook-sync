@@ -9,6 +9,7 @@ pub mod hrdlog;
 pub mod lofi;
 pub mod lotw;
 pub mod ntfy;
+pub mod pota;
 pub mod qrz;
 pub mod sync_worker;
 pub mod wavelog;

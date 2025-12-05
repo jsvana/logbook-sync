@@ -118,6 +118,15 @@ fn default_ntfy_priority() -> u8 {
     3
 }
 
+/// POTA.app integration configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PotaIntegrationConfig {
+    /// POTA.app email address
+    pub email: String,
+    /// POTA.app password
+    pub password: String,
+}
+
 /// Wrapper enum for all integration types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -130,6 +139,7 @@ pub enum IntegrationConfig {
     Hrdlog(HrdlogIntegrationConfig),
     Wavelog(WavelogIntegrationConfig),
     Ntfy(NtfyIntegrationConfig),
+    Pota(PotaIntegrationConfig),
 }
 
 impl IntegrationConfig {
@@ -144,6 +154,7 @@ impl IntegrationConfig {
             IntegrationConfig::Hrdlog(_) => "hrdlog",
             IntegrationConfig::Wavelog(_) => "wavelog",
             IntegrationConfig::Ntfy(_) => "ntfy",
+            IntegrationConfig::Pota(_) => "pota",
         }
     }
 }

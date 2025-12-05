@@ -236,6 +236,55 @@
             color: var(--text-dim);
             margin-top: 0.25rem;
         }
+        /* POTA Modal Styles */
+        .pota-activation {
+            padding: 0.75rem;
+            border-radius: 4px;
+            margin-bottom: 0.5rem;
+        }
+        .pota-activation.valid {
+            background: var(--badge-enabled-bg);
+            border: 1px solid var(--badge-enabled-text);
+        }
+        .pota-activation.invalid {
+            background: var(--badge-disabled-bg);
+            border: 1px solid var(--badge-disabled-text);
+            color: var(--badge-disabled-text);
+        }
+        .pota-activation label {
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .pota-activation details {
+            margin-top: 0.5rem;
+        }
+        .pota-activation summary {
+            cursor: pointer;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+        }
+        .pota-qso-table {
+            font-size: 0.8rem;
+            margin-top: 0.5rem;
+        }
+        .pota-qso-table th, .pota-qso-table td {
+            padding: 0.25rem 0.5rem;
+        }
+        .no-activations {
+            color: var(--text-dim);
+            text-align: center;
+            padding: 2rem;
+        }
+        .invalid-header {
+            font-weight: bold;
+            color: var(--badge-disabled-text);
+            margin-bottom: 0.5rem;
+        }
+        .text-muted {
+            color: var(--text-dim);
+        }
     </style>
 </head>
 <body>
@@ -453,6 +502,20 @@
                 </div>
             </div>
         </div>
+
+        <!-- POTA Preview/Upload Modal -->
+        <div id="pota-modal" class="hidden" style="position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 1000;">
+            <div class="card" style="max-width: 700px; width: 100%; max-height: 80vh; overflow-y: auto;">
+                <h2>POTA Activation Upload</h2>
+                <div id="pota-summary" style="margin-bottom: 1rem; padding: 0.75rem; background: var(--surface); border-radius: 4px;"></div>
+                <div id="pota-valid-activations" style="margin-bottom: 1rem;"></div>
+                <div id="pota-invalid-activations" style="margin-bottom: 1rem;"></div>
+                <div style="display: flex; gap: 1rem;">
+                    <button type="button" id="pota-upload-btn" onclick="uploadSelectedPota()">Upload Selected</button>
+                    <button type="button" onclick="closePotaModal()" style="background: var(--primary);">Cancel</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -470,6 +533,7 @@
             hrdlog: { name: 'HRDLog', desc: 'HRDLog.net logbook' },
             wavelog: { name: 'Wavelog', desc: 'Self-hosted Wavelog instance' },
             ntfy: { name: 'ntfy', desc: 'Push notifications via ntfy.sh' },
+            pota: { name: 'POTA.app', desc: 'Parks on the Air activation upload' },
         };
 
         // Integration field definitions (lofi has its own wizard)
@@ -508,6 +572,10 @@
                 { name: 'priority', label: 'Priority (1-5)', type: 'number', default: 3 },
                 { name: 'notify_on_sync', label: 'Notify on Sync', type: 'checkbox', default: true },
                 { name: 'notify_on_error', label: 'Notify on Error', type: 'checkbox', default: true },
+            ],
+            pota: [
+                { name: 'email', label: 'POTA.app Email', type: 'email', required: true },
+                { name: 'password', label: 'POTA.app Password', type: 'password', required: true },
             ],
         };
 
@@ -643,6 +711,7 @@
             hrdlog: { upload: true, download: false },
             wavelog: { upload: true, download: true },
             ntfy: { upload: false, download: false }, // Notifications only, no sync
+            pota: { upload: false, download: false, manualUpload: true }, // Manual upload with preview
         };
 
         function formatSyncTime(isoString) {
@@ -706,6 +775,34 @@
                             </button>
                         </div>
                     </div>
+                </div>`;
+            }
+
+            // Special case for POTA - manual upload with preview
+            if (type === 'pota') {
+                const ulState = syncState?.upload;
+                const lastSync = ulState?.last_sync_at;
+                const result = ulState?.last_sync_result;
+                const resultClass = result === 'success' ? 'success' : (result === 'error' ? 'error' : '');
+                const message = ulState?.last_sync_message || '';
+
+                return `<div class="sync-status">
+                    <div class="sync-row">
+                        <div class="sync-direction">
+                            <span class="sync-direction-icon">&#8593;</span>
+                            <div class="sync-info">
+                                <span>Activation Upload</span>
+                                <span class="sync-time">Last: ${formatSyncTime(lastSync)}</span>
+                                ${result ? `<span class="sync-result ${resultClass}">${message}</span>` : ''}
+                            </div>
+                        </div>
+                        <div class="sync-actions">
+                            <button class="sync-btn" onclick="showPotaPreview()" id="pota-preview-btn">
+                                Preview
+                            </button>
+                        </div>
+                    </div>
+                    <div class="sync-interval-info">Manual upload only (preview shows valid activations)</div>
                 </div>`;
             }
 
@@ -890,6 +987,156 @@
                 btn.disabled = false;
                 btn.textContent = originalText;
                 btn.classList.remove('syncing');
+            }
+        }
+
+        // POTA preview/upload functions
+        let potaPreviewData = null;
+
+        async function showPotaPreview() {
+            const btn = document.getElementById('pota-preview-btn');
+            if (!btn) return;
+
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+            btn.classList.add('syncing');
+
+            try {
+                const result = await api('/sync/pota/preview');
+                if (!result.success) {
+                    alert(`Preview failed: ${result.message}`);
+                    return;
+                }
+
+                potaPreviewData = result;
+                renderPotaModal(result);
+                document.getElementById('pota-modal').classList.remove('hidden');
+            } catch (err) {
+                alert(`Preview error: ${err.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+                btn.classList.remove('syncing');
+            }
+        }
+
+        function renderPotaModal(data) {
+            const validList = document.getElementById('pota-valid-activations');
+            const invalidList = document.getElementById('pota-invalid-activations');
+            const summary = document.getElementById('pota-summary');
+
+            // Summary
+            summary.innerHTML = `
+                <strong>${data.valid_activations.length}</strong> valid activations
+                (<strong>${data.total_qsos}</strong> QSOs) ready to upload.
+                ${data.invalid_activations.length > 0 ? `<br><span class="text-muted">${data.invalid_activations.length} incomplete activations (need 10+ QSOs)</span>` : ''}
+                ${data.skipped_qsos > 0 ? `<br><span class="text-muted">${data.skipped_qsos} non-POTA QSOs skipped</span>` : ''}
+            `;
+
+            // Valid activations
+            if (data.valid_activations.length > 0) {
+                validList.innerHTML = data.valid_activations.map(a => `
+                    <div class="pota-activation valid">
+                        <label>
+                            <input type="checkbox" checked value="${a.park_ref}:${a.date}" class="pota-activation-checkbox">
+                            <strong>${a.park_ref}</strong> on ${formatPotaDate(a.date)} - ${a.qso_count} QSOs
+                        </label>
+                        <details>
+                            <summary>View QSOs</summary>
+                            <table class="pota-qso-table">
+                                <thead><tr><th>Call</th><th>Time</th><th>Band</th><th>Mode</th></tr></thead>
+                                <tbody>
+                                    ${a.qsos.map(q => `<tr><td>${q.call}</td><td>${formatPotaTime(q.time)}</td><td>${q.band}</td><td>${q.mode}</td></tr>`).join('')}
+                                </tbody>
+                            </table>
+                        </details>
+                    </div>
+                `).join('');
+            } else {
+                validList.innerHTML = '<div class="no-activations">No valid activations found (need 10+ QSOs with POTA park reference)</div>';
+            }
+
+            // Invalid activations
+            if (data.invalid_activations.length > 0) {
+                invalidList.innerHTML = `
+                    <div class="invalid-header">Incomplete Activations (not uploaded)</div>
+                    ${data.invalid_activations.map(a => `
+                        <div class="pota-activation invalid">
+                            <strong>${a.park_ref}</strong> on ${formatPotaDate(a.date)} - ${a.qso_count} QSOs (need ${10 - a.qso_count} more)
+                        </div>
+                    `).join('')}
+                `;
+            } else {
+                invalidList.innerHTML = '';
+            }
+
+            // Update upload button state
+            updatePotaUploadButton();
+        }
+
+        function formatPotaDate(dateStr) {
+            if (dateStr.length === 8) {
+                return `${dateStr.slice(0,4)}-${dateStr.slice(4,6)}-${dateStr.slice(6,8)}`;
+            }
+            return dateStr;
+        }
+
+        function formatPotaTime(timeStr) {
+            if (timeStr.length >= 4) {
+                return `${timeStr.slice(0,2)}:${timeStr.slice(2,4)}`;
+            }
+            return timeStr;
+        }
+
+        function updatePotaUploadButton() {
+            const btn = document.getElementById('pota-upload-btn');
+            const checkboxes = document.querySelectorAll('.pota-activation-checkbox:checked');
+            btn.disabled = checkboxes.length === 0;
+            btn.textContent = checkboxes.length > 0 ? `Upload ${checkboxes.length} Activation${checkboxes.length > 1 ? 's' : ''}` : 'Select activations to upload';
+        }
+
+        function closePotaModal() {
+            document.getElementById('pota-modal').classList.add('hidden');
+            potaPreviewData = null;
+        }
+
+        async function uploadSelectedPota() {
+            const checkboxes = document.querySelectorAll('.pota-activation-checkbox:checked');
+            if (checkboxes.length === 0) {
+                alert('Please select at least one activation to upload');
+                return;
+            }
+
+            const activations = Array.from(checkboxes).map(cb => cb.value);
+            const btn = document.getElementById('pota-upload-btn');
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Uploading...';
+
+            try {
+                const result = await api('/sync/pota/upload', {
+                    method: 'POST',
+                    body: JSON.stringify({ activations }),
+                });
+
+                if (result.success) {
+                    alert(`Successfully uploaded ${result.activations_uploaded} activation(s) (${result.qsos_uploaded} QSOs)`);
+                    closePotaModal();
+                    loadIntegrations(); // Refresh to show updated sync status
+                } else {
+                    let msg = result.message;
+                    if (result.errors && result.errors.length > 0) {
+                        msg += '\n\nErrors:\n' + result.errors.join('\n');
+                    }
+                    alert(msg);
+                }
+            } catch (err) {
+                alert(`Upload error: ${err.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+                updatePotaUploadButton();
             }
         }
 
@@ -1208,6 +1455,13 @@
             if (!confirm('Remove LoFi integration?')) return;
             await deleteIntegration('lofi');
             closeLofiModal();
+        });
+
+        // POTA checkbox event delegation
+        document.getElementById('pota-valid-activations').addEventListener('change', (e) => {
+            if (e.target.classList.contains('pota-activation-checkbox')) {
+                updatePotaUploadButton();
+            }
         });
 
         // File Upload

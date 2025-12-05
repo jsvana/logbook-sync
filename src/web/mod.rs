@@ -1967,6 +1967,393 @@ async fn sync_qrz_download(State(state): State<AppState>, jar: CookieJar) -> imp
     )
 }
 
+// === POTA sync handlers ===
+
+/// Response for POTA preview (dry run)
+#[derive(Debug, Serialize)]
+pub struct PotaPreviewResponse {
+    pub success: bool,
+    pub valid_activations: Vec<PotaActivationInfo>,
+    pub invalid_activations: Vec<PotaActivationInfo>,
+    pub total_qsos: usize,
+    pub skipped_qsos: usize,
+    pub message: Option<String>,
+}
+
+/// Info about a single POTA activation
+#[derive(Debug, Serialize)]
+pub struct PotaActivationInfo {
+    pub park_ref: String,
+    pub date: String,
+    pub qso_count: usize,
+    pub is_valid: bool,
+    pub qsos: Vec<PotaQsoInfo>,
+}
+
+/// Brief info about a QSO in a POTA activation
+#[derive(Debug, Serialize)]
+pub struct PotaQsoInfo {
+    pub call: String,
+    pub time: String,
+    pub band: String,
+    pub mode: String,
+}
+
+/// Request for POTA upload (can specify which activations to upload)
+#[derive(Debug, Deserialize)]
+pub struct PotaUploadRequest {
+    /// If provided, only upload these specific activations (park_ref + date pairs)
+    /// Format: ["US-0001:20240101", "US-0002:20240102"]
+    pub activations: Option<Vec<String>>,
+}
+
+/// Response for POTA upload
+#[derive(Debug, Serialize)]
+pub struct PotaUploadResponse {
+    pub success: bool,
+    pub message: String,
+    pub activations_uploaded: usize,
+    pub qsos_uploaded: usize,
+    pub errors: Vec<String>,
+}
+
+/// Preview POTA activations (dry run)
+async fn pota_preview(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    if get_current_user(&jar, &state).is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(PotaPreviewResponse {
+                success: false,
+                valid_activations: vec![],
+                invalid_activations: vec![],
+                total_qsos: 0,
+                skipped_qsos: 0,
+                message: Some("Unauthorized".into()),
+            }),
+        );
+    }
+
+    // Get all QSOs
+    let db = match Database::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaPreviewResponse {
+                    success: false,
+                    valid_activations: vec![],
+                    invalid_activations: vec![],
+                    total_qsos: 0,
+                    skipped_qsos: 0,
+                    message: Some(format!("Database error: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let qsos = match db.get_all_qsos() {
+        Ok(q) => q,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaPreviewResponse {
+                    success: false,
+                    valid_activations: vec![],
+                    invalid_activations: vec![],
+                    total_qsos: 0,
+                    skipped_qsos: 0,
+                    message: Some(format!("Failed to get QSOs: {}", e)),
+                }),
+            );
+        }
+    };
+
+    // Generate preview
+    let preview = crate::pota::preview_upload(&qsos);
+
+    let valid_activations: Vec<PotaActivationInfo> = preview
+        .valid_activations
+        .iter()
+        .map(|a| PotaActivationInfo {
+            park_ref: a.park_ref.clone(),
+            date: a.date.clone(),
+            qso_count: a.qsos.len(),
+            is_valid: true,
+            qsos: a
+                .qsos
+                .iter()
+                .map(|q| PotaQsoInfo {
+                    call: q.call.clone(),
+                    time: q.time_on.clone(),
+                    band: q.band.clone(),
+                    mode: q.mode.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let invalid_activations: Vec<PotaActivationInfo> = preview
+        .invalid_activations
+        .iter()
+        .map(|a| PotaActivationInfo {
+            park_ref: a.park_ref.clone(),
+            date: a.date.clone(),
+            qso_count: a.qsos.len(),
+            is_valid: false,
+            qsos: a
+                .qsos
+                .iter()
+                .map(|q| PotaQsoInfo {
+                    call: q.call.clone(),
+                    time: q.time_on.clone(),
+                    band: q.band.clone(),
+                    mode: q.mode.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(PotaPreviewResponse {
+            success: true,
+            valid_activations,
+            invalid_activations,
+            total_qsos: preview.total_qsos,
+            skipped_qsos: preview.skipped_qsos,
+            message: None,
+        }),
+    )
+}
+
+/// Upload POTA activations
+async fn pota_upload(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(req): Json<PotaUploadRequest>,
+) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(PotaUploadResponse {
+                    success: false,
+                    message: "Unauthorized".into(),
+                    activations_uploaded: 0,
+                    qsos_uploaded: 0,
+                    errors: vec![],
+                }),
+            );
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaUploadResponse {
+                    success: false,
+                    message: "Internal error".into(),
+                    activations_uploaded: 0,
+                    qsos_uploaded: 0,
+                    errors: vec![],
+                }),
+            );
+        }
+    };
+
+    // Get POTA integration config
+    let integration = match integrations::get_integration(
+        &conn,
+        &state.master_key,
+        user.id,
+        &user_salt,
+        "pota",
+    ) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(PotaUploadResponse {
+                    success: false,
+                    message: "POTA integration not configured".into(),
+                    activations_uploaded: 0,
+                    qsos_uploaded: 0,
+                    errors: vec![],
+                }),
+            );
+        }
+        Err(e) => {
+            tracing::error!("Failed to get POTA integration: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaUploadResponse {
+                    success: false,
+                    message: "Failed to get integration config".into(),
+                    activations_uploaded: 0,
+                    qsos_uploaded: 0,
+                    errors: vec![],
+                }),
+            );
+        }
+    };
+
+    let pota_config = match integration.config {
+        integrations::IntegrationConfig::Pota(c) => c,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaUploadResponse {
+                    success: false,
+                    message: "Invalid integration type".into(),
+                    activations_uploaded: 0,
+                    qsos_uploaded: 0,
+                    errors: vec![],
+                }),
+            );
+        }
+    };
+
+    // Get all QSOs
+    let db = match Database::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let _ = integrations::record_sync_error(&conn, user.id, "pota", "upload", &err_msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaUploadResponse {
+                    success: false,
+                    message: format!("Database error: {}", err_msg),
+                    activations_uploaded: 0,
+                    qsos_uploaded: 0,
+                    errors: vec![],
+                }),
+            );
+        }
+    };
+
+    let qsos = match db.get_all_qsos() {
+        Ok(q) => q,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let _ = integrations::record_sync_error(&conn, user.id, "pota", "upload", &err_msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaUploadResponse {
+                    success: false,
+                    message: format!("Failed to get QSOs: {}", err_msg),
+                    activations_uploaded: 0,
+                    qsos_uploaded: 0,
+                    errors: vec![],
+                }),
+            );
+        }
+    };
+
+    // Group into activations
+    let (all_activations, _skipped) = crate::pota::group_pota_activations(&qsos);
+
+    // Filter to valid activations and optionally filter by requested activation keys
+    let activations_to_upload: Vec<_> = all_activations
+        .into_iter()
+        .filter(|a| a.is_valid_activation())
+        .filter(|a| {
+            if let Some(ref requested) = req.activations {
+                let key = format!("{}:{}", a.park_ref, a.date);
+                requested.contains(&key)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if activations_to_upload.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(PotaUploadResponse {
+                success: true,
+                message: "No valid activations to upload".into(),
+                activations_uploaded: 0,
+                qsos_uploaded: 0,
+                errors: vec![],
+            }),
+        );
+    }
+
+    // Upload to POTA
+    let result = match crate::pota::upload_to_pota(
+        &pota_config.email,
+        &pota_config.password,
+        &activations_to_upload,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let _ = integrations::record_sync_error(&conn, user.id, "pota", "upload", &err_msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaUploadResponse {
+                    success: false,
+                    message: format!("Upload failed: {}", err_msg),
+                    activations_uploaded: 0,
+                    qsos_uploaded: 0,
+                    errors: vec![err_msg],
+                }),
+            );
+        }
+    };
+
+    // Record sync result
+    if result.errors.is_empty() {
+        let _ = integrations::record_sync_success(
+            &conn,
+            user.id,
+            "pota",
+            "upload",
+            result.qsos_uploaded as i64,
+            Some(&format!(
+                "Uploaded {} activations",
+                result.activations_uploaded
+            )),
+        );
+    } else {
+        let _ = integrations::record_sync_error(
+            &conn,
+            user.id,
+            "pota",
+            "upload",
+            &result.errors.join("; "),
+        );
+    }
+
+    let message = format!(
+        "Uploaded {} activations ({} QSOs){}",
+        result.activations_uploaded,
+        result.qsos_uploaded,
+        if result.errors.is_empty() {
+            String::new()
+        } else {
+            format!(" with {} errors", result.errors.len())
+        }
+    );
+
+    (
+        StatusCode::OK,
+        Json(PotaUploadResponse {
+            success: result.errors.is_empty(),
+            message,
+            activations_uploaded: result.activations_uploaded,
+            qsos_uploaded: result.qsos_uploaded,
+            errors: result.errors,
+        }),
+    )
+}
+
 // === User profile handlers ===
 
 async fn update_profile(
@@ -2310,6 +2697,9 @@ pub async fn build_router(
         .route("/sync/lofi", post(sync_lofi))
         .route("/sync/qrz/upload", post(sync_qrz_upload))
         .route("/sync/qrz/download", post(sync_qrz_download))
+        // POTA endpoints
+        .route("/sync/pota/preview", get(pota_preview))
+        .route("/sync/pota/upload", post(pota_upload))
         // Log upload
         .route("/logs/upload", post(upload_log));
 

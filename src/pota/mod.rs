@@ -1,16 +1,18 @@
-//! POTA (Parks on the Air) ADIF export functionality.
+//! POTA (Parks on the Air) ADIF export and upload functionality.
 //!
 //! Groups QSOs by UTC date and park reference, generating separate
 //! ADIF files suitable for upload to pota.app.
 
 use chrono::NaiveDate;
+use pota_adif_upload::PotaClient;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use tracing::info;
 
-use crate::Result;
-use crate::adif::Qso;
+use crate::adif::{Qso, write_adif};
+use crate::{Error, Result};
 
 /// Key for grouping QSOs: (UTC Date, Park Reference)
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -416,4 +418,307 @@ mod tests {
         assert_eq!(format_field("CALL", "W1AW"), "<CALL:4>W1AW");
         assert_eq!(format_field("qso_date", "20241201"), "<QSO_DATE:8>20241201");
     }
+
+    #[test]
+    fn test_valid_park_ref() {
+        assert!(is_valid_park_ref("US-0001"));
+        assert!(is_valid_park_ref("VE-1234"));
+        assert!(is_valid_park_ref("JA-0001"));
+        assert!(is_valid_park_ref("JAFF-0001")); // 4-letter entities
+        assert!(!is_valid_park_ref("US0001")); // No hyphen
+        assert!(!is_valid_park_ref("US-001")); // Only 3 digits
+        assert!(!is_valid_park_ref("US-00001")); // 5 digits
+        assert!(!is_valid_park_ref("1S-0001")); // Number in entity
+        assert!(!is_valid_park_ref("us-0001")); // Lowercase entity
+    }
+
+    #[test]
+    fn test_group_activations() {
+        let qsos = vec![
+            // First activation: US-0001 on day 1
+            make_pota_qso("W1ABC", "20240101", "US-0001"),
+            make_pota_qso("W2DEF", "20240101", "US-0001"),
+            // Second activation: US-0002 on day 1
+            make_pota_qso("W3GHI", "20240101", "US-0002"),
+            // Third activation: US-0001 on day 2
+            make_pota_qso("W4JKL", "20240102", "US-0001"),
+        ];
+
+        let (activations, skipped) = group_pota_activations(&qsos);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(activations.len(), 3);
+    }
+
+    #[test]
+    fn test_preview_upload() {
+        // Create 12 QSOs for a valid activation
+        let mut qsos: Vec<Qso> = (1..=12)
+            .map(|i| {
+                let mut qso = make_pota_qso(&format!("W{}ABC", i), "20240101", "US-0001");
+                qso.time_on = format!("12{:02}00", i);
+                qso
+            })
+            .collect();
+
+        // Add 5 QSOs for an invalid activation
+        for i in 1..=5 {
+            let mut qso = make_pota_qso(&format!("W{}DEF", i), "20240101", "US-0002");
+            qso.time_on = format!("14{:02}00", i);
+            qsos.push(qso);
+        }
+
+        let preview = preview_upload(&qsos);
+
+        assert_eq!(preview.valid_activations.len(), 1);
+        assert_eq!(preview.invalid_activations.len(), 1);
+        assert_eq!(preview.total_qsos, 12);
+        assert_eq!(preview.skipped_qsos, 0);
+    }
+}
+
+// =============================================================================
+// POTA Upload functionality
+// =============================================================================
+
+/// Represents a single POTA activation (grouped by park + UTC date)
+#[derive(Debug, Clone, Serialize)]
+pub struct PotaActivation {
+    /// Park reference (e.g., "US-0001")
+    pub park_ref: String,
+    /// UTC date in YYYYMMDD format
+    pub date: String,
+    /// QSOs in this activation
+    pub qsos: Vec<Qso>,
+}
+
+impl PotaActivation {
+    /// Check if this is a valid activation (10+ QSOs)
+    pub fn is_valid_activation(&self) -> bool {
+        self.qsos.len() >= 10
+    }
+
+    /// Get a summary of this activation
+    pub fn summary(&self) -> String {
+        format!(
+            "{} on {} ({} QSOs{})",
+            self.park_ref,
+            format_date(&self.date),
+            self.qsos.len(),
+            if self.is_valid_activation() {
+                ""
+            } else {
+                " - NOT A VALID ACTIVATION"
+            }
+        )
+    }
+}
+
+/// Format YYYYMMDD date to YYYY-MM-DD
+fn format_date(date: &str) -> String {
+    if date.len() == 8 {
+        format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8])
+    } else {
+        date.to_string()
+    }
+}
+
+/// Result of a POTA upload preview (dry run)
+#[derive(Debug, Clone, Serialize)]
+pub struct PotaUploadPreview {
+    /// Valid activations (10+ QSOs)
+    pub valid_activations: Vec<PotaActivation>,
+    /// Invalid activations (less than 10 QSOs)
+    pub invalid_activations: Vec<PotaActivation>,
+    /// Total QSOs that would be uploaded
+    pub total_qsos: usize,
+    /// QSOs that were skipped (no POTA ref, invalid data, etc.)
+    pub skipped_qsos: usize,
+}
+
+/// Result of an actual POTA upload
+#[derive(Debug, Clone, Serialize)]
+pub struct PotaUploadResult {
+    /// Number of activations uploaded
+    pub activations_uploaded: usize,
+    /// Total QSOs uploaded
+    pub qsos_uploaded: usize,
+    /// Any errors encountered
+    pub errors: Vec<String>,
+}
+
+/// Group QSOs into POTA activations by park reference and UTC date
+pub fn group_pota_activations(qsos: &[Qso]) -> (Vec<PotaActivation>, usize) {
+    // Group by (park_ref, date)
+    let mut groups: HashMap<(String, String), Vec<Qso>> = HashMap::new();
+    let mut skipped = 0;
+
+    for qso in qsos {
+        // Check if this is a POTA QSO with a valid park reference
+        if !qso.is_pota() {
+            skipped += 1;
+            continue;
+        }
+
+        let park_ref = match qso.get_pota_ref() {
+            Some(r) => r.to_uppercase(),
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // Validate park reference format (XX-NNNN or similar)
+        if !is_valid_park_ref(&park_ref) {
+            tracing::debug!(park_ref = %park_ref, "Skipping QSO with invalid park reference");
+            skipped += 1;
+            continue;
+        }
+
+        let key = (park_ref, qso.qso_date.clone());
+        groups.entry(key).or_default().push(qso.clone());
+    }
+
+    // Convert to activations
+    let mut activations: Vec<PotaActivation> = groups
+        .into_iter()
+        .map(|((park_ref, date), qsos)| PotaActivation {
+            park_ref,
+            date,
+            qsos,
+        })
+        .collect();
+
+    // Sort by date (newest first), then by park reference
+    activations.sort_by(|a, b| {
+        b.date
+            .cmp(&a.date)
+            .then_with(|| a.park_ref.cmp(&b.park_ref))
+    });
+
+    (activations, skipped)
+}
+
+/// Validate a POTA park reference format
+/// Valid formats: XX-NNNN, XXX-NNNN (e.g., US-0001, VE-0123, JA-1234)
+fn is_valid_park_ref(park_ref: &str) -> bool {
+    let parts: Vec<&str> = park_ref.split('-').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+
+    let entity = parts[0];
+    let number = parts[1];
+
+    // Entity should be 1-4 uppercase letters
+    if entity.is_empty() || entity.len() > 4 || !entity.chars().all(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+
+    // Number should be 4 digits
+    if number.len() != 4 || !number.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    true
+}
+
+/// Generate a preview of what would be uploaded to POTA
+pub fn preview_upload(qsos: &[Qso]) -> PotaUploadPreview {
+    let (activations, skipped_qsos) = group_pota_activations(qsos);
+
+    let (valid, invalid): (Vec<_>, Vec<_>) = activations
+        .into_iter()
+        .partition(|a| a.is_valid_activation());
+
+    let total_qsos = valid.iter().map(|a| a.qsos.len()).sum();
+
+    PotaUploadPreview {
+        valid_activations: valid,
+        invalid_activations: invalid,
+        total_qsos,
+        skipped_qsos,
+    }
+}
+
+/// Upload POTA activations to POTA.app
+pub async fn upload_to_pota(
+    email: &str,
+    password: &str,
+    activations: &[PotaActivation],
+) -> Result<PotaUploadResult> {
+    if activations.is_empty() {
+        return Ok(PotaUploadResult {
+            activations_uploaded: 0,
+            qsos_uploaded: 0,
+            errors: vec![],
+        });
+    }
+
+    // Authenticate with POTA
+    info!("Authenticating with POTA.app...");
+    let client = PotaClient::authenticate(email, password)
+        .await
+        .map_err(|e| Error::Other(format!("POTA authentication failed: {}", e)))?;
+
+    let mut activations_uploaded = 0;
+    let mut qsos_uploaded = 0;
+    let mut errors = Vec::new();
+
+    for activation in activations {
+        if !activation.is_valid_activation() {
+            errors.push(format!(
+                "Skipped {} on {}: only {} QSOs (need 10+)",
+                activation.park_ref,
+                format_date(&activation.date),
+                activation.qsos.len()
+            ));
+            continue;
+        }
+
+        // Generate ADIF for this activation
+        let adif_content = write_adif(None, &activation.qsos);
+        let filename = format!(
+            "{}_{}.adi",
+            activation.park_ref.replace('-', "_"),
+            activation.date
+        );
+
+        info!(
+            park = %activation.park_ref,
+            date = %activation.date,
+            qsos = activation.qsos.len(),
+            "Uploading activation to POTA"
+        );
+
+        match client
+            .upload_adif(&filename, adif_content.into_bytes())
+            .await
+        {
+            Ok(()) => {
+                activations_uploaded += 1;
+                qsos_uploaded += activation.qsos.len();
+                info!(
+                    park = %activation.park_ref,
+                    date = %activation.date,
+                    "Activation uploaded successfully"
+                );
+            }
+            Err(e) => {
+                let error_msg = format!(
+                    "Failed to upload {} on {}: {}",
+                    activation.park_ref,
+                    format_date(&activation.date),
+                    e
+                );
+                errors.push(error_msg);
+            }
+        }
+    }
+
+    Ok(PotaUploadResult {
+        activations_uploaded,
+        qsos_uploaded,
+        errors,
+    })
 }
