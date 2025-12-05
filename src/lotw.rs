@@ -3,7 +3,7 @@
 //! Note: Uploading to LoTW requires TQSL (TrustedQSL) which must be installed separately.
 //! This module focuses on downloading confirmations via HTTPS.
 
-use crate::adif::{parse_adif, Qso};
+use crate::adif::{Qso, parse_adif};
 use crate::config::LotwConfig;
 use crate::{Error, Result};
 use reqwest::Client;

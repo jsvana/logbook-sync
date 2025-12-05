@@ -4,7 +4,7 @@ pub mod users;
 use crate::adif::Qso;
 use crate::{Error, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 

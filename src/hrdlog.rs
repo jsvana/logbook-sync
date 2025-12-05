@@ -4,7 +4,7 @@
 //! An upload code is required (different from your password), which can be
 //! obtained from your HRDLog.net account settings.
 
-use crate::adif::{write_adif, Qso};
+use crate::adif::{Qso, write_adif};
 use crate::config::HrdlogConfig;
 use crate::{Error, Result};
 use reqwest::Client;

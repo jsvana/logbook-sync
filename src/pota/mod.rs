@@ -9,8 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 use tracing::info;
 
-use crate::adif::Qso;
 use crate::Result;
+use crate::adif::Qso;
 
 /// Key for grouping QSOs: (UTC Date, Park Reference)
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]

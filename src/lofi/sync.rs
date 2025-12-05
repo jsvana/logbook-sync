@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::metrics;
 use crate::ntfy::NtfyClient;
 use std::time::Instant;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use super::client::LofiClient;

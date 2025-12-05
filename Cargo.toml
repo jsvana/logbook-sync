@@ -1,7 +1,7 @@
 [package]
 name = "logbook-sync"
-version = "0.1.0"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
 description = "ADIF log synchronization daemon for amateur radio"
 authors = ["jsvana"]
 license = "MIT"

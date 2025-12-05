@@ -1,8 +1,8 @@
 //! ntfy.sh notification client for sync events
 
+use crate::Result;
 use crate::config::NtfyConfig;
 use crate::sync::SyncStats;
-use crate::Result;
 use reqwest::Client;
 use tracing::{debug, error, info};
 

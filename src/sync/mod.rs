@@ -5,7 +5,7 @@ use crate::db::Database;
 use crate::lofi::{LofiClient, LofiSyncService};
 use crate::ntfy::NtfyClient;
 use crate::qrz::{QrzClient, UploadResult};
-use crate::watcher::{process_adif_file, FileWatcher, ProcessResult, WatchEvent};
+use crate::watcher::{FileWatcher, ProcessResult, WatchEvent, process_adif_file};
 use crate::{Config, Result};
 use std::path::Path;
 use std::sync::Arc;
@@ -149,13 +149,12 @@ impl SyncService {
 
     /// Send a notification about sync activity (if ntfy is configured)
     async fn notify_sync(&self, stats: &SyncStats) {
-        if let Some(ref client) = self.ntfy_client {
-            if let Err(e) = client
+        if let Some(ref client) = self.ntfy_client
+            && let Err(e) = client
                 .notify_sync(stats, &self.config.general.callsign)
                 .await
-            {
-                warn!(error = %e, "Failed to send ntfy notification");
-            }
+        {
+            warn!(error = %e, "Failed to send ntfy notification");
         }
     }
 
@@ -715,7 +714,7 @@ fn is_permanent_error(error: &str) -> bool {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to create SIGINT handler");
         let mut sigterm =

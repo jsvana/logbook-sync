@@ -2,7 +2,7 @@
 //!
 //! Note: Downloading confirmations requires an eQSL AG (Authenticity Guaranteed) membership.
 
-use crate::adif::{parse_adif, write_adif, Qso};
+use crate::adif::{Qso, parse_adif, write_adif};
 use crate::config::EqslConfig;
 use crate::{Error, Result};
 use reqwest::Client;

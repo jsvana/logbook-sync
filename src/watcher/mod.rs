@@ -1,8 +1,8 @@
 use crate::adif::parse_adif;
-use crate::db::{compute_file_checksum, Database};
+use crate::db::{Database, compute_file_checksum};
 use crate::{Config, Result};
 use notify::RecursiveMode;
-use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -154,17 +154,17 @@ pub fn process_adif_file(path: &Path, db: &Database) -> Result<ProcessResult> {
 
     // Check if file has changed since last processing
     let checksum = compute_file_checksum(path)?;
-    if let Some(old_checksum) = db.get_file_checksum(&path_str)? {
-        if old_checksum == checksum {
-            debug!(path = %path.display(), "File unchanged, skipping");
-            return Ok(ProcessResult {
-                path: path.to_path_buf(),
-                total_qsos: 0,
-                new_qsos: 0,
-                skipped_duplicate: 0,
-                errors: 0,
-            });
-        }
+    if let Some(old_checksum) = db.get_file_checksum(&path_str)?
+        && old_checksum == checksum
+    {
+        debug!(path = %path.display(), "File unchanged, skipping");
+        return Ok(ProcessResult {
+            path: path.to_path_buf(),
+            total_qsos: 0,
+            new_qsos: 0,
+            skipped_duplicate: 0,
+            errors: 0,
+        });
     }
 
     // Read and parse the file

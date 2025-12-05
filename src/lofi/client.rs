@@ -2,7 +2,7 @@
 
 use crate::config::LofiConfig;
 use crate::error::{Error, Result};
-use reqwest::{header, Client};
+use reqwest::{Client, header};
 use tracing::{debug, info, warn};
 
 use super::models::*;
@@ -85,7 +85,7 @@ impl LofiClient {
     pub fn generate_client_secret() -> String {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        let bytes: [u8; 32] = rng.gen();
+        let bytes: [u8; 32] = rng.r#gen();
         hex::encode(bytes)
     }
 

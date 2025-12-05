@@ -1,7 +1,7 @@
 mod parser;
 mod writer;
 
-pub use parser::{parse_adif, AdifHeader, AdifRecord};
+pub use parser::{AdifHeader, AdifRecord, parse_adif};
 pub use writer::write_adif;
 
 use serde::{Deserialize, Serialize};
@@ -86,10 +86,10 @@ impl Qso {
         }
 
         // Also check QSLMSG field for "POTA" pattern (e.g., "POTA US-0189")
-        if let Some(qslmsg) = self.other_fields.get("QSLMSG") {
-            if qslmsg.to_uppercase().contains("POTA") {
-                return true;
-            }
+        if let Some(qslmsg) = self.other_fields.get("QSLMSG")
+            && qslmsg.to_uppercase().contains("POTA")
+        {
+            return true;
         }
 
         false
@@ -98,10 +98,10 @@ impl Qso {
     /// Extract POTA park reference from this QSO
     pub fn get_pota_ref(&self) -> Option<&str> {
         // First check MY_SIG_INFO
-        if let Some(ref info) = self.my_sig_info {
-            if !info.is_empty() {
-                return Some(info.as_str());
-            }
+        if let Some(ref info) = self.my_sig_info
+            && !info.is_empty()
+        {
+            return Some(info.as_str());
         }
 
         // Fall back to extracting from QSLMSG (e.g., "POTA US-0189")

@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use logbook_sync::crypto::MasterKey;
-use logbook_sync::db::{users, Database};
+use logbook_sync::db::{Database, users};
 use logbook_sync::qrz::QrzClient;
 use logbook_sync::{Config, PotaExporter, SyncOptions, SyncService, WavelogClient};
 use std::path::PathBuf;
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing::{Level, error, info, warn};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(name = "logbook-sync")]
@@ -372,13 +372,13 @@ async fn run_status(config: Config) -> Result<()> {
     let mut new_qsos = 0;
 
     for file in &files {
-        if let Ok(content) = std::fs::read_to_string(file) {
-            if let Ok(parsed) = parse_adif(&content) {
-                total_file_qsos += parsed.qsos.len();
-                for qso in &parsed.qsos {
-                    if !db.qso_exists(qso).unwrap_or(true) {
-                        new_qsos += 1;
-                    }
+        if let Ok(content) = std::fs::read_to_string(file)
+            && let Ok(parsed) = parse_adif(&content)
+        {
+            total_file_qsos += parsed.qsos.len();
+            for qso in &parsed.qsos {
+                if !db.qso_exists(qso).unwrap_or(true) {
+                    new_qsos += 1;
                 }
             }
         }
@@ -447,68 +447,68 @@ async fn run_status(config: Config) -> Result<()> {
     }
 
     // Check Wavelog status if enabled
-    if let Some(ref wavelog_config) = config.wavelog {
-        if wavelog_config.enabled {
-            println!();
-            println!("Wavelog ({}):", wavelog_config.base_url);
-            match WavelogClient::new(wavelog_config.clone()) {
-                Ok(client) => {
-                    // Try to get station info
-                    match client.get_station_info().await {
-                        Ok(stations) => {
-                            println!("  Stations:     {}", stations.len());
-                            for station in &stations {
-                                println!(
-                                    "    - {} ({})",
-                                    station.station_callsign, station.station_profile_name
-                                );
+    if let Some(ref wavelog_config) = config.wavelog
+        && wavelog_config.enabled
+    {
+        println!();
+        println!("Wavelog ({}):", wavelog_config.base_url);
+        match WavelogClient::new(wavelog_config.clone()) {
+            Ok(client) => {
+                // Try to get station info
+                match client.get_station_info().await {
+                    Ok(stations) => {
+                        println!("  Stations:     {}", stations.len());
+                        for station in &stations {
+                            println!(
+                                "    - {} ({})",
+                                station.station_callsign, station.station_profile_name
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!("  Station info: Error - {}", e);
+                    }
+                }
+
+                // Try to get recent QSO count
+                if wavelog_config.logbook_slug.is_some() {
+                    match client.get_recent_qsos(50).await {
+                        Ok(response) => {
+                            println!("  Recent QSOs:  {} available", response.count);
+                            if response.count > 0 {
+                                // Check how many are new
+                                let qsos: Vec<_> = response
+                                    .qsos
+                                    .into_iter()
+                                    .map(|wl| {
+                                        let qso: logbook_sync::adif::Qso = wl.into();
+                                        qso
+                                    })
+                                    .collect();
+                                let mut new_count = 0;
+                                for qso in &qsos {
+                                    if !db.qso_exists(qso).unwrap_or(true) {
+                                        new_count += 1;
+                                    }
+                                }
+                                if new_count > 0 {
+                                    println!(
+                                        "  New QSOs:     {} (run 'download -s wavelog' to sync)",
+                                        new_count
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
-                            println!("  Station info: Error - {}", e);
+                            println!("  Recent QSOs:  Error - {}", e);
                         }
                     }
-
-                    // Try to get recent QSO count
-                    if wavelog_config.logbook_slug.is_some() {
-                        match client.get_recent_qsos(50).await {
-                            Ok(response) => {
-                                println!("  Recent QSOs:  {} available", response.count);
-                                if response.count > 0 {
-                                    // Check how many are new
-                                    let qsos: Vec<_> = response
-                                        .qsos
-                                        .into_iter()
-                                        .map(|wl| {
-                                            let qso: logbook_sync::adif::Qso = wl.into();
-                                            qso
-                                        })
-                                        .collect();
-                                    let mut new_count = 0;
-                                    for qso in &qsos {
-                                        if !db.qso_exists(qso).unwrap_or(true) {
-                                            new_count += 1;
-                                        }
-                                    }
-                                    if new_count > 0 {
-                                        println!(
-                                            "  New QSOs:     {} (run 'download -s wavelog' to sync)",
-                                            new_count
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("  Recent QSOs:  Error - {}", e);
-                            }
-                        }
-                    } else {
-                        println!("  Recent QSOs:  (logbook_slug not configured)");
-                    }
+                } else {
+                    println!("  Recent QSOs:  (logbook_slug not configured)");
                 }
-                Err(e) => {
-                    println!("  Error: {}", e);
-                }
+            }
+            Err(e) => {
+                println!("  Error: {}", e);
             }
         }
     }
@@ -843,8 +843,8 @@ async fn run_download_wavelog(config: Config) -> Result<()> {
 }
 
 async fn run_download_lotw(config: Config) -> Result<()> {
-    use logbook_sync::qso_source;
     use logbook_sync::LotwClient;
+    use logbook_sync::qso_source;
 
     let lotw_config = config
         .lotw
@@ -940,8 +940,8 @@ async fn run_download_lotw(config: Config) -> Result<()> {
 }
 
 async fn run_download_eqsl(config: Config) -> Result<()> {
-    use logbook_sync::qso_source;
     use logbook_sync::EqslClient;
+    use logbook_sync::qso_source;
 
     let eqsl_config = config
         .eqsl
@@ -1367,20 +1367,23 @@ async fn run_lofi_setup(config: &Config) -> Result<()> {
     println!("==========\n");
 
     // Check if already configured
-    if let Some(ref lofi) = config.lofi {
-        if lofi.client_key.is_some() && lofi.client_secret.is_some() {
-            println!("LoFi credentials already exist in config.");
-            println!("To generate new credentials, remove the existing client_key and client_secret first.\n");
+    if let Some(ref lofi) = config.lofi
+        && lofi.client_key.is_some()
+        && lofi.client_secret.is_some()
+    {
+        println!("LoFi credentials already exist in config.");
+        println!(
+            "To generate new credentials, remove the existing client_key and client_secret first.\n"
+        );
 
-            // Show existing (partial) credentials
-            if let Some(ref key) = lofi.client_key {
-                println!("  client_key: {}...", &key[..8.min(key.len())]);
-            }
-            if lofi.client_secret.is_some() {
-                println!("  client_secret: (configured)");
-            }
-            return Ok(());
+        // Show existing (partial) credentials
+        if let Some(ref key) = lofi.client_key {
+            println!("  client_key: {}...", &key[..8.min(key.len())]);
         }
+        if lofi.client_secret.is_some() {
+            println!("  client_secret: (configured)");
+        }
+        return Ok(());
     }
 
     // Generate new credentials
@@ -1555,8 +1558,8 @@ async fn run_lofi_status(config: &Config) -> Result<()> {
 
 /// Run one-time LoFi sync
 async fn run_lofi_sync(config: &Config) -> Result<()> {
-    use logbook_sync::lofi::{LofiClient, LofiSyncService};
     use logbook_sync::NtfyClient;
+    use logbook_sync::lofi::{LofiClient, LofiSyncService};
 
     println!("LoFi Sync");
     println!("=========\n");

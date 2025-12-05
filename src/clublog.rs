@@ -3,7 +3,7 @@
 //! ClubLog supports both real-time uploads (single QSOs) and batch uploads (ADIF files).
 //! An API key is required, which can be obtained by emailing ClubLog support.
 
-use crate::adif::{write_adif, Qso};
+use crate::adif::{Qso, write_adif};
 use crate::config::ClublogConfig;
 use crate::{Error, Result};
 use reqwest::Client;

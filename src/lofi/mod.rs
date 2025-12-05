@@ -9,4 +9,4 @@ mod sync;
 
 pub use client::LofiClient;
 pub use models::*;
-pub use sync::{run_lofi_sync_loop, LofiSyncService};
+pub use sync::{LofiSyncService, run_lofi_sync_loop};

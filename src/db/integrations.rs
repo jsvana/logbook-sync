@@ -2,11 +2,11 @@
 //!
 //! Stores encrypted user integration configs for QRZ, LoFi, LotW, etc.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{CryptoError, MasterKey, UserCrypto};
 use crate::Result;
+use crate::crypto::{CryptoError, MasterKey, UserCrypto};
 
 /// QRZ.com integration configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

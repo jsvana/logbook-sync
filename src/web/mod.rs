@@ -3,11 +3,11 @@
 //! Provides a browser-based UI for user configuration and management.
 
 use axum::{
+    Json, Router,
     extract::{Multipart, Path, State},
-    http::{header::SET_COOKIE, StatusCode},
+    http::{StatusCode, header::SET_COOKIE},
     response::{Html, IntoResponse},
     routing::{get, post, put},
-    Json, Router,
 };
 use axum_extra::extract::CookieJar;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ use tokio::io::AsyncWriteExt;
 use tower_http::services::ServeDir;
 
 use crate::crypto::MasterKey;
-use crate::db::{integrations, users, Database};
+use crate::db::{Database, integrations, users};
 use rusqlite::Connection;
 
 const SESSION_COOKIE_NAME: &str = "logbook_session";
@@ -133,7 +133,7 @@ pub struct LofiSendLinkRequest {
 
 /// Create a simple signed session token: user_id:timestamp:signature
 fn create_session_token(user_id: i64, master_key: &MasterKey) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
@@ -153,7 +153,7 @@ fn create_session_token(user_id: i64, master_key: &MasterKey) -> String {
 
 /// Validate session token and return user_id if valid (within 7 days)
 fn validate_session_token(token: &str, master_key: &MasterKey) -> Option<i64> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
@@ -398,7 +398,7 @@ async fn get_stats(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
                     qsl_confirmed: 0,
                     processed_files: 0,
                 }),
-            )
+            );
         }
     };
 
@@ -435,7 +435,7 @@ async fn list_users(State(state): State<AppState>) -> impl IntoResponse {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(Vec::<UserInfo>::new()),
-            )
+            );
         }
     };
 
@@ -477,7 +477,7 @@ async fn list_integrations(State(state): State<AppState>, jar: CookieJar) -> imp
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(Vec::<IntegrationInfo>::new()),
-            )
+            );
         }
     };
 
@@ -517,7 +517,7 @@ async fn save_integration(
                     success: false,
                     message: Some("Unauthorized".into()),
                 }),
-            )
+            );
         }
     };
 
@@ -530,7 +530,7 @@ async fn save_integration(
                     success: false,
                     message: Some("Failed to get user salt".into()),
                 }),
-            )
+            );
         }
     };
 
@@ -544,7 +544,7 @@ async fn save_integration(
                     success: false,
                     message: Some(format!("Invalid config: {}", e)),
                 }),
-            )
+            );
         }
     };
 
@@ -632,7 +632,7 @@ async fn delete_integration(
                     success: false,
                     message: Some("Unauthorized".into()),
                 }),
-            )
+            );
         }
     };
 
@@ -1234,7 +1234,7 @@ async fn update_profile(
                     success: false,
                     message: Some("Unauthorized".into()),
                 }),
-            )
+            );
         }
     };
 
@@ -1275,7 +1275,7 @@ async fn update_theme(
                     success: false,
                     message: Some("Unauthorized".into()),
                 }),
-            )
+            );
         }
     };
 
@@ -1311,7 +1311,7 @@ async fn change_password(
                     success: false,
                     message: Some("Unauthorized".into()),
                 }),
-            )
+            );
         }
     };
 
@@ -1371,7 +1371,7 @@ async fn upload_log(
                     success: false,
                     message: Some("Unauthorized".into()),
                 }),
-            )
+            );
         }
     };
 
@@ -1385,7 +1385,7 @@ async fn upload_log(
                     success: false,
                     message: Some("No file uploaded".into()),
                 }),
-            )
+            );
         }
         Err(e) => {
             return (
@@ -1394,7 +1394,7 @@ async fn upload_log(
                     success: false,
                     message: Some(format!("Failed to read upload: {}", e)),
                 }),
-            )
+            );
         }
     };
 
@@ -1424,7 +1424,7 @@ async fn upload_log(
                     success: false,
                     message: Some(format!("Failed to read file: {}", e)),
                 }),
-            )
+            );
         }
     };
 
@@ -1464,7 +1464,7 @@ async fn upload_log(
                     success: false,
                     message: Some(format!("Failed to create file: {}", e)),
                 }),
-            )
+            );
         }
     };
 

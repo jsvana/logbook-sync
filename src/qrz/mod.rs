@@ -2,7 +2,7 @@
 //!
 //! Handles communication with QRZ.com logbook API for uploading and downloading QSOs.
 
-use crate::adif::{parse_adif, Qso};
+use crate::adif::{Qso, parse_adif};
 use crate::{Error, Result};
 use reqwest::Client;
 use std::collections::HashMap;
