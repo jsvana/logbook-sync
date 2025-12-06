@@ -2,7 +2,7 @@ mod parser;
 mod writer;
 
 pub use parser::{AdifHeader, AdifRecord, parse_adif};
-pub use writer::write_adif;
+pub use writer::{write_adif, write_pota_adif};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

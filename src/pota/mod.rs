@@ -9,9 +9,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::adif::{Qso, write_adif};
+use crate::adif::{Qso, write_pota_adif};
 use crate::{Error, Result};
 
 /// Key for grouping QSOs: (UTC Date, Park Reference)
@@ -703,23 +703,37 @@ pub async fn upload_to_pota(
     let mut errors = Vec::new();
 
     for activation in activations {
-        if !activation.is_valid_activation() {
-            errors.push(format!(
-                "Skipped {} on {}: only {} QSOs (need 10+)",
-                activation.park_ref,
-                format_date(&activation.date),
-                activation.qsos.len()
-            ));
-            continue;
-        }
+        // Note: We upload all activations, including incomplete ones (<10 QSOs).
+        // Incomplete activations can still be submitted to POTA - they just won't
+        // count as a valid activation for the activator's credit.
 
-        // Generate ADIF for this activation
-        let adif_content = write_adif(None, &activation.qsos);
+        // Get the station callsign from the first QSO
+        let callsign = activation
+            .qsos
+            .first()
+            .and_then(|q| q.station_callsign.as_deref())
+            .unwrap_or("UNKNOWN");
+
+        // Generate ADIF for this activation with proper POTA header
+        let adif_content = write_pota_adif(
+            callsign,
+            &activation.park_ref,
+            &activation.date,
+            &activation.qsos,
+        );
         let filename = format!(
             "{}_{}.adi",
             activation.park_ref.replace('-', "_"),
             activation.date
         );
+
+        // Write ADIF to temp file for debugging
+        let debug_path = format!("/tmp/pota_upload_{}", filename);
+        if let Err(e) = std::fs::write(&debug_path, &adif_content) {
+            warn!(path = %debug_path, error = %e, "Failed to write debug ADIF file");
+        } else {
+            info!(path = %debug_path, "Wrote debug ADIF file");
+        }
 
         info!(
             park = %activation.park_ref,

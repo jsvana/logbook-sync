@@ -117,6 +117,10 @@
         }
         .badge.enabled { background: var(--badge-enabled-bg); color: var(--badge-enabled-text); }
         .badge.disabled { background: var(--badge-disabled-bg); color: var(--badge-disabled-text); }
+        .badge.under-construction { background: #fef3c7; color: #92400e; }
+        [data-theme="dark"] .badge.under-construction { background: #78350f; color: #fcd34d; }
+        .dropdown-item.under-construction { opacity: 0.6; cursor: not-allowed; }
+        .dropdown-item.under-construction:hover { background: inherit; }
         .sync-status {
             margin-top: 0.75rem;
             padding: 0.75rem;
@@ -565,13 +569,13 @@
         const INTEGRATION_TYPES = {
             qrz: { name: 'QRZ.com', desc: 'Sync logbook with QRZ.com' },
             lofi: { name: 'Ham2K LoFi', desc: 'Sync with LoFi Portable Logger' },
-            lotw: { name: 'LotW', desc: 'Logbook of The World' },
-            clublog: { name: 'Club Log', desc: 'Upload to Club Log' },
-            eqsl: { name: 'eQSL', desc: 'eQSL.cc electronic QSL' },
-            hrdlog: { name: 'HRDLog', desc: 'HRDLog.net logbook' },
-            wavelog: { name: 'Wavelog', desc: 'Self-hosted Wavelog instance' },
+            lotw: { name: 'LotW', desc: 'Logbook of The World', underConstruction: true },
+            clublog: { name: 'Club Log', desc: 'Upload to Club Log', underConstruction: true },
+            eqsl: { name: 'eQSL', desc: 'eQSL.cc electronic QSL', underConstruction: true },
+            hrdlog: { name: 'HRDLog', desc: 'HRDLog.net logbook', underConstruction: true },
+            wavelog: { name: 'Wavelog', desc: 'Self-hosted Wavelog instance', underConstruction: true },
             ntfy: { name: 'ntfy', desc: 'Push notifications via ntfy.sh' },
-            pota: { name: 'POTA.app', desc: 'Parks on the Air activation upload' },
+            pota: { name: 'POTA.app', desc: 'Parks on the Air activation upload', underConstruction: true },
         };
 
         // Integration field definitions (lofi has its own wizard)
@@ -793,9 +797,42 @@
             return `${Math.floor(secs / 3600)}h`;
         }
 
-        function renderSyncStatus(type, syncState, config, syncIntervalSecs) {
+        function renderSyncStatus(type, syncState, config, syncIntervalSecs, stats) {
             const caps = SYNC_CAPABILITIES[type] || {};
             const rows = [];
+
+            // Special case for LoFi - show synced counts
+            if (type === 'lofi') {
+                const dlState = syncState?.download;
+                const lastSync = dlState?.last_sync_at;
+                const result = dlState?.last_sync_result;
+                const resultClass = result === 'success' ? 'success' : (result === 'error' ? 'error' : '');
+                const nextSync = formatNextSyncTime(lastSync, syncIntervalSecs);
+                const intervalStr = formatIntervalSecs(syncIntervalSecs);
+
+                const operations = stats?.operations || 0;
+                const qsos = stats?.qsos || 0;
+                const potaOps = stats?.pota_operations || 0;
+
+                return `<div class="sync-status">
+                    <div class="sync-row">
+                        <div class="sync-direction">
+                            <span class="sync-direction-icon">&#8595;</span>
+                            <div class="sync-info">
+                                <span>Synced from Ham2K PoLo</span>
+                                <span class="sync-time">Last: ${formatSyncTime(lastSync)}${nextSync ? ` · Next: ${nextSync}` : ''}</span>
+                                <span class="sync-result ${resultClass}">${operations} operations · ${qsos} QSOs${potaOps > 0 ? ` · ${potaOps} POTA` : ''}</span>
+                            </div>
+                        </div>
+                        <div class="sync-actions">
+                            <button class="sync-btn" onclick="forceSync('lofi', 'download')" id="sync-lofi-download">
+                                Sync Now
+                            </button>
+                        </div>
+                    </div>
+                    <div class="sync-interval-info">Auto-sync every ${intervalStr}</div>
+                </div>`;
+            }
 
             // Special case for ntfy - show test button instead of sync status
             if (type === 'ntfy') {
@@ -931,7 +968,7 @@
                     const type = integration.integration_type;
                     const meta = INTEGRATION_TYPES[type] || { name: type.toUpperCase(), desc: '' };
                     const enabled = integration.enabled;
-                    const syncStatusHtml = enabled ? renderSyncStatus(type, integration.sync_state, integration.config, integration.sync_interval_secs) : '';
+                    const syncStatusHtml = enabled ? renderSyncStatus(type, integration.sync_state, integration.config, integration.sync_interval_secs, integration.stats) : '';
 
                     return `
                         <div class="integration-card configured">
@@ -955,10 +992,16 @@
             }
 
             // Render dropdown options for available integrations
-            if (availableTypes.length === 0) {
+            // Separate available types into ready and under-construction
+            const readyTypes = availableTypes.filter(t => !INTEGRATION_TYPES[t].underConstruction);
+            const constructionTypes = availableTypes.filter(t => INTEGRATION_TYPES[t].underConstruction);
+
+            if (readyTypes.length === 0 && constructionTypes.length === 0) {
                 dropdownOptions.innerHTML = '<div style="padding: 1rem; color: var(--text-dim); text-align: center;">All integrations configured</div>';
             } else {
-                dropdownOptions.innerHTML = availableTypes.map(type => {
+                let html = '';
+                // Ready integrations (clickable)
+                html += readyTypes.map(type => {
                     const meta = INTEGRATION_TYPES[type];
                     return `
                         <div class="dropdown-item" onclick="addIntegration('${type}')">
@@ -967,11 +1010,31 @@
                         </div>
                     `;
                 }).join('');
+                // Under construction integrations (not clickable)
+                if (constructionTypes.length > 0) {
+                    html += '<div style="padding: 0.5rem 1rem; color: var(--text-dim); font-size: 0.8rem; border-top: 1px solid var(--primary); margin-top: 0.5rem;">Coming Soon</div>';
+                    html += constructionTypes.map(type => {
+                        const meta = INTEGRATION_TYPES[type];
+                        return `
+                            <div class="dropdown-item under-construction">
+                                <strong>${meta.name}</strong> <span class="badge under-construction">Under Construction</span>
+                                <div class="desc">${meta.desc}</div>
+                            </div>
+                        `;
+                    }).join('');
+                }
+                dropdownOptions.innerHTML = html;
             }
         }
 
         function addIntegration(type) {
             document.getElementById('add-integration-menu').classList.add('hidden');
+            // Block under-construction integrations
+            const meta = INTEGRATION_TYPES[type];
+            if (meta && meta.underConstruction) {
+                alert(`${meta.name} is under construction and not yet available.`);
+                return;
+            }
             if (type === 'lofi') {
                 openLofiModal();
             } else {
@@ -1064,19 +1127,29 @@
             const invalidList = document.getElementById('pota-invalid-activations');
             const summary = document.getElementById('pota-summary');
 
+            const totalActivations = data.valid_activations.length + data.invalid_activations.length;
+
             // Summary
             summary.innerHTML = `
-                <strong>${data.valid_activations.length}</strong> valid activations
-                (<strong>${data.total_qsos}</strong> QSOs) ready to upload.
-                ${data.invalid_activations.length > 0 ? `<br><span class="text-muted">${data.invalid_activations.length} incomplete activations (need 10+ QSOs)</span>` : ''}
+                <strong>${totalActivations}</strong> activation${totalActivations !== 1 ? 's' : ''}
+                (<strong>${data.total_qsos}</strong> QSOs) found.
+                ${data.valid_activations.length > 0 ? `<br><span class="text-success">${data.valid_activations.length} complete (10+ QSOs)</span>` : ''}
+                ${data.invalid_activations.length > 0 ? `<br><span class="text-muted">${data.invalid_activations.length} incomplete (&lt;10 QSOs - can still upload)</span>` : ''}
                 ${data.skipped_qsos > 0 ? `<br><span class="text-muted">${data.skipped_qsos} non-POTA QSOs skipped</span>` : ''}
             `;
 
             // Valid activations
             const selectionControls = document.getElementById('pota-selection-controls');
-            if (data.valid_activations.length > 0) {
+            if (data.valid_activations.length > 0 || data.invalid_activations.length > 0) {
                 selectionControls.style.display = 'block';
-                validList.innerHTML = data.valid_activations.map(a => `
+            } else {
+                selectionControls.style.display = 'none';
+            }
+
+            if (data.valid_activations.length > 0) {
+                validList.innerHTML = `
+                    <div class="section-header">Complete Activations (10+ QSOs)</div>
+                    ${data.valid_activations.map(a => `
                     <div class="pota-activation valid">
                         <label>
                             <input type="checkbox" checked value="${a.park_ref}:${a.date}" class="pota-activation-checkbox" onchange="updatePotaUploadButton(); updatePotaToggleButton();">
@@ -1092,25 +1165,41 @@
                             </table>
                         </details>
                     </div>
-                `).join('');
+                `).join('')}`;
                 updatePotaToggleButton();
             } else {
-                selectionControls.style.display = 'none';
-                validList.innerHTML = '<div class="no-activations">No valid activations found (need 10+ QSOs with POTA park reference)</div>';
+                validList.innerHTML = '';
             }
 
-            // Invalid activations
+            // Incomplete activations (now with checkboxes!)
             if (data.invalid_activations.length > 0) {
                 invalidList.innerHTML = `
-                    <div class="invalid-header">Incomplete Activations (not uploaded)</div>
+                    <div class="section-header">Incomplete Activations (&lt;10 QSOs)</div>
                     ${data.invalid_activations.map(a => `
                         <div class="pota-activation invalid">
-                            <strong>${a.park_ref}</strong> on ${formatPotaDate(a.date)} - ${a.qso_count} QSOs (need ${10 - a.qso_count} more)
+                            <label>
+                                <input type="checkbox" value="${a.park_ref}:${a.date}" class="pota-activation-checkbox" onchange="updatePotaUploadButton(); updatePotaToggleButton();">
+                                <strong>${a.park_ref}</strong> on ${formatPotaDate(a.date)} - ${a.qso_count} QSOs <span class="text-muted">(need ${10 - a.qso_count} more for credit)</span>
+                            </label>
+                            <details>
+                                <summary>View QSOs</summary>
+                                <table class="pota-qso-table">
+                                    <thead><tr><th>Call</th><th>Time</th><th>Band</th><th>Mode</th></tr></thead>
+                                    <tbody>
+                                        ${a.qsos.map(q => `<tr><td>${q.call}</td><td>${formatPotaTime(q.time)}</td><td>${q.band}</td><td>${q.mode}</td></tr>`).join('')}
+                                    </tbody>
+                                </table>
+                            </details>
                         </div>
                     `).join('')}
                 `;
             } else {
                 invalidList.innerHTML = '';
+            }
+
+            // Show message if no activations at all
+            if (data.valid_activations.length === 0 && data.invalid_activations.length === 0) {
+                validList.innerHTML = '<div class="no-activations">No POTA activations found (QSOs need MY_SIG=POTA and MY_SIG_INFO with park reference)</div>';
             }
 
             // Update upload button state
@@ -1318,10 +1407,17 @@
                 return;
             }
 
+            const meta = INTEGRATION_TYPES[type] || { name: type.toUpperCase() };
+
+            // Block under-construction integrations
+            if (meta.underConstruction) {
+                alert(`${meta.name} is under construction and not yet available.`);
+                return;
+            }
+
             const modal = document.getElementById('integration-modal');
             const fields = document.getElementById('integration-fields');
             const existing = integrations.find(i => i.integration_type === type);
-            const meta = INTEGRATION_TYPES[type] || { name: type.toUpperCase() };
 
             document.getElementById('modal-title').textContent = `Configure ${meta.name}`;
 
@@ -1651,11 +1747,13 @@
                         <div class="stat-value">${stats.synced_qrz || 0}</div>
                         <div class="stat-label">Synced to QRZ</div>
                     </div>
-                    <div class="stat-item">
-                        <div class="stat-value">${stats.lotw_confirmed || 0}</div>
-                        <div class="stat-label">LotW Confirmed</div>
+                    <div class="stat-item" style="opacity: 0.6;">
+                        <div class="stat-value">--</div>
+                        <div class="stat-label">LotW Confirmed <span class="badge under-construction" style="font-size: 0.6rem;">Coming Soon</span></div>
                     </div>
                 `;
+                // Also load recent QSOs
+                await loadRecentQsos();
             } catch (err) {
                 console.error('Failed to load QSO stats:', err);
                 document.getElementById('qso-stats').innerHTML = `
@@ -1666,6 +1764,39 @@
             } finally {
                 loadingEl.classList.add('hidden');
                 contentEl.classList.remove('hidden');
+            }
+        }
+
+        async function loadRecentQsos() {
+            try {
+                const qsos = await api('/qsos/recent');
+                const tbody = document.querySelector('#qso-table tbody');
+                if (qsos.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-dim);">No QSOs found</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = qsos.map(q => {
+                    const date = q.qso_date.length === 8
+                        ? `${q.qso_date.slice(0,4)}-${q.qso_date.slice(4,6)}-${q.qso_date.slice(6,8)}`
+                        : q.qso_date;
+                    const time = q.time_on.length >= 4
+                        ? `${q.time_on.slice(0,2)}:${q.time_on.slice(2,4)}`
+                        : q.time_on;
+                    const syncStatus = q.qrz_synced
+                        ? '<span style="color: var(--badge-enabled-text);">Synced</span>'
+                        : '<span style="color: var(--text-dim);">Pending</span>';
+                    return `<tr>
+                        <td>${date} ${time}</td>
+                        <td><strong>${q.call}</strong></td>
+                        <td>${q.band}</td>
+                        <td>${q.mode}</td>
+                        <td>${syncStatus}</td>
+                    </tr>`;
+                }).join('');
+            } catch (err) {
+                console.error('Failed to load recent QSOs:', err);
+                const tbody = document.querySelector('#qso-table tbody');
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-dim);">Failed to load QSOs</td></tr>';
             }
         }
 

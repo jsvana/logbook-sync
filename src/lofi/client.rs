@@ -248,29 +248,37 @@ impl LofiClient {
     }
 
     /// Fetch operations with pagination
-    /// Pass synced_until_millis from previous response's meta to get next page
+    /// Pass synced_since_millis (unix epoch ms) to get changes since that time
+    /// Pass 0 to get all operations
+    /// Pass deleted to filter by deleted status (None = active only, Some(true) = deleted only, Some(false) = active only)
     /// Returns response with meta.operations.records_left indicating if more pages exist
     pub async fn fetch_operations(
         &self,
-        synced_until_millis: Option<f64>,
+        synced_since_millis: i64,
         limit: Option<u32>,
+        deleted: Option<bool>,
     ) -> Result<OperationsResponse> {
         let token = self.get_token()?;
 
         let mut url = format!("{}/v1/operations", LOFI_BASE_URL);
         let mut params = Vec::new();
 
-        if let Some(until) = synced_until_millis {
-            // Format as integer milliseconds
-            params.push(format!("synced_until_millis={:.0}", until));
-        }
+        // Use synced_since_millis to get changes since last sync
+        params.push(format!("synced_since_millis={}", synced_since_millis));
+        // Only get changes from other clients (not our own uploads)
+        params.push("other_clients_only=true".to_string());
+
         if let Some(lim) = limit {
             params.push(format!("limit={}", lim));
         }
 
-        if !params.is_empty() {
-            url = format!("{}?{}", url, params.join("&"));
+        // Filter by deleted status - API returns active by default
+        // Pass deleted=true to get deleted operations
+        if deleted == Some(true) {
+            params.push("deleted=true".to_string());
         }
+
+        url = format!("{}?{}", url, params.join("&"));
 
         debug!("Fetching operations from: {}", url);
 
@@ -285,8 +293,47 @@ impl LofiClient {
         self.handle_response(response).await
     }
 
-    /// Fetch QSOs with pagination
-    /// Pass synced_until_millis from previous response's meta to get next page
+    /// Fetch QSOs for a specific operation with pagination
+    /// Pass synced_since_millis (unix epoch ms) to get changes since that time
+    /// Pass 0 to get all QSOs for this operation
+    pub async fn fetch_operation_qsos(
+        &self,
+        operation_uuid: &str,
+        synced_since_millis: i64,
+        limit: Option<u32>,
+    ) -> Result<QsosResponse> {
+        let token = self.get_token()?;
+
+        let mut url = format!("{}/v1/operations/{}/qsos", LOFI_BASE_URL, operation_uuid);
+        let mut params = Vec::new();
+
+        // Use synced_since_millis to get changes since last sync
+        params.push(format!("synced_since_millis={}", synced_since_millis));
+        // Only get changes from other clients
+        params.push("other_clients_only=true".to_string());
+
+        if let Some(lim) = limit {
+            params.push(format!("limit={}", lim));
+        }
+
+        url = format!("{}?{}", url, params.join("&"));
+
+        debug!("Fetching QSOs from: {}", url);
+
+        let response = self
+            .client
+            .get(&url)
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(Error::Http)?;
+
+        self.handle_response(response).await
+    }
+
+    /// Fetch QSOs with pagination (deprecated - use fetch_operation_qsos instead)
+    /// This endpoint may not work correctly - QSOs should be fetched per-operation
+    #[deprecated(note = "Use fetch_operation_qsos instead")]
     pub async fn fetch_qsos(
         &self,
         synced_until_millis: Option<f64>,
@@ -347,9 +394,14 @@ impl LofiClient {
             )));
         }
 
-        response
-            .json()
+        let body = response
+            .text()
             .await
-            .map_err(|e| Error::Lofi(format!("Failed to parse LoFi response: {}", e)))
+            .map_err(|e| Error::Lofi(format!("Failed to read LoFi response body: {}", e)))?;
+
+        serde_json::from_str(&body).map_err(|e| {
+            warn!("Failed to parse LoFi response. Body: {}", body);
+            Error::Lofi(format!("Failed to parse LoFi response: {}", e))
+        })
     }
 }

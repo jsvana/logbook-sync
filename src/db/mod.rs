@@ -58,6 +58,7 @@ pub mod qso_source {
     pub const EQSL: &str = "eqsl";
     pub const CLUBLOG: &str = "clublog";
     pub const HRDLOG: &str = "hrdlog";
+    pub const LOFI: &str = "lofi";
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +397,10 @@ impl Database {
             [],
         )?;
 
+        // Deduplicate QSOs and normalize time_on to HHMMSS (migration v4)
+        // This removes duplicate QSOs that differ only in time precision (HHMM vs HHMMSS)
+        self.deduplicate_qsos()?;
+
         // Add theme column to users table (migration v3)
         let user_columns: Vec<String> = self
             .conn
@@ -713,6 +718,19 @@ impl Database {
         Ok(self.get_lofi_bearer_token()?.is_some())
     }
 
+    /// Get LoFi last sync timestamp (unix epoch milliseconds)
+    pub fn get_lofi_last_sync_millis(&self) -> Result<i64> {
+        Ok(self
+            .get_sync_state("lofi_last_sync_millis")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Set LoFi last sync timestamp (unix epoch milliseconds)
+    pub fn set_lofi_last_sync_millis(&self, millis: i64) -> Result<()> {
+        self.set_sync_state("lofi_last_sync_millis", &millis.to_string())
+    }
+
     /// Get QSOs by source (for filtering/querying)
     pub fn get_qsos_by_source(&self, source: &str) -> Result<Vec<Qso>> {
         let mut stmt = self.conn.prepare(
@@ -858,32 +876,133 @@ impl Database {
         Ok(qsos)
     }
 
+    /// Get recent QSOs with sync status info
+    pub fn get_recent_qsos(&self, limit: usize) -> Result<Vec<StoredQso>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, call, qso_date, time_on, band, mode, source_file, source_hash,
+                   qrz_logid, qrz_synced_at, lotw_qsl_rcvd, lotw_qsl_sent, qsl_rcvd, qsl_sent,
+                   pota_synced, created_at, updated_at, adif_record, source, source_id
+            FROM qsos
+            ORDER BY qso_date DESC, time_on DESC
+            LIMIT ?1
+            "#,
+        )?;
+
+        let qsos = stmt
+            .query_map([limit as i64], |row| {
+                Ok(StoredQso {
+                    id: row.get(0)?,
+                    call: row.get(1)?,
+                    qso_date: row.get(2)?,
+                    time_on: row.get(3)?,
+                    band: row.get(4)?,
+                    mode: row.get(5)?,
+                    source_file: row.get(6)?,
+                    source_hash: row.get(7)?,
+                    qrz_logid: row.get(8)?,
+                    qrz_synced_at: row.get(9)?,
+                    lotw_qsl_rcvd: row.get(10)?,
+                    lotw_qsl_sent: row.get(11)?,
+                    qsl_rcvd: row.get(12)?,
+                    qsl_sent: row.get(13)?,
+                    pota_synced: row.get::<_, i64>(14)? != 0,
+                    created_at: row.get(15)?,
+                    updated_at: row.get(16)?,
+                    adif_record: row.get(17)?,
+                    source: row.get(18)?,
+                    source_id: row.get(19)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(qsos)
+    }
+
     /// Get statistics for status display
     pub fn get_stats(&self) -> Result<DbStats> {
-        let total_qsos: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM qsos", [], |row| row.get(0))?;
+        // Count unique QSOs by dedup key (call + date + HHMM + band + mode)
+        // This prevents counting the same QSO from different sources as duplicates
+        let total_qsos: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT
+                    UPPER(call),
+                    qso_date,
+                    SUBSTR(time_on, 1, 4),
+                    LOWER(band),
+                    UPPER(mode)
+                FROM qsos
+            )
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
 
         let synced_qrz: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM qsos WHERE qrz_synced_at IS NOT NULL",
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT
+                    UPPER(call),
+                    qso_date,
+                    SUBSTR(time_on, 1, 4),
+                    LOWER(band),
+                    UPPER(mode)
+                FROM qsos
+                WHERE qrz_synced_at IS NOT NULL
+            )
+            "#,
             [],
             |row| row.get(0),
         )?;
 
         let pending_qrz: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM qsos WHERE qrz_synced_at IS NULL",
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT
+                    UPPER(call),
+                    qso_date,
+                    SUBSTR(time_on, 1, 4),
+                    LOWER(band),
+                    UPPER(mode)
+                FROM qsos
+                WHERE qrz_synced_at IS NULL
+            )
+            "#,
             [],
             |row| row.get(0),
         )?;
 
         let lotw_confirmed: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM qsos WHERE lotw_qsl_rcvd = 'Y'",
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT
+                    UPPER(call),
+                    qso_date,
+                    SUBSTR(time_on, 1, 4),
+                    LOWER(band),
+                    UPPER(mode)
+                FROM qsos
+                WHERE lotw_qsl_rcvd = 'Y'
+            )
+            "#,
             [],
             |row| row.get(0),
         )?;
 
         let qsl_confirmed: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM qsos WHERE qsl_rcvd = 'Y'",
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT
+                    UPPER(call),
+                    qso_date,
+                    SUBSTR(time_on, 1, 4),
+                    LOWER(band),
+                    UPPER(mode)
+                FROM qsos
+                WHERE qsl_rcvd = 'Y'
+            )
+            "#,
             [],
             |row| row.get(0),
         )?;
@@ -903,6 +1022,50 @@ impl Database {
     }
 
     // === Database Maintenance Methods ===
+
+    /// Deduplicate QSOs by normalizing time_on to HHMMSS and removing duplicates
+    /// Keeps the row with the most information (preferring qrz_synced, then most recent)
+    fn deduplicate_qsos(&self) -> Result<()> {
+        // First, normalize all time_on values to HHMMSS format
+        self.conn.execute(
+            r#"
+            UPDATE qsos
+            SET time_on = time_on || '00'
+            WHERE LENGTH(time_on) = 4
+            "#,
+            [],
+        )?;
+
+        // Find and remove duplicates, keeping the "best" row:
+        // - Prefer rows with qrz_synced_at (already synced to QRZ)
+        // - Then prefer rows with lotw_qsl_rcvd = 'Y' (LotW confirmed)
+        // - Then prefer the most recently updated row
+        let deleted = self.conn.execute(
+            r#"
+            DELETE FROM qsos WHERE id IN (
+                SELECT id FROM (
+                    SELECT
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY UPPER(call), qso_date, SUBSTR(time_on, 1, 4), LOWER(band), UPPER(mode)
+                            ORDER BY
+                                (CASE WHEN qrz_synced_at IS NOT NULL THEN 1 ELSE 0 END) DESC,
+                                (CASE WHEN lotw_qsl_rcvd = 'Y' THEN 1 ELSE 0 END) DESC,
+                                updated_at DESC
+                        ) as rn
+                    FROM qsos
+                ) WHERE rn > 1
+            )
+            "#,
+            [],
+        )?;
+
+        if deleted > 0 {
+            tracing::info!(deleted_count = deleted, "Deduplicated QSOs in database");
+        }
+
+        Ok(())
+    }
 
     /// Compact the database (VACUUM)
     pub fn vacuum(&self) -> Result<()> {
@@ -1067,9 +1230,64 @@ impl Database {
         Ok(is_new)
     }
 
+    /// Get all LoFi operations from the database
+    pub fn get_lofi_operations(&self) -> Result<Vec<crate::lofi::LofiOperation>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT raw_json FROM lofi_operations ORDER BY updated_at_millis DESC")?;
+
+        let operations = stmt
+            .query_map([], |row| {
+                let json: String = row.get(0)?;
+                Ok(json)
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect();
+
+        Ok(operations)
+    }
+
+    /// Get operation refs for a given operation UUID
+    pub fn get_lofi_operation_refs(
+        &self,
+        operation_uuid: &str,
+    ) -> Result<Vec<crate::lofi::OperationRef>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT ref_type, reference, program, name, location, label, short_label
+            FROM lofi_operation_refs
+            WHERE operation_uuid = ?1
+            "#,
+        )?;
+
+        let refs = stmt
+            .query_map(params![operation_uuid], |row| {
+                Ok(crate::lofi::OperationRef {
+                    ref_type: row.get(0)?,
+                    reference: row.get(1)?,
+                    program: row.get(2)?,
+                    name: row.get(3)?,
+                    location: row.get(4)?,
+                    label: row.get(5)?,
+                    short_label: row.get(6)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(refs)
+    }
+
     /// Insert or update a LoFi QSO
     /// Returns true if this is a new QSO (not previously seen)
-    pub fn upsert_lofi_qso(&self, qso: &crate::lofi::LofiQso) -> Result<bool> {
+    /// `account_override` can be used to provide the account UUID from the operation
+    /// when the QSO itself doesn't include it (per-operation endpoint)
+    pub fn upsert_lofi_qso(
+        &self,
+        qso: &crate::lofi::LofiQso,
+        account_override: Option<&str>,
+    ) -> Result<bool> {
         let existing: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM lofi_qsos WHERE lofi_uuid = ?1",
             params![&qso.uuid],
@@ -1078,6 +1296,13 @@ impl Database {
 
         let is_new = existing == 0;
         let raw_json = serde_json::to_string(qso).map_err(|e| Error::Other(e.to_string()))?;
+
+        // Use account from QSO if present, otherwise use override
+        let account = qso
+            .account
+            .as_deref()
+            .or(account_override)
+            .unwrap_or("unknown");
 
         self.conn.execute(
             r#"
@@ -1115,27 +1340,33 @@ impl Database {
             "#,
             params![
                 &qso.uuid,
-                &qso.account,
+                account,
                 &qso.operation,
                 qso.created_at_millis,
                 qso.updated_at_millis,
                 qso.synced_at_millis,
                 qso.start_at_millis,
-                &qso.their_call,
-                &qso.our_call,
+                qso.their_call(),
+                qso.our_call(),
                 &qso.band,
                 qso.freq,
                 &qso.mode,
-                &qso.rst_sent,
-                &qso.rst_rcvd,
-                &qso.our_grid,
-                &qso.their_grid,
-                &qso.their_name,
-                &qso.their_qth,
-                &qso.their_state,
-                &qso.their_country,
-                qso.their_cq_zone,
-                qso.their_itu_zone,
+                qso.rst_sent(),
+                qso.rst_rcvd(),
+                None::<String>, // our_grid - not in new API
+                qso.their_grid(),
+                qso.their_name(),
+                None::<String>, // their_qth - not in new API
+                qso.their_state(),
+                qso.their_country(),
+                qso.their
+                    .as_ref()
+                    .and_then(|t| t.guess.as_ref())
+                    .and_then(|g| g.cq_zone),
+                qso.their
+                    .as_ref()
+                    .and_then(|t| t.guess.as_ref())
+                    .and_then(|g| g.itu_zone),
                 &qso.tx_pwr,
                 &qso.notes,
                 qso.deleted,
@@ -1151,18 +1382,40 @@ impl Database {
         )?;
 
         for ref_item in &qso.refs {
-            self.conn.execute(
-                r#"
-                INSERT INTO lofi_qso_refs (qso_uuid, ref_type, reference, program)
-                VALUES (?1, ?2, ?3, ?4)
-                "#,
-                params![
-                    &qso.uuid,
-                    &ref_item.ref_type,
-                    &ref_item.reference,
-                    &ref_item.program,
-                ],
-            )?;
+            // Only insert refs that have both type and reference
+            if ref_item.ref_type.is_some() && ref_item.reference.is_some() {
+                self.conn.execute(
+                    r#"
+                    INSERT INTO lofi_qso_refs (qso_uuid, ref_type, reference, program)
+                    VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                    params![
+                        &qso.uuid,
+                        &ref_item.ref_type,
+                        &ref_item.reference,
+                        &ref_item.program,
+                    ],
+                )?;
+            }
+        }
+
+        // Also insert into the main qsos table for unified QSO handling
+        // Get operation refs to populate POTA fields
+        let operation_refs = if let Some(op_uuid) = &qso.operation {
+            self.get_lofi_operation_refs(op_uuid).unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        // Convert LoFi QSO to ADIF QSO and insert into main table
+        if let Some(adif_qso) = qso.to_qso(&operation_refs) {
+            // Use source="lofi" and source_id=uuid for tracking
+            let _ = self.upsert_qso_with_source(
+                &adif_qso,
+                None, // no source file
+                qso_source::LOFI,
+                Some(&qso.uuid),
+            );
         }
 
         Ok(is_new)

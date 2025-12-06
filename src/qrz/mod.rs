@@ -285,9 +285,9 @@ fn qso_to_adif_string(qso: &Qso) -> String {
     adif.push_str(&format_field("mode", &qso.mode));
 
     // Optional fields
-    if let Some(ref v) = qso.station_callsign {
-        adif.push_str(&format_field("station_callsign", v));
-    }
+    // Note: We intentionally skip STATION_CALLSIGN for QRZ uploads.
+    // QRZ rejects QSOs where station_callsign doesn't match the logbook callsign.
+    // By omitting it, QRZ uses the logbook owner's callsign by default.
     if let Some(ref v) = qso.freq {
         adif.push_str(&format_field("freq", v));
     }

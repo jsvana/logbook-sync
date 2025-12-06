@@ -376,53 +376,155 @@ async fn run_lofi_download(
         client.set_bearer_token(token.clone());
     }
 
+    let batch_size = config.sync_batch_size;
+
+    // Get last sync timestamp (0 means get all)
+    let initial_synced_since = {
+        let db = Database::open(db_path)?;
+        db.get_lofi_last_sync_millis()?
+    };
+
+    // Record sync start time to save after successful sync
+    let sync_start_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    debug!(
+        user_id = user_id,
+        synced_since_millis = initial_synced_since,
+        "Fetching LoFi operations since timestamp"
+    );
+
+    // First, sync operations with proper pagination
+    // Fetch both active and deleted operations (API filters by deleted status)
+    for include_deleted in [false, true] {
+        let mut ops_synced_since = initial_synced_since;
+        loop {
+            let response = match client
+                .fetch_operations(ops_synced_since, Some(batch_size), Some(include_deleted))
+                .await
+            {
+                Ok(r) => r,
+                Err(crate::Error::Lofi(msg)) if msg.contains("404") => {
+                    debug!(
+                        user_id = user_id,
+                        "LoFi returned 404 - device may need to be re-linked"
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+
+            let meta = &response.meta.operations;
+
+            // Save operations to database
+            {
+                let db = Database::open(db_path)?;
+                for op in &response.operations {
+                    if let Err(e) = db.upsert_lofi_operation(op) {
+                        warn!("Failed to save LoFi operation: {}", e);
+                    }
+                }
+            }
+
+            if meta.records_left == 0 {
+                break;
+            }
+
+            // Get next page cursor from metadata
+            if let Some(next_millis) = meta.next_updated_at_millis.or(meta.next_synced_at_millis) {
+                ops_synced_since = next_millis as i64;
+            } else {
+                warn!("LoFi API indicated more operations but no pagination cursor provided");
+                break;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    // Now get all operations from database and sync QSOs for each
+    let operations = {
+        let db = Database::open(db_path)?;
+        db.get_lofi_operations()?
+    };
+
     let mut total_qsos = 0i64;
-    let mut cursor: Option<f64> = None;
 
-    loop {
-        let response = match client.fetch_qsos(cursor, Some(50)).await {
-            Ok(r) => r,
-            Err(crate::Error::Lofi(msg)) if msg.contains("404") => {
-                // 404 means the device is no longer linked on the LoFi server
-                // This is not a fatal error - the user just needs to re-link
-                debug!(
-                    user_id = user_id,
-                    "LoFi returned 404 - device may need to be re-linked"
+    for op in operations {
+        if op.deleted != 0 {
+            continue;
+        }
+
+        // Fetch QSOs for this operation using the correct endpoint with proper pagination
+        let mut qsos_synced_since = initial_synced_since;
+        loop {
+            let response = match client
+                .fetch_operation_qsos(&op.uuid, qsos_synced_since, Some(batch_size))
+                .await
+            {
+                Ok(r) => r,
+                Err(crate::Error::Lofi(msg)) if msg.contains("404") => {
+                    debug!(
+                        user_id = user_id,
+                        operation = %op.uuid,
+                        "LoFi returned 404 for operation QSOs"
+                    );
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+
+            let meta = &response.meta.qsos;
+
+            // Save QSOs to database
+            {
+                let db = Database::open(db_path)?;
+                for qso in &response.qsos {
+                    if qso.deleted != 0 {
+                        continue;
+                    }
+
+                    if let Err(e) = db.upsert_lofi_qso(qso, Some(&op.account)) {
+                        warn!("Failed to save LoFi QSO: {}", e);
+                    } else {
+                        total_qsos += 1;
+                    }
+                }
+            }
+
+            if meta.records_left == 0 {
+                break;
+            }
+
+            // Get next page cursor from metadata
+            if let Some(next_millis) = meta.next_updated_at_millis.or(meta.next_synced_at_millis) {
+                qsos_synced_since = next_millis as i64;
+            } else {
+                warn!(
+                    operation = %op.uuid,
+                    "LoFi API indicated more QSOs but no pagination cursor provided"
                 );
-                return Ok(());
+                break;
             }
-            Err(e) => return Err(e),
-        };
 
-        // Save QSOs to database (open/close connection for each batch)
-        {
-            let db = Database::open(db_path)?;
-            for qso in &response.qsos {
-                if qso.deleted != 0 {
-                    continue;
-                }
-
-                if let Err(e) = db.upsert_lofi_qso(qso) {
-                    warn!("Failed to save LoFi QSO: {}", e);
-                } else {
-                    total_qsos += 1;
-                }
-            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
-        if response.meta.qsos.records_left == 0 {
-            break;
-        }
-
-        cursor = response.qsos.last().map(|q| q.updated_at_millis);
-
-        // Small delay between batches
+        // Small delay between operations
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
-    // Record sync result
+    // Record sync result and save sync timestamp
     {
         let db = Database::open(db_path)?;
+
+        // Save the sync timestamp for next time
+        if let Err(e) = db.set_lofi_last_sync_millis(sync_start_millis) {
+            warn!(error = %e, "Failed to save LoFi sync timestamp");
+        }
+
         let message = format!("Downloaded {} QSOs from LoFi", total_qsos);
         integrations::record_sync_success(
             db.conn(),

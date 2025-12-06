@@ -6,18 +6,53 @@ pub fn write_adif(header: Option<&AdifHeader>, qsos: &[Qso]) -> String {
 
     // Write header
     output.push_str("ADIF Export from LogbookSync\n");
+    output.push_str(&format_field("ADIF_VER", "3.1.4"));
     output.push_str(&format_field("PROGRAMID", "LogbookSync"));
     output.push_str(&format_field("PROGRAMVERSION", env!("CARGO_PKG_VERSION")));
 
     if let Some(h) = header {
         for (name, value) in &h.fields {
-            if name != "PROGRAMID" && name != "PROGRAMVERSION" {
+            if name != "PROGRAMID" && name != "PROGRAMVERSION" && name != "ADIF_VER" {
                 output.push_str(&format_field(name, value));
             }
         }
     }
 
     output.push_str("<EOH>\n\n");
+
+    // Write QSO records
+    for qso in qsos {
+        output.push_str(&write_qso(qso));
+        output.push('\n');
+    }
+
+    output
+}
+
+/// Write QSOs to ADIF format for POTA activation upload
+/// This includes a descriptive header matching the Ham2K format
+pub fn write_pota_adif(callsign: &str, park_ref: &str, date: &str, qsos: &[Qso]) -> String {
+    let mut output = String::new();
+
+    // Format date for display (YYYYMMDD -> YYYY-MM-DD)
+    let display_date = if date.len() == 8 {
+        format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8])
+    } else {
+        date.to_string()
+    };
+
+    // Write header matching Ham2K format (each field on its own line)
+    output.push_str(&format!(
+        "ADIF for {}: POTA {} on {}\n",
+        callsign, park_ref, display_date
+    ));
+    output.push_str(&format_field("ADIF_VER", "3.1.4"));
+    output.push('\n');
+    output.push_str(&format_field("PROGRAMID", "LogbookSync"));
+    output.push('\n');
+    output.push_str(&format_field("PROGRAMVERSION", env!("CARGO_PKG_VERSION")));
+    output.push('\n');
+    output.push_str("<EOH>\n");
 
     // Write QSO records
     for qso in qsos {

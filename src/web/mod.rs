@@ -79,6 +79,17 @@ pub struct StatsResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RecentQsoResponse {
+    pub call: String,
+    pub qso_date: String,
+    pub time_on: String,
+    pub band: String,
+    pub mode: String,
+    pub qrz_synced: bool,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct IntegrationInfo {
     pub integration_type: String,
     pub enabled: bool,
@@ -87,6 +98,9 @@ pub struct IntegrationInfo {
     pub sync_state: Option<IntegrationSyncState>,
     /// Sync interval in seconds (from server config)
     pub sync_interval_secs: u64,
+    /// Integration-specific stats (e.g., LoFi synced counts)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -467,6 +481,48 @@ async fn get_stats(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
     }
 }
 
+async fn get_recent_qsos(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    // Require authentication
+    if get_current_user(&jar, &state).is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(Vec::<RecentQsoResponse>::new()),
+        );
+    }
+
+    let db = match Database::open(&state.db_path) {
+        Ok(d) => d,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Vec::<RecentQsoResponse>::new()),
+            );
+        }
+    };
+
+    match db.get_recent_qsos(25) {
+        Ok(qsos) => {
+            let response: Vec<RecentQsoResponse> = qsos
+                .into_iter()
+                .map(|q| RecentQsoResponse {
+                    call: q.call,
+                    qso_date: q.qso_date,
+                    time_on: q.time_on,
+                    band: q.band,
+                    mode: q.mode,
+                    qrz_synced: q.qrz_synced_at.is_some(),
+                    source: q.source,
+                })
+                .collect();
+            (StatusCode::OK, Json(response))
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(Vec::<RecentQsoResponse>::new()),
+        ),
+    }
+}
+
 async fn list_users(State(state): State<AppState>) -> impl IntoResponse {
     let conn = match Connection::open(&state.db_path) {
         Ok(c) => c,
@@ -570,12 +626,30 @@ async fn list_integrations(State(state): State<AppState>, jar: CookieJar) -> imp
 
                     let sync_interval_secs = state.sync_config.interval_for(&i.integration_type);
 
+                    // Get integration-specific stats (e.g., LoFi synced counts)
+                    let stats = if i.integration_type == "lofi" {
+                        if let Ok(db) = Database::open(&state.db_path) {
+                            db.get_lofi_stats().ok().map(|s| {
+                                serde_json::json!({
+                                    "operations": s.operations,
+                                    "qsos": s.qsos,
+                                    "pota_operations": s.pota_operations
+                                })
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
                     IntegrationInfo {
                         integration_type: i.integration_type,
                         enabled: i.enabled,
                         config: serde_json::to_value(&i.config).unwrap_or(Value::Null),
                         sync_state,
                         sync_interval_secs,
+                        stats,
                     }
                 })
                 .collect();
@@ -1614,48 +1688,159 @@ async fn sync_lofi(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
         }
     };
 
-    // Fetch QSOs from LoFi
-    let mut total_qsos = 0i64;
-    let mut cursor: Option<f64> = None;
+    let batch_size = lofi_config.sync_batch_size;
 
-    loop {
-        let response = match client.fetch_qsos(cursor, Some(50)).await {
-            Ok(r) => r,
-            Err(e) => {
-                let err_msg = e.to_string();
-                let _ =
-                    integrations::record_sync_error(&conn, user.id, "lofi", "download", &err_msg);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(SyncResponse {
-                        success: false,
-                        message: format!("Failed to fetch from LoFi: {}", err_msg),
-                        items_synced: total_qsos,
-                    }),
-                );
+    // Get last sync timestamp (0 means get all)
+    let initial_synced_since = db.get_lofi_last_sync_millis().unwrap_or(0);
+
+    // Record sync start time to save after successful sync
+    let sync_start_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    tracing::debug!(
+        synced_since_millis = initial_synced_since,
+        "Fetching LoFi operations since timestamp"
+    );
+
+    // First, sync operations with proper pagination
+    // Fetch both active and deleted operations (API filters by deleted status)
+    for include_deleted in [false, true] {
+        let mut ops_synced_since = initial_synced_since;
+        loop {
+            let response = match client
+                .fetch_operations(ops_synced_since, Some(batch_size), Some(include_deleted))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    let _ = integrations::record_sync_error(
+                        &conn, user.id, "lofi", "download", &err_msg,
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(SyncResponse {
+                            success: false,
+                            message: format!("Failed to fetch operations from LoFi: {}", err_msg),
+                            items_synced: 0,
+                        }),
+                    );
+                }
+            };
+
+            let meta = &response.meta.operations;
+
+            tracing::info!(
+                "LoFi operations response: {} operations, {} total, {} left, deleted={}",
+                response.operations.len(),
+                meta.total_records,
+                meta.records_left,
+                include_deleted
+            );
+
+            for op in &response.operations {
+                if let Err(e) = db.upsert_lofi_operation(op) {
+                    tracing::warn!("Failed to save LoFi operation: {}", e);
+                }
             }
-        };
 
-        for qso in &response.qsos {
-            if qso.deleted != 0 {
-                continue;
+            if meta.records_left == 0 {
+                break;
             }
 
-            if let Err(e) = db.upsert_lofi_qso(qso) {
-                tracing::warn!("Failed to save LoFi QSO: {}", e);
+            // Get next page cursor from metadata
+            if let Some(next_millis) = meta.next_updated_at_millis.or(meta.next_synced_at_millis) {
+                ops_synced_since = next_millis as i64;
             } else {
-                total_qsos += 1;
+                tracing::warn!(
+                    "LoFi API indicated more operations but no pagination cursor provided"
+                );
+                break;
             }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    // Get all operations from database
+    let operations = match db.get_lofi_operations() {
+        Ok(ops) => ops,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let _ = integrations::record_sync_error(&conn, user.id, "lofi", "download", &err_msg);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SyncResponse {
+                    success: false,
+                    message: format!("Failed to get operations: {}", err_msg),
+                    items_synced: 0,
+                }),
+            );
+        }
+    };
+
+    // Fetch QSOs for each operation with proper pagination
+    let mut total_qsos = 0i64;
+
+    for op in operations {
+        if op.deleted != 0 {
+            continue;
         }
 
-        if response.meta.qsos.records_left == 0 {
-            break;
+        let mut qsos_synced_since = initial_synced_since;
+        loop {
+            let response = match client
+                .fetch_operation_qsos(&op.uuid, qsos_synced_since, Some(batch_size))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Failed to fetch QSOs for operation {}: {}", op.uuid, e);
+                    break;
+                }
+            };
+
+            let meta = &response.meta.qsos;
+
+            for qso in &response.qsos {
+                if qso.deleted != 0 {
+                    continue;
+                }
+
+                if let Err(e) = db.upsert_lofi_qso(qso, Some(&op.account)) {
+                    tracing::warn!("Failed to save LoFi QSO: {}", e);
+                } else {
+                    total_qsos += 1;
+                }
+            }
+
+            if meta.records_left == 0 {
+                break;
+            }
+
+            // Get next page cursor from metadata
+            if let Some(next_millis) = meta.next_updated_at_millis.or(meta.next_synced_at_millis) {
+                qsos_synced_since = next_millis as i64;
+            } else {
+                tracing::warn!(
+                    operation = %op.uuid,
+                    "LoFi API indicated more QSOs but no pagination cursor provided"
+                );
+                break;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
-        cursor = Some(response.meta.qsos.synced_until_millis);
-
-        // Small delay between requests
+        // Small delay between operations
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    // Save the sync timestamp for next time
+    if let Err(e) = db.set_lofi_last_sync_millis(sync_start_millis) {
+        tracing::warn!(error = %e, "Failed to save LoFi sync timestamp");
     }
 
     // Record success
@@ -2320,10 +2505,12 @@ async fn pota_upload(
     // Group into activations
     let (all_activations, _skipped) = crate::pota::group_pota_activations(&qsos);
 
-    // Filter to valid activations and optionally filter by requested activation keys
+    // Optionally filter by requested activation keys
+    // Note: We upload all activations, not just "valid" ones (10+ QSOs).
+    // Incomplete activations can still be uploaded - they just won't count as
+    // a valid activation for the activator's credit.
     let activations_to_upload: Vec<_> = all_activations
         .into_iter()
-        .filter(|a| a.is_valid_activation())
         .filter(|a| {
             if let Some(ref requested) = req.activations {
                 let key = format!("{}:{}", a.park_ref, a.date);
@@ -2339,7 +2526,7 @@ async fn pota_upload(
             StatusCode::OK,
             Json(PotaUploadResponse {
                 success: true,
-                message: "No valid activations to upload".into(),
+                message: "No activations to upload".into(),
                 activations_uploaded: 0,
                 qsos_uploaded: 0,
                 errors: vec![],
@@ -2838,6 +3025,7 @@ pub async fn build_router(
         .route("/health", get(health))
         .route("/stats", get(get_stats))
         .route("/qsos/stats", get(get_stats))
+        .route("/qsos/recent", get(get_recent_qsos))
         // Users
         .route("/users", get(list_users))
         .route("/users/me", put(update_profile))
