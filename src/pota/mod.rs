@@ -3,8 +3,15 @@
 //! Groups QSOs by UTC date and park reference, generating separate
 //! ADIF files suitable for upload to pota.app.
 
+pub mod browser;
+
+pub use browser::{
+    BrowserProgress, PotaCachedTokens, PotaRemoteActivation, PotaRemoteQso, PotaUploadJob,
+    PotaUploader, ProgressCallback, UploadResult, get_activation_qsos, get_activations,
+    get_all_activation_qsos,
+};
+
 use chrono::NaiveDate;
-use pota_adif_upload::PotaClient;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -575,9 +582,20 @@ pub fn group_pota_activations(qsos: &[Qso]) -> (Vec<PotaActivation>, usize) {
     let mut seen_keys: HashMap<(String, String), HashSet<String>> = HashMap::new();
     let mut skipped = 0;
 
+    // Special annotation callsigns from Ham2K PoLo that shouldn't be uploaded
+    const ANNOTATION_CALLS: &[&str] = &["SOLAR", "WEATHER", "NOTE"];
+
     for qso in qsos {
         // Check if this is a POTA QSO with a valid park reference
         if !qso.is_pota() {
+            skipped += 1;
+            continue;
+        }
+
+        // Skip Ham2K PoLo annotation records (SOLAR, WEATHER, NOTE)
+        let call_upper = qso.call.to_uppercase();
+        if ANNOTATION_CALLS.contains(&call_upper.as_str()) {
+            tracing::debug!(call = %qso.call, "Skipping Ham2K PoLo annotation record");
             skipped += 1;
             continue;
         }
@@ -678,11 +696,21 @@ pub fn preview_upload(qsos: &[Qso]) -> PotaUploadPreview {
     }
 }
 
-/// Upload POTA activations to POTA.app
+/// Upload POTA activations to POTA.app using headless browser authentication
 pub async fn upload_to_pota(
     email: &str,
     password: &str,
     activations: &[PotaActivation],
+) -> Result<PotaUploadResult> {
+    upload_to_pota_with_progress(email, password, activations, None).await
+}
+
+/// Upload POTA activations to POTA.app with progress reporting
+pub async fn upload_to_pota_with_progress(
+    email: &str,
+    password: &str,
+    activations: &[PotaActivation],
+    progress_callback: Option<ProgressCallback>,
 ) -> Result<PotaUploadResult> {
     if activations.is_empty() {
         return Ok(PotaUploadResult {
@@ -692,17 +720,38 @@ pub async fn upload_to_pota(
         });
     }
 
-    // Authenticate with POTA
-    info!("Authenticating with POTA.app...");
-    let client = PotaClient::authenticate(email, password)
-        .await
+    // Create the POTA uploader with browser-based authentication
+    // Cache tokens in the user's cache directory
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("logbook-sync");
+    fs::create_dir_all(&cache_dir).ok();
+    let cache_path = cache_dir.join("pota_tokens.json");
+
+    let mut uploader = PotaUploader::new(
+        email.to_string(),
+        password.to_string(),
+        cache_path,
+        true, // headless mode
+    );
+
+    // Set progress callback if provided
+    if let Some(cb) = progress_callback {
+        uploader.set_progress_callback(cb);
+    }
+
+    // Ensure we're authenticated before uploading
+    info!("Authenticating with POTA.app via browser...");
+    uploader
+        .ensure_authenticated()
         .map_err(|e| Error::Other(format!("POTA authentication failed: {}", e)))?;
 
     let mut activations_uploaded = 0;
     let mut qsos_uploaded = 0;
     let mut errors = Vec::new();
+    let total_activations = activations.len();
 
-    for activation in activations {
+    for (idx, activation) in activations.iter().enumerate() {
         // Note: We upload all activations, including incomplete ones (<10 QSOs).
         // Incomplete activations can still be submitted to POTA - they just won't
         // count as a valid activation for the activator's credit.
@@ -714,6 +763,21 @@ pub async fn upload_to_pota(
             .and_then(|q| q.station_callsign.as_deref())
             .unwrap_or("UNKNOWN");
 
+        // Get location from park reference prefix + my_state
+        // Park reference format: XX-NNNN (e.g., "US-4571")
+        // Location format: XX-SS (e.g., "US-CA")
+        let park_prefix = activation.park_ref.split('-').next().unwrap_or("US");
+        let my_state = activation
+            .qsos
+            .first()
+            .and_then(|q| q.my_state.as_deref())
+            .unwrap_or("");
+        let location = if !my_state.is_empty() {
+            format!("{}-{}", park_prefix, my_state)
+        } else {
+            park_prefix.to_string()
+        };
+
         // Generate ADIF for this activation with proper POTA header
         let adif_content = write_pota_adif(
             callsign,
@@ -721,11 +785,14 @@ pub async fn upload_to_pota(
             &activation.date,
             &activation.qsos,
         );
-        let filename = format!(
-            "{}_{}.adi",
-            activation.park_ref.replace('-', "_"),
-            activation.date
-        );
+        // Filename format: {callsign}@{park}-{YYMMDD}.adi (POTA convention)
+        // activation.date is YYYYMMDD, we need YYMMDD (last 6 chars)
+        let date_str = if activation.date.len() >= 6 {
+            &activation.date[activation.date.len() - 6..]
+        } else {
+            &activation.date
+        };
+        let filename = format!("{}@{}-{}.adi", callsign, activation.park_ref, date_str);
 
         // Write ADIF to temp file for debugging
         let debug_path = format!("/tmp/pota_upload_{}", filename);
@@ -739,21 +806,47 @@ pub async fn upload_to_pota(
             park = %activation.park_ref,
             date = %activation.date,
             qsos = activation.qsos.len(),
+            idx = idx + 1,
+            total = total_activations,
             "Uploading activation to POTA"
         );
 
-        match client
-            .upload_adif(&filename, adif_content.into_bytes())
+        match uploader
+            .upload_with_retry(
+                &filename,
+                adif_content.into_bytes(),
+                &activation.park_ref,
+                &location,
+                callsign,
+                3,
+            )
             .await
         {
-            Ok(()) => {
-                activations_uploaded += 1;
-                qsos_uploaded += activation.qsos.len();
-                info!(
-                    park = %activation.park_ref,
-                    date = %activation.date,
-                    "Activation uploaded successfully"
-                );
+            Ok(result) => {
+                if result.accepted {
+                    activations_uploaded += 1;
+                    qsos_uploaded += activation.qsos.len();
+                    info!(
+                        park = %activation.park_ref,
+                        date = %activation.date,
+                        "Activation uploaded successfully"
+                    );
+                } else {
+                    // File was rejected (likely duplicate)
+                    let error_msg = format!(
+                        "{} on {}: {}",
+                        activation.park_ref,
+                        format_date(&activation.date),
+                        result.message
+                    );
+                    warn!(
+                        park = %activation.park_ref,
+                        date = %activation.date,
+                        message = %result.message,
+                        "Activation upload rejected"
+                    );
+                    errors.push(error_msg);
+                }
             }
             Err(e) => {
                 let error_msg = format!(
@@ -788,29 +881,42 @@ pub struct PotaJobInfo {
     pub callsign: Option<String>,
 }
 
-/// Get POTA upload job status
+/// Get POTA upload job status using headless browser authentication
 pub async fn get_upload_jobs(email: &str, password: &str) -> Result<Vec<PotaJobInfo>> {
-    let client = PotaClient::authenticate(email, password)
-        .await
-        .map_err(|e| Error::Other(format!("POTA authentication failed: {}", e)))?;
+    // Create the POTA uploader with browser-based authentication
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("logbook-sync");
+    fs::create_dir_all(&cache_dir).ok();
+    let cache_path = cache_dir.join("pota_tokens.json");
 
-    let jobs = client
+    let mut uploader = PotaUploader::new(
+        email.to_string(),
+        password.to_string(),
+        cache_path,
+        true, // headless mode
+    );
+
+    let jobs = uploader
         .get_jobs()
         .await
         .map_err(|e| Error::Other(format!("Failed to get POTA jobs: {}", e)))?;
 
     Ok(jobs
         .into_iter()
-        .map(|j| PotaJobInfo {
-            job_id: j.job_id,
-            status: j.status_str().to_string(),
-            park_ref: j.reference,
-            park_name: j.park_name,
-            submitted: j.submitted,
-            processed: j.processed,
-            total_qsos: j.total,
-            inserted_qsos: j.inserted,
-            callsign: j.callsign_used,
+        .map(|j| {
+            let callsign = j.callsign().map(String::from);
+            PotaJobInfo {
+                job_id: j.job_id,
+                status: j.status_string().to_string(),
+                park_ref: j.reference,
+                park_name: j.park_name,
+                submitted: j.submitted,
+                processed: j.processed,
+                total_qsos: j.total,
+                inserted_qsos: j.inserted,
+                callsign,
+            }
         })
         .collect())
 }
