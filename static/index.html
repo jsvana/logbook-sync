@@ -19,6 +19,8 @@
             --badge-enabled-text: #155724;
             --badge-disabled-bg: #f8d7da;
             --badge-disabled-text: #721c24;
+            --badge-warning-bg: #fff3cd;
+            --badge-warning-text: #856404;
         }
 
         /* Dark theme */
@@ -35,6 +37,8 @@
             --badge-enabled-text: #4ade80;
             --badge-disabled-bg: #5c1a1a;
             --badge-disabled-text: #f87171;
+            --badge-warning-bg: #5c4a1a;
+            --badge-warning-text: #fcd34d;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -257,36 +261,98 @@
             margin-top: 0.25rem;
         }
         /* POTA Modal Styles */
+        .pota-activations-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 0.5rem;
+        }
         .pota-activation {
-            padding: 0.75rem;
+            padding: 0.5rem;
             border-radius: 4px;
-            margin-bottom: 0.5rem;
+            font-size: 0.85rem;
         }
         .pota-activation.valid {
             background: var(--badge-enabled-bg);
             border: 1px solid var(--badge-enabled-text);
         }
         .pota-activation.invalid {
-            background: var(--badge-disabled-bg);
-            border: 1px solid var(--badge-disabled-text);
-            color: var(--badge-disabled-text);
+            background: var(--badge-warning-bg);
+            border: 1px solid var(--badge-warning-text);
+            color: var(--badge-warning-text);
         }
         .pota-activation label {
             cursor: pointer;
             display: flex;
-            align-items: center;
-            gap: 0.5rem;
+            align-items: flex-start;
+            gap: 0.35rem;
+        }
+        .pota-activation label input[type="checkbox"] {
+            margin-top: 2px;
+        }
+        .pota-activation-info {
+            display: flex;
+            flex-direction: column;
+            gap: 0.1rem;
+            line-height: 1.3;
+        }
+        .pota-activation-park {
+            font-weight: 600;
+        }
+        .pota-activation-meta {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+        }
+        .pota-activation.invalid .pota-activation-meta {
+            color: var(--badge-warning-text);
+            opacity: 0.8;
+        }
+        .pota-activation.uploaded {
+            opacity: 0.7;
+            border-style: dashed;
         }
         .pota-activation details {
-            margin-top: 0.5rem;
+            margin-top: 0.35rem;
+            grid-column: 1 / -1;
         }
         .pota-activation summary {
             cursor: pointer;
             color: var(--text-dim);
-            font-size: 0.85rem;
+            font-size: 0.7rem;
         }
         .pota-qso-table {
+            font-size: 0.7rem;
+            margin-top: 0.25rem;
+        }
+        .section-header {
             font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-dim);
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .pota-section {
+            margin-bottom: 1rem;
+        }
+        .pota-section > summary {
+            cursor: pointer;
+            list-style: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .pota-section > summary::-webkit-details-marker {
+            display: none;
+        }
+        .pota-section > summary::before {
+            content: '▶';
+            font-size: 0.7rem;
+            transition: transform 0.2s;
+        }
+        .pota-section[open] > summary::before {
+            transform: rotate(90deg);
+        }
+        .pota-section > .pota-activations-grid {
             margin-top: 0.5rem;
         }
         .pota-qso-table th, .pota-qso-table td {
@@ -542,6 +608,11 @@
                 <button type="button" onclick="closePotaModal()" style="position: absolute; top: 0.75rem; right: 0.75rem; background: transparent; border: none; color: var(--text-dim); font-size: 1.5rem; cursor: pointer; padding: 0.25rem 0.5rem; line-height: 1;" title="Close">&times;</button>
                 <h2>POTA Activation Upload</h2>
                 <div id="pota-summary" style="margin-bottom: 1rem; padding: 0.75rem; background: var(--surface); border-radius: 4px;"></div>
+                <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem;">
+                    <button type="button" id="pota-upload-btn" onclick="uploadSelectedPota()">Upload Selected</button>
+                    <button type="button" id="pota-check-status-btn" onclick="checkPotaJobStatus()" style="background: var(--primary);">Check Upload Status</button>
+                    <button type="button" onclick="closePotaModal()" style="background: var(--primary);">Cancel</button>
+                </div>
                 <div id="pota-selection-controls" style="margin-bottom: 0.5rem; display: none;">
                     <button type="button" id="pota-toggle-all" onclick="toggleAllPotaActivations()" style="padding: 0.25rem 0.5rem; font-size: 0.875rem;">Deselect All</button>
                 </div>
@@ -551,10 +622,9 @@
                     <h3 style="margin-bottom: 0.5rem;">Recent Upload Jobs</h3>
                     <div id="pota-jobs-list"></div>
                 </div>
-                <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
-                    <button type="button" id="pota-upload-btn" onclick="uploadSelectedPota()">Upload Selected</button>
-                    <button type="button" id="pota-check-status-btn" onclick="checkPotaJobStatus()" style="background: var(--primary);">Check Upload Status</button>
-                    <button type="button" onclick="closePotaModal()" style="background: var(--primary);">Cancel</button>
+                <div id="pota-progress-section" style="margin-bottom: 1rem; display: none;">
+                    <h3 style="margin-bottom: 0.5rem;">Upload Progress</h3>
+                    <div id="pota-progress-log" style="background: var(--surface); border-radius: 4px; padding: 0.75rem; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 0.875rem;"></div>
                 </div>
             </div>
         </div>
@@ -575,7 +645,7 @@
             hrdlog: { name: 'HRDLog', desc: 'HRDLog.net logbook', underConstruction: true },
             wavelog: { name: 'Wavelog', desc: 'Self-hosted Wavelog instance', underConstruction: true },
             ntfy: { name: 'ntfy', desc: 'Push notifications via ntfy.sh' },
-            pota: { name: 'POTA.app', desc: 'Parks on the Air activation upload', underConstruction: true },
+            pota: { name: 'POTA.app', desc: 'Parks on the Air activation upload' },
         };
 
         // Integration field definitions (lofi has its own wizard)
@@ -610,7 +680,7 @@
             ntfy: [
                 { name: 'server', label: 'Server URL', type: 'url', default: 'https://ntfy.sh' },
                 { name: 'topic', label: 'Topic', type: 'text', required: true },
-                { name: 'token', label: 'Access Token (optional)', type: 'password' },
+                { name: 'token', label: 'Access Token', type: 'password' },
                 { name: 'priority', label: 'Priority (1-5)', type: 'number', default: 3 },
                 { name: 'notify_on_sync', label: 'Notify on Sync', type: 'checkbox', default: true },
                 { name: 'notify_on_error', label: 'Notify on Error', type: 'checkbox', default: true },
@@ -753,7 +823,7 @@
             hrdlog: { upload: true, download: false },
             wavelog: { upload: true, download: true },
             ntfy: { upload: false, download: false }, // Notifications only, no sync
-            pota: { upload: false, download: false, manualUpload: true }, // Manual upload with preview
+            pota: { upload: true, download: true },
         };
 
         function formatSyncTime(isoString) {
@@ -801,39 +871,6 @@
             const caps = SYNC_CAPABILITIES[type] || {};
             const rows = [];
 
-            // Special case for LoFi - show synced counts
-            if (type === 'lofi') {
-                const dlState = syncState?.download;
-                const lastSync = dlState?.last_sync_at;
-                const result = dlState?.last_sync_result;
-                const resultClass = result === 'success' ? 'success' : (result === 'error' ? 'error' : '');
-                const nextSync = formatNextSyncTime(lastSync, syncIntervalSecs);
-                const intervalStr = formatIntervalSecs(syncIntervalSecs);
-
-                const operations = stats?.operations || 0;
-                const qsos = stats?.qsos || 0;
-                const potaOps = stats?.pota_operations || 0;
-
-                return `<div class="sync-status">
-                    <div class="sync-row">
-                        <div class="sync-direction">
-                            <span class="sync-direction-icon">&#8595;</span>
-                            <div class="sync-info">
-                                <span>Synced from Ham2K PoLo</span>
-                                <span class="sync-time">Last: ${formatSyncTime(lastSync)}${nextSync ? ` · Next: ${nextSync}` : ''}</span>
-                                <span class="sync-result ${resultClass}">${operations} operations · ${qsos} QSOs${potaOps > 0 ? ` · ${potaOps} POTA` : ''}</span>
-                            </div>
-                        </div>
-                        <div class="sync-actions">
-                            <button class="sync-btn" onclick="forceSync('lofi', 'download')" id="sync-lofi-download">
-                                Sync Now
-                            </button>
-                        </div>
-                    </div>
-                    <div class="sync-interval-info">Auto-sync every ${intervalStr}</div>
-                </div>`;
-            }
-
             // Special case for ntfy - show test button instead of sync status
             if (type === 'ntfy') {
                 return `<div class="sync-status">
@@ -853,38 +890,12 @@
                 </div>`;
             }
 
-            // Special case for POTA - manual upload with preview
-            if (type === 'pota') {
-                const ulState = syncState?.upload;
-                const lastSync = ulState?.last_sync_at;
-                const result = ulState?.last_sync_result;
-                const resultClass = result === 'success' ? 'success' : (result === 'error' ? 'error' : '');
-                const message = ulState?.last_sync_message || '';
-
-                return `<div class="sync-status">
-                    <div class="sync-row">
-                        <div class="sync-direction">
-                            <span class="sync-direction-icon">&#8593;</span>
-                            <div class="sync-info">
-                                <span>Activation Upload</span>
-                                <span class="sync-time">Last: ${formatSyncTime(lastSync)}</span>
-                                ${result ? `<span class="sync-result ${resultClass}">${message}</span>` : ''}
-                            </div>
-                        </div>
-                        <div class="sync-actions">
-                            <button class="sync-btn" onclick="showPotaPreview()" id="pota-preview-btn">
-                                Preview
-                            </button>
-                        </div>
-                    </div>
-                    <div class="sync-interval-info">Manual upload only (preview shows valid activations)</div>
-                </div>`;
-            }
-
             // Check if upload/download is enabled in config
             const uploadEnabled = config?.upload_enabled !== false && caps.upload;
             const downloadEnabled = config?.download_enabled !== false && caps.download;
+            const intervalStr = formatIntervalSecs(syncIntervalSecs);
 
+            // Download row
             if (caps.download && downloadEnabled) {
                 const dlState = syncState?.download;
                 const lastSync = dlState?.last_sync_at;
@@ -893,6 +904,21 @@
                 const itemsSynced = dlState?.items_synced || 0;
                 const nextSync = formatNextSyncTime(lastSync, syncIntervalSecs);
 
+                // Build stats display
+                let statsDisplay = '';
+                if (type === 'lofi') {
+                    const operations = stats?.operations || 0;
+                    const qsos = stats?.qsos || 0;
+                    const potaOps = stats?.pota_operations || 0;
+                    statsDisplay = `${qsos} QSOs · ${operations} operations${potaOps > 0 ? ` · ${potaOps} POTA` : ''}`;
+                } else if (type === 'pota') {
+                    const activations = stats?.activations || 0;
+                    const qsos = stats?.qsos || 0;
+                    statsDisplay = `${activations} activations · ${qsos} QSOs`;
+                } else if (result) {
+                    statsDisplay = `${itemsSynced} downloaded`;
+                }
+
                 rows.push(`
                     <div class="sync-row">
                         <div class="sync-direction">
@@ -900,7 +926,7 @@
                             <div class="sync-info">
                                 <span>Download</span>
                                 <span class="sync-time">Last: ${formatSyncTime(lastSync)}${nextSync ? ` · Next: ${nextSync}` : ''}</span>
-                                ${result ? `<span class="sync-result ${resultClass}">${itemsSynced} items</span>` : ''}
+                                ${statsDisplay ? `<span class="sync-result ${resultClass}">${statsDisplay}</span>` : ''}
                             </div>
                         </div>
                         <div class="sync-actions">
@@ -912,6 +938,7 @@
                 `);
             }
 
+            // Upload row
             if (caps.upload && uploadEnabled) {
                 const ulState = syncState?.upload;
                 const lastSync = ulState?.last_sync_at;
@@ -919,6 +946,25 @@
                 const resultClass = result === 'success' ? 'success' : (result === 'error' ? 'error' : '');
                 const itemsSynced = ulState?.items_synced || 0;
                 const nextSync = formatNextSyncTime(lastSync, syncIntervalSecs);
+                const pendingCount = stats?.pending_upload || 0;
+
+                // Build stats display
+                let statsDisplay = '';
+                if (type === 'pota') {
+                    const validActivations = stats?.valid_activations || 0;
+                    const uniqueParks = stats?.unique_parks || 0;
+                    statsDisplay = `${validActivations} valid · ${uniqueParks} parks`;
+                } else if (result) {
+                    statsDisplay = `${itemsSynced} uploaded`;
+                }
+                if (pendingCount > 0) {
+                    statsDisplay += statsDisplay ? ` · ${pendingCount} pending` : `${pendingCount} pending`;
+                }
+
+                // POTA gets a Preview button instead of Sync Now (shows modal for review)
+                const uploadButton = type === 'pota'
+                    ? `<button class="sync-btn" onclick="showPotaPreview()" id="sync-${type}-upload">Preview</button>`
+                    : `<button class="sync-btn" onclick="forceSync('${type}', 'upload')" id="sync-${type}-upload">Sync Now</button>`;
 
                 rows.push(`
                     <div class="sync-row">
@@ -927,13 +973,11 @@
                             <div class="sync-info">
                                 <span>Upload</span>
                                 <span class="sync-time">Last: ${formatSyncTime(lastSync)}${nextSync ? ` · Next: ${nextSync}` : ''}</span>
-                                ${result ? `<span class="sync-result ${resultClass}">${itemsSynced} items</span>` : ''}
+                                ${statsDisplay ? `<span class="sync-result ${resultClass}">${statsDisplay}</span>` : ''}
                             </div>
                         </div>
                         <div class="sync-actions">
-                            <button class="sync-btn" onclick="forceSync('${type}', 'upload')" id="sync-${type}-upload">
-                                Sync Now
-                            </button>
+                            ${uploadButton}
                         </div>
                     </div>
                 `);
@@ -941,8 +985,6 @@
 
             if (rows.length === 0) return '';
 
-            // Add sync interval info at the bottom
-            const intervalStr = formatIntervalSecs(syncIntervalSecs);
             return `<div class="sync-status">
                 ${rows.join('')}
                 <div class="sync-interval-info">Auto-sync every ${intervalStr}</div>
@@ -1095,7 +1137,7 @@
         let potaPreviewData = null;
 
         async function showPotaPreview() {
-            const btn = document.getElementById('pota-preview-btn');
+            const btn = document.getElementById('sync-pota-upload');
             if (!btn) return;
 
             const originalText = btn.textContent;
@@ -1146,27 +1188,50 @@
                 selectionControls.style.display = 'none';
             }
 
+            // Helper to render activation status badge
+            function renderUploadStatus(a) {
+                if (a.fully_uploaded) {
+                    return `<span class="badge enabled" style="margin-left: 0.5rem;">All uploaded</span>`;
+                } else if (a.uploaded_qso_count > 0) {
+                    return `<span class="badge" style="background: var(--badge-warning-bg); color: var(--badge-warning-text); margin-left: 0.5rem;">${a.uploaded_qso_count}/${a.qso_count} uploaded</span>`;
+                }
+                return `<span class="badge disabled" style="margin-left: 0.5rem;">Not uploaded</span>`;
+            }
+
+            // Helper to render QSO row with upload status
+            function renderQsoRow(q) {
+                const style = q.already_uploaded ? 'opacity: 0.6;' : '';
+                const icon = q.already_uploaded ? '<span title="Already uploaded" style="color: var(--badge-enabled-text);">✓</span> ' : '';
+                return `<tr style="${style}"><td>${icon}${q.call}</td><td>${formatPotaTime(q.time)}</td><td>${q.band}</td><td>${q.mode}</td></tr>`;
+            }
+
             if (data.valid_activations.length > 0) {
                 validList.innerHTML = `
-                    <div class="section-header">Complete Activations (10+ QSOs)</div>
-                    ${data.valid_activations.map(a => `
-                    <div class="pota-activation valid">
-                        <label>
-                            <input type="checkbox" checked value="${a.park_ref}:${a.date}" class="pota-activation-checkbox" onchange="updatePotaUploadButton(); updatePotaToggleButton();">
-                            <strong>${a.park_ref}</strong> on ${formatPotaDate(a.date)} - ${a.qso_count} QSOs
-                        </label>
-                        <details>
-                            <summary>View QSOs</summary>
-                            <table class="pota-qso-table">
-                                <thead><tr><th>Call</th><th>Time</th><th>Band</th><th>Mode</th></tr></thead>
-                                <tbody>
-                                    ${a.qsos.map(q => `<tr><td>${q.call}</td><td>${formatPotaTime(q.time)}</td><td>${q.band}</td><td>${q.mode}</td></tr>`).join('')}
-                                </tbody>
-                            </table>
-                        </details>
-                    </div>
-                `).join('')}`;
-                updatePotaToggleButton();
+                    <details class="pota-section" open>
+                        <summary><span class="section-header">Complete Activations (10+ QSOs)</span></summary>
+                        <div class="pota-activations-grid">
+                        ${data.valid_activations.map(a => `
+                        <div class="pota-activation valid ${a.fully_uploaded ? 'uploaded' : ''}">
+                            <label>
+                                <input type="checkbox" ${a.fully_uploaded ? '' : 'checked'} value="${a.park_ref}:${a.date}" class="pota-activation-checkbox" onchange="updatePotaUploadButton(); updatePotaToggleButton();">
+                                <span class="pota-activation-info">
+                                    <span class="pota-activation-park">${a.park_ref}${renderUploadStatus(a)}</span>
+                                    <span class="pota-activation-meta">${formatPotaDate(a.date)} · ${a.qso_count} QSOs</span>
+                                </span>
+                            </label>
+                            <details>
+                                <summary>View QSOs</summary>
+                                <table class="pota-qso-table">
+                                    <thead><tr><th>Call</th><th>Time</th><th>Band</th><th>Mode</th></tr></thead>
+                                    <tbody>
+                                        ${a.qsos.map(q => renderQsoRow(q)).join('')}
+                                    </tbody>
+                                </table>
+                            </details>
+                        </div>
+                        `).join('')}
+                        </div>
+                    </details>`;
             } else {
                 validList.innerHTML = '';
             }
@@ -1174,24 +1239,31 @@
             // Incomplete activations (now with checkboxes!)
             if (data.invalid_activations.length > 0) {
                 invalidList.innerHTML = `
-                    <div class="section-header">Incomplete Activations (&lt;10 QSOs)</div>
-                    ${data.invalid_activations.map(a => `
-                        <div class="pota-activation invalid">
-                            <label>
-                                <input type="checkbox" value="${a.park_ref}:${a.date}" class="pota-activation-checkbox" onchange="updatePotaUploadButton(); updatePotaToggleButton();">
-                                <strong>${a.park_ref}</strong> on ${formatPotaDate(a.date)} - ${a.qso_count} QSOs <span class="text-muted">(need ${10 - a.qso_count} more for credit)</span>
-                            </label>
-                            <details>
-                                <summary>View QSOs</summary>
-                                <table class="pota-qso-table">
-                                    <thead><tr><th>Call</th><th>Time</th><th>Band</th><th>Mode</th></tr></thead>
-                                    <tbody>
-                                        ${a.qsos.map(q => `<tr><td>${q.call}</td><td>${formatPotaTime(q.time)}</td><td>${q.band}</td><td>${q.mode}</td></tr>`).join('')}
-                                    </tbody>
-                                </table>
-                            </details>
+                    <details class="pota-section" open>
+                        <summary><span class="section-header">Incomplete Activations (&lt;10 QSOs)</span></summary>
+                        <div class="pota-activations-grid">
+                        ${data.invalid_activations.map(a => `
+                            <div class="pota-activation invalid ${a.fully_uploaded ? 'uploaded' : ''}">
+                                <label>
+                                    <input type="checkbox" ${a.fully_uploaded ? '' : 'checked'} value="${a.park_ref}:${a.date}" class="pota-activation-checkbox" onchange="updatePotaUploadButton(); updatePotaToggleButton();">
+                                    <span class="pota-activation-info">
+                                        <span class="pota-activation-park">${a.park_ref}${renderUploadStatus(a)}</span>
+                                        <span class="pota-activation-meta">${formatPotaDate(a.date)} · ${a.qso_count} QSOs (need ${10 - a.qso_count} more)</span>
+                                    </span>
+                                </label>
+                                <details>
+                                    <summary>View QSOs</summary>
+                                    <table class="pota-qso-table">
+                                        <thead><tr><th>Call</th><th>Time</th><th>Band</th><th>Mode</th></tr></thead>
+                                        <tbody>
+                                            ${a.qsos.map(q => renderQsoRow(q)).join('')}
+                                        </tbody>
+                                    </table>
+                                </details>
+                            </div>
+                        `).join('')}
                         </div>
-                    `).join('')}
+                    </details>
                 `;
             } else {
                 invalidList.innerHTML = '';
@@ -1202,8 +1274,9 @@
                 validList.innerHTML = '<div class="no-activations">No POTA activations found (QSOs need MY_SIG=POTA and MY_SIG_INFO with park reference)</div>';
             }
 
-            // Update upload button state
+            // Update button states after all checkboxes are rendered
             updatePotaUploadButton();
+            updatePotaToggleButton();
         }
 
         function formatPotaDate(dateStr) {
@@ -1230,6 +1303,7 @@
         function closePotaModal() {
             document.getElementById('pota-modal').classList.add('hidden');
             document.getElementById('pota-jobs-section').style.display = 'none';
+            document.getElementById('pota-progress-section').style.display = 'none';
             potaPreviewData = null;
         }
 
@@ -1319,25 +1393,81 @@
             btn.disabled = true;
             btn.textContent = 'Uploading...';
 
+            // Show progress section and clear log
+            const progressSection = document.getElementById('pota-progress-section');
+            const progressLog = document.getElementById('pota-progress-log');
+            progressSection.style.display = 'block';
+            progressLog.innerHTML = '';
+
+            function addProgressLine(step, detail, isError) {
+                const time = new Date().toLocaleTimeString();
+                const color = isError ? 'var(--danger)' : 'var(--text)';
+                const line = document.createElement('div');
+                line.style.color = color;
+                line.innerHTML = `<span style="color: var(--text-dim)">[${time}]</span> <strong>${step}</strong>${detail ? `: ${detail}` : ''}`;
+                progressLog.appendChild(line);
+                progressLog.scrollTop = progressLog.scrollHeight;
+            }
+
+            addProgressLine('Starting', 'Initiating POTA upload...', false);
+
             try {
-                const result = await api('/sync/pota/upload', {
+                // Use SSE for progress updates
+                const response = await fetch('/api/sync/pota/upload/stream', {
                     method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ activations }),
+                    credentials: 'include',
                 });
 
-                if (result.success) {
-                    alert(`Successfully uploaded ${result.activations_uploaded} activation(s) (${result.qsos_uploaded} QSOs)`);
-                    closePotaModal();
-                    loadIntegrations(); // Refresh to show updated sync status
-                } else {
-                    let msg = result.message;
-                    if (result.errors && result.errors.length > 0) {
-                        msg += '\n\nErrors:\n' + result.errors.join('\n');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let finalResult = null;
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const event = JSON.parse(line.slice(6));
+                                addProgressLine(event.step, event.detail, event.is_error);
+                                if (event.result) {
+                                    finalResult = event.result;
+                                }
+                            } catch (e) {
+                                // Ignore parse errors for incomplete data
+                            }
+                        }
                     }
-                    alert(msg);
+                }
+
+                // Handle final result
+                if (finalResult) {
+                    if (finalResult.success) {
+                        addProgressLine('Done', `Uploaded ${finalResult.activations_uploaded} activation(s) (${finalResult.qsos_uploaded} QSOs)`, false);
+                        loadIntegrations(); // Refresh to show updated sync status
+                    } else {
+                        addProgressLine('Failed', finalResult.message, true);
+                        if (finalResult.errors && finalResult.errors.length > 0) {
+                            for (const err of finalResult.errors) {
+                                addProgressLine('Error', err, true);
+                            }
+                        }
+                    }
                 }
             } catch (err) {
-                alert(`Upload error: ${err.message}`);
+                addProgressLine('Error', err.message, true);
             } finally {
                 btn.disabled = false;
                 btn.textContent = originalText;
@@ -1356,13 +1486,18 @@
             btn.classList.add('syncing');
 
             try {
+                // Handle POTA download specially - it uses streaming
+                if (type === 'pota' && direction === 'download') {
+                    await performPotaDownloadStream(btn, originalText);
+                    return;
+                }
+
                 let endpoint;
                 if (type === 'lofi') {
                     endpoint = '/sync/lofi';
                 } else if (type === 'qrz') {
                     endpoint = direction === 'upload' ? '/sync/qrz/upload' : '/sync/qrz/download';
                 } else {
-                    // Future integrations
                     endpoint = `/sync/${type}/${direction}`;
                 }
 
@@ -1379,6 +1514,57 @@
                 }
             } catch (err) {
                 alert(`Sync error: ${err.message}`);
+                btn.disabled = false;
+                btn.textContent = originalText;
+                btn.classList.remove('syncing');
+            }
+        }
+
+        // POTA download uses streaming to show progress
+        async function performPotaDownloadStream(btn, originalText) {
+            try {
+                const response = await fetch('/api/sync/pota/download/stream', {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(line.substring(6));
+                                if (data.status) {
+                                    btn.textContent = data.status;
+                                }
+                                if (data.error) {
+                                    throw new Error(data.error);
+                                }
+                            } catch (e) {
+                                // Skip non-JSON lines
+                            }
+                        }
+                    }
+                }
+
+                await loadIntegrations();
+            } catch (err) {
+                alert(`Download error: ${err.message}`);
+            } finally {
                 btn.disabled = false;
                 btn.textContent = originalText;
                 btn.classList.remove('syncing');
@@ -1451,7 +1637,34 @@
             `;
 
             modal.dataset.type = type;
+            modal.dataset.existingConfig = existing?.config ? JSON.stringify(existing.config) : '';
             modal.classList.remove('hidden');
+        }
+
+        // Helper to build config from form, preserving password fields from existing config
+        function buildConfigFromForm(type, formData, existingConfig) {
+            const fieldDefs = INTEGRATION_FIELDS[type] || [];
+            const config = { type };
+            fieldDefs.forEach(field => {
+                if (field.type === 'checkbox') {
+                    config[field.name] = formData.has(field.name);
+                } else if (field.type === 'number') {
+                    const value = formData.get(field.name);
+                    if (value) config[field.name] = parseInt(value, 10);
+                } else if (field.type === 'password') {
+                    const value = formData.get(field.name);
+                    // Use new value if provided, otherwise keep existing
+                    if (value) {
+                        config[field.name] = value;
+                    } else if (existingConfig?.[field.name]) {
+                        config[field.name] = existingConfig[field.name];
+                    }
+                } else {
+                    const value = formData.get(field.name);
+                    if (value) config[field.name] = value;
+                }
+            });
+            return config;
         }
 
         document.getElementById('modal-cancel').addEventListener('click', () => {
@@ -1462,19 +1675,11 @@
             e.preventDefault();
             const modal = document.getElementById('integration-modal');
             const type = modal.dataset.type;
+            const existingConfig = modal.dataset.existingConfig ? JSON.parse(modal.dataset.existingConfig) : null;
             const form = e.target;
             const formData = new FormData(form);
 
-            const fieldDefs = INTEGRATION_FIELDS[type] || [];
-            const config = { type };
-            fieldDefs.forEach(field => {
-                if (field.type === 'checkbox') {
-                    config[field.name] = formData.has(field.name);
-                } else {
-                    const value = formData.get(field.name);
-                    if (value) config[field.name] = value;
-                }
-            });
+            const config = buildConfigFromForm(type, formData, existingConfig);
 
             try {
                 await api(`/integrations/${type}`, {
@@ -1494,21 +1699,13 @@
         document.getElementById('modal-test').addEventListener('click', async () => {
             const modal = document.getElementById('integration-modal');
             const type = modal.dataset.type;
+            const existingConfig = modal.dataset.existingConfig ? JSON.parse(modal.dataset.existingConfig) : null;
             const form = document.getElementById('integration-form');
             const formData = new FormData(form);
             const testBtn = document.getElementById('modal-test');
 
             // Build config from current form values
-            const fieldDefs = INTEGRATION_FIELDS[type] || [];
-            const config = { type };
-            fieldDefs.forEach(field => {
-                if (field.type === 'checkbox') {
-                    config[field.name] = formData.has(field.name);
-                } else {
-                    const value = formData.get(field.name);
-                    if (value) config[field.name] = value;
-                }
-            });
+            const config = buildConfigFromForm(type, formData, existingConfig);
 
             // Show loading state
             const originalText = testBtn.innerHTML;
@@ -1737,7 +1934,57 @@
             contentEl.classList.add('hidden');
 
             try {
-                const stats = await api('/qsos/stats');
+                // Fetch both basic stats and sync stats in parallel
+                const [stats, syncStats] = await Promise.all([
+                    api('/qsos/stats'),
+                    api('/stats/sync').catch(() => null)
+                ]);
+
+                // Build the sync stats section
+                let syncStatsHtml = '';
+                if (syncStats) {
+                    const d = syncStats.downloaded;
+                    const u = syncStats.uploaded;
+                    const p = syncStats.pending;
+
+                    // Build source counts (only show non-zero)
+                    const sources = [];
+                    if (d.local > 0) sources.push(`<span title="Local ADIF files">Local: ${d.local}</span>`);
+                    if (d.qrz > 0) sources.push(`<span title="Downloaded from QRZ">QRZ: ${d.qrz}</span>`);
+                    if (d.lofi > 0) sources.push(`<span title="Downloaded from Ham2K PoLo">LoFi: ${d.lofi}</span>`);
+                    if (d.pota > 0) sources.push(`<span title="Downloaded from POTA.app">POTA: ${d.pota}</span>`);
+                    if (d.wavelog > 0) sources.push(`<span title="Downloaded from Wavelog">Wavelog: ${d.wavelog}</span>`);
+                    if (d.lotw > 0) sources.push(`<span title="Downloaded from LotW">LotW: ${d.lotw}</span>`);
+
+                    syncStatsHtml = `
+                        <div style="margin-top: 1rem; padding: 1rem; background: var(--bg); border-radius: 4px;">
+                            <div style="font-weight: 600; margin-bottom: 0.75rem; font-size: 0.9rem;">Sync Overview</div>
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; font-size: 0.85rem;">
+                                <div style="padding: 0.5rem; border: 1px solid var(--primary); border-radius: 4px;">
+                                    <div style="color: var(--text-dim); margin-bottom: 0.25rem;">Total Unique QSOs</div>
+                                    <div style="font-size: 1.25rem; font-weight: bold; color: var(--accent);">${syncStats.total_unique_qsos}</div>
+                                </div>
+                                <div style="padding: 0.5rem; border: 1px solid var(--primary); border-radius: 4px;">
+                                    <div style="color: var(--text-dim); margin-bottom: 0.25rem;">Pending QRZ Upload</div>
+                                    <div style="font-size: 1.25rem; font-weight: bold; ${p.qrz > 0 ? 'color: var(--badge-warning-text);' : ''}">${p.qrz}</div>
+                                </div>
+                                <div style="padding: 0.5rem; border: 1px solid var(--primary); border-radius: 4px;">
+                                    <div style="color: var(--text-dim); margin-bottom: 0.25rem;">Pending POTA Upload</div>
+                                    <div style="font-size: 1.25rem; font-weight: bold; ${p.pota > 0 ? 'color: var(--badge-warning-text);' : ''}">${p.pota}</div>
+                                </div>
+                            </div>
+                            ${sources.length > 0 ? `
+                            <div style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--primary);">
+                                <div style="color: var(--text-dim); font-size: 0.8rem; margin-bottom: 0.25rem;">Downloaded From:</div>
+                                <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; font-size: 0.8rem;">
+                                    ${sources.join(' <span style="color: var(--text-dim);">|</span> ')}
+                                </div>
+                            </div>
+                            ` : ''}
+                        </div>
+                    `;
+                }
+
                 document.getElementById('qso-stats').innerHTML = `
                     <div class="stat-item">
                         <div class="stat-value">${stats.total_qsos || 0}</div>
@@ -1751,7 +1998,8 @@
                         <div class="stat-value">--</div>
                         <div class="stat-label">LotW Confirmed <span class="badge under-construction" style="font-size: 0.6rem;">Coming Soon</span></div>
                     </div>
-                `;
+                ` + syncStatsHtml;
+
                 // Also load recent QSOs
                 await loadRecentQsos();
             } catch (err) {

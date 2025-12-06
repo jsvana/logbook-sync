@@ -16,8 +16,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "coo
 # QRZ API client
 qrz-logbook-api = "0.1"
 
-# POTA API client
-pota_adif_upload = { version = "0.1", package = "pota-adif-upload" }
+# Standard directories for caching tokens
+dirs = "5"
 
 # OpenSSL vendored for cross-compilation (qrz-logbook-api pulls in native-tls)
 openssl = { version = "0.10", features = ["vendored"] }
@@ -62,6 +62,7 @@ rand = "0.8"
 
 # Async utilities
 futures = "0.3"
+async-stream = "0.3"
 
 # Systemd integration
 sd-notify = "0.4"
@@ -91,6 +92,9 @@ base64 = "0.22"
 
 # Time handling for sessions
 time = "0.3"
+
+# Headless browser automation for POTA authentication
+headless_chrome = "1.0"
 
 [dev-dependencies]
 tempfile = "3"

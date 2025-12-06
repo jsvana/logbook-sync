@@ -186,7 +186,7 @@ pub fn update_password(conn: &Connection, user_id: i64, new_password: &str) -> R
         hash_password(new_password).map_err(|e| crate::Error::Other(e.to_string()))?;
 
     conn.execute(
-        "UPDATE users SET password_hash = ?1, updated_at = datetime('now') WHERE id = ?2",
+        "UPDATE users SET password_hash = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
         params![&password_hash, user_id],
     )?;
 
@@ -201,7 +201,7 @@ pub fn update_user_profile(
     callsign: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE users SET email = ?1, callsign = ?2, updated_at = datetime('now') WHERE id = ?3",
+        "UPDATE users SET email = ?1, callsign = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?3",
         params![email, callsign, user_id],
     )?;
 
@@ -218,7 +218,7 @@ pub fn update_user_theme(conn: &Connection, user_id: i64, theme: &str) -> Result
     }
 
     conn.execute(
-        "UPDATE users SET theme = ?1, updated_at = datetime('now') WHERE id = ?2",
+        "UPDATE users SET theme = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
         params![theme, user_id],
     )?;
 
@@ -228,7 +228,7 @@ pub fn update_user_theme(conn: &Connection, user_id: i64, theme: &str) -> Result
 /// Deactivate user
 pub fn deactivate_user(conn: &Connection, user_id: i64) -> Result<()> {
     conn.execute(
-        "UPDATE users SET is_active = 0, updated_at = datetime('now') WHERE id = ?1",
+        "UPDATE users SET is_active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?1",
         params![user_id],
     )?;
     Ok(())
@@ -237,7 +237,7 @@ pub fn deactivate_user(conn: &Connection, user_id: i64) -> Result<()> {
 /// Activate user
 pub fn activate_user(conn: &Connection, user_id: i64) -> Result<()> {
     conn.execute(
-        "UPDATE users SET is_active = 1, updated_at = datetime('now') WHERE id = ?1",
+        "UPDATE users SET is_active = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?1",
         params![user_id],
     )?;
     Ok(())
@@ -253,7 +253,7 @@ pub fn delete_user(conn: &Connection, user_id: i64) -> Result<()> {
 /// Record login timestamp
 pub fn record_login(conn: &Connection, user_id: i64) -> Result<()> {
     conn.execute(
-        "UPDATE users SET last_login_at = datetime('now') WHERE id = ?1",
+        "UPDATE users SET last_login_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?1",
         params![user_id],
     )?;
     Ok(())

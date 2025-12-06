@@ -59,6 +59,7 @@ pub mod qso_source {
     pub const CLUBLOG: &str = "clublog";
     pub const HRDLOG: &str = "hrdlog";
     pub const LOFI: &str = "lofi";
+    pub const POTA: &str = "pota";
 }
 
 #[derive(Debug, Clone)]
@@ -171,8 +172,8 @@ impl Database {
                 synced INTEGER DEFAULT 0,
 
                 -- Sync tracking
-                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-                last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                last_updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
 
                 -- Store full JSON for complete data preservation
                 raw_json TEXT NOT NULL
@@ -249,8 +250,8 @@ impl Database {
                 deleted INTEGER DEFAULT 0,
 
                 -- Sync tracking
-                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-                last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                last_updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 is_new INTEGER DEFAULT 1,
 
                 -- Store full JSON for complete data preservation
@@ -293,8 +294,8 @@ impl Database {
                 is_admin INTEGER NOT NULL DEFAULT 0,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 theme TEXT NOT NULL DEFAULT 'light',  -- 'light' or 'dark'
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 last_login_at TEXT
             );
 
@@ -308,8 +309,8 @@ impl Database {
                 integration_type TEXT NOT NULL,  -- 'qrz', 'lofi', 'lotw', 'clublog', etc.
                 enabled INTEGER NOT NULL DEFAULT 1,
                 encrypted_config TEXT NOT NULL,  -- JSON encrypted with user's derived key
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 UNIQUE(user_id, integration_type)
             );
 
@@ -322,7 +323,7 @@ impl Database {
                 watch_path TEXT NOT NULL,
                 patterns TEXT NOT NULL DEFAULT '["*.adi", "*.adif", "*.ADI", "*.ADIF"]',  -- JSON array
                 enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
 
             CREATE INDEX IF NOT EXISTS idx_user_watch_paths_user ON user_watch_paths(user_id);
@@ -350,6 +351,67 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_user_sync_state_user ON user_sync_state(user_id);
+
+            -- POTA Activations (downloaded from POTA.app)
+            CREATE TABLE IF NOT EXISTS pota_activations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                callsign TEXT NOT NULL,
+                date TEXT NOT NULL,              -- YYYY-MM-DD format
+                reference TEXT NOT NULL,         -- Park reference (e.g., "US-0189")
+                name TEXT,                       -- Park name
+                parktype_desc TEXT,              -- Park type description
+                location_desc TEXT,              -- Location (e.g., "US-CA")
+                first_qso TEXT,                  -- ISO datetime of first QSO
+                last_qso TEXT,                   -- ISO datetime of last QSO
+                total INTEGER NOT NULL DEFAULT 0,
+                cw INTEGER NOT NULL DEFAULT 0,
+                data INTEGER NOT NULL DEFAULT 0,
+                phone INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                last_updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE(callsign, date, reference)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pota_activations_callsign ON pota_activations(callsign);
+            CREATE INDEX IF NOT EXISTS idx_pota_activations_date ON pota_activations(date);
+            CREATE INDEX IF NOT EXISTS idx_pota_activations_reference ON pota_activations(reference);
+
+            -- POTA QSOs (downloaded from POTA.app)
+            CREATE TABLE IF NOT EXISTS pota_qsos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                qso_id INTEGER NOT NULL UNIQUE,  -- POTA's qsoId
+                user_id INTEGER,                 -- POTA's userId
+                qso_datetime TEXT NOT NULL,      -- ISO datetime
+                station_callsign TEXT NOT NULL,
+                operator_callsign TEXT,
+                worked_callsign TEXT NOT NULL,
+                band TEXT,
+                mode TEXT,
+                rst_sent TEXT,
+                rst_rcvd TEXT,
+                my_sig TEXT,
+                my_sig_info TEXT,
+                p2p_match TEXT,                  -- Park-to-park match info
+                job_id INTEGER,
+                park_id INTEGER,
+                reference TEXT,                  -- Park reference
+                park_name TEXT,
+                parktype_desc TEXT,
+                location_id INTEGER,
+                location_desc TEXT,
+                location_name TEXT,
+                sig TEXT,                        -- Their SIG (e.g., POTA if they were at a park)
+                sig_info TEXT,                   -- Their SIG_INFO (their park ref)
+                logged_mode TEXT,
+                first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                last_updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pota_qsos_qso_id ON pota_qsos(qso_id);
+            CREATE INDEX IF NOT EXISTS idx_pota_qsos_datetime ON pota_qsos(qso_datetime);
+            CREATE INDEX IF NOT EXISTS idx_pota_qsos_worked_callsign ON pota_qsos(worked_callsign);
+            CREATE INDEX IF NOT EXISTS idx_pota_qsos_reference ON pota_qsos(reference);
+            CREATE INDEX IF NOT EXISTS idx_pota_qsos_station_callsign ON pota_qsos(station_callsign);
             "#,
         )?;
         Ok(())
@@ -431,9 +493,24 @@ impl Database {
         source: &str,
         source_id: Option<&str>,
     ) -> Result<i64> {
+        let (id, _is_new) = self.upsert_qso_with_source_ext(qso, source_file, source, source_id)?;
+        Ok(id)
+    }
+
+    /// Upsert a QSO and return (row_id, is_new)
+    pub fn upsert_qso_with_source_ext(
+        &self,
+        qso: &Qso,
+        source_file: Option<&str>,
+        source: &str,
+        source_id: Option<&str>,
+    ) -> Result<(i64, bool)> {
         let now = Utc::now().to_rfc3339();
         let adif_json = serde_json::to_string(qso).map_err(|e| Error::Other(e.to_string()))?;
         let source_hash = compute_hash(&adif_json);
+
+        // Check if QSO already exists
+        let is_new = !self.qso_exists(qso)?;
 
         // Try to insert, on conflict update
         self.conn.execute(
@@ -464,7 +541,7 @@ impl Database {
             ],
         )?;
 
-        Ok(self.conn.last_insert_rowid())
+        Ok((self.conn.last_insert_rowid(), is_new))
     }
 
     /// Check if a QSO already exists
@@ -1141,6 +1218,402 @@ impl Database {
         })
     }
 
+    // === POTA Database Operations ===
+
+    /// Insert or update a POTA activation
+    /// Returns true if this is a new activation (not previously seen)
+    pub fn upsert_pota_activation(
+        &self,
+        activation: &crate::pota::PotaRemoteActivation,
+    ) -> Result<bool> {
+        let existing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pota_activations WHERE callsign = ?1 AND date = ?2 AND reference = ?3",
+            params![&activation.callsign, &activation.date, &activation.reference],
+            |row| row.get(0),
+        )?;
+
+        let is_new = existing == 0;
+
+        self.conn.execute(
+            r#"
+            INSERT INTO pota_activations (
+                callsign, date, reference, name, parktype_desc, location_desc,
+                first_qso, last_qso, total, cw, data, phone
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(callsign, date, reference) DO UPDATE SET
+                name = excluded.name,
+                parktype_desc = excluded.parktype_desc,
+                location_desc = excluded.location_desc,
+                first_qso = excluded.first_qso,
+                last_qso = excluded.last_qso,
+                total = excluded.total,
+                cw = excluded.cw,
+                data = excluded.data,
+                phone = excluded.phone,
+                last_updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            "#,
+            params![
+                &activation.callsign,
+                &activation.date,
+                &activation.reference,
+                &activation.name,
+                &activation.parktype_desc,
+                &activation.location_desc,
+                &activation.first_qso,
+                &activation.last_qso,
+                activation.total,
+                activation.cw,
+                activation.data,
+                activation.phone,
+            ],
+        )?;
+
+        Ok(is_new)
+    }
+
+    /// Insert or update a POTA QSO from the remote API
+    /// Returns true if this is a new QSO (not previously seen)
+    pub fn upsert_pota_qso(&self, qso: &crate::pota::PotaRemoteQso) -> Result<bool> {
+        let existing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pota_qsos WHERE qso_id = ?1",
+            params![qso.qso_id],
+            |row| row.get(0),
+        )?;
+
+        let is_new = existing == 0;
+
+        self.conn.execute(
+            r#"
+            INSERT INTO pota_qsos (
+                qso_id, user_id, qso_datetime, station_callsign, operator_callsign,
+                worked_callsign, band, mode, rst_sent, rst_rcvd, my_sig, my_sig_info,
+                p2p_match, job_id, park_id, reference, park_name, parktype_desc,
+                location_id, location_desc, location_name, sig, sig_info, logged_mode
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+            ON CONFLICT(qso_id) DO UPDATE SET
+                qso_datetime = excluded.qso_datetime,
+                station_callsign = excluded.station_callsign,
+                operator_callsign = excluded.operator_callsign,
+                worked_callsign = excluded.worked_callsign,
+                band = excluded.band,
+                mode = excluded.mode,
+                rst_sent = excluded.rst_sent,
+                rst_rcvd = excluded.rst_rcvd,
+                my_sig = excluded.my_sig,
+                my_sig_info = excluded.my_sig_info,
+                p2p_match = excluded.p2p_match,
+                job_id = excluded.job_id,
+                park_id = excluded.park_id,
+                reference = excluded.reference,
+                park_name = excluded.park_name,
+                parktype_desc = excluded.parktype_desc,
+                location_id = excluded.location_id,
+                location_desc = excluded.location_desc,
+                location_name = excluded.location_name,
+                sig = excluded.sig,
+                sig_info = excluded.sig_info,
+                logged_mode = excluded.logged_mode,
+                last_updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            "#,
+            params![
+                qso.qso_id,
+                qso.user_id,
+                &qso.qso_date_time,
+                &qso.station_callsign,
+                &qso.operator_callsign,
+                &qso.worked_callsign,
+                &qso.band,
+                &qso.mode,
+                &qso.rst_sent,
+                &qso.rst_rcvd,
+                &qso.my_sig,
+                &qso.my_sig_info,
+                &qso.p2p_match,
+                qso.job_id,
+                qso.park_id,
+                &qso.reference,
+                &qso.name,
+                &qso.parktype_desc,
+                qso.location_id,
+                &qso.location_desc,
+                &qso.location_name,
+                &qso.sig,
+                &qso.sig_info,
+                &qso.logged_mode,
+            ],
+        )?;
+
+        // Also insert into the main qsos table for unified QSO handling
+        if let Some(adif_qso) = qso.to_qso() {
+            let _ = self.upsert_qso_with_source(
+                &adif_qso,
+                None,
+                qso_source::POTA,
+                Some(&qso.qso_id.to_string()),
+            );
+        }
+
+        Ok(is_new)
+    }
+
+    /// Get total count of POTA activations
+    pub fn get_pota_activation_count(&self) -> Result<i64> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM pota_activations", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(count)
+    }
+
+    /// Get total count of POTA QSOs
+    pub fn get_pota_qso_count(&self) -> Result<i64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pota_qsos", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Get POTA statistics
+    pub fn get_pota_stats(&self) -> Result<PotaStats> {
+        let activations: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM pota_activations", [], |row| {
+                    row.get(0)
+                })?;
+
+        let qsos: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pota_qsos", [], |row| row.get(0))?;
+
+        let valid_activations: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pota_activations WHERE total >= 10",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let unique_parks: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT reference) FROM pota_activations",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(PotaStats {
+            activations,
+            qsos,
+            valid_activations,
+            unique_parks,
+        })
+    }
+
+    /// Get POTA last sync timestamp
+    pub fn get_pota_last_sync(&self) -> Result<Option<String>> {
+        self.get_sync_state("pota_last_sync")
+    }
+
+    /// Set POTA last sync timestamp
+    pub fn set_pota_last_sync(&self, timestamp: &str) -> Result<()> {
+        self.set_sync_state("pota_last_sync", timestamp)
+    }
+
+    /// Get comprehensive sync statistics showing downloaded/uploaded/pending counts
+    pub fn get_sync_stats(&self) -> Result<SyncStats> {
+        // Total unique QSOs (deduplicated by call, date, time HHMM, band, mode)
+        let total_unique_qsos: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT
+                    UPPER(call),
+                    qso_date,
+                    SUBSTR(time_on, 1, 4),
+                    LOWER(band),
+                    UPPER(mode)
+                FROM qsos
+            )
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Count QSOs by source (these are unique QSOs per source, not total rows)
+        let count_by_source = |source: &str| -> Result<i64> {
+            Ok(self.conn.query_row(
+                r#"
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT
+                        UPPER(call),
+                        qso_date,
+                        SUBSTR(time_on, 1, 4),
+                        LOWER(band),
+                        UPPER(mode)
+                    FROM qsos
+                    WHERE source = ?1
+                )
+                "#,
+                [source],
+                |row| row.get(0),
+            )?)
+        };
+
+        // For POTA, count directly from pota_qsos table since those may not be in the main qsos table
+        let pota_downloaded: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM pota_qsos", [], |row| row.get(0))?;
+
+        // For LoFi, count directly from lofi_qsos table
+        let lofi_downloaded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lofi_qsos WHERE deleted = 0",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let downloaded = SourceCounts {
+            local: count_by_source(qso_source::LOCAL)?,
+            qrz: count_by_source(qso_source::QRZ)?,
+            lofi: lofi_downloaded,
+            pota: pota_downloaded,
+            wavelog: count_by_source(qso_source::WAVELOG)?,
+            lotw: count_by_source(qso_source::LOTW)?,
+        };
+
+        // Uploaded to QRZ (has qrz_synced_at)
+        let uploaded_qrz: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT
+                    UPPER(call),
+                    qso_date,
+                    SUBSTR(time_on, 1, 4),
+                    LOWER(band),
+                    UPPER(mode)
+                FROM qsos
+                WHERE qrz_synced_at IS NOT NULL
+            )
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Uploaded to POTA (has pota_synced = 1)
+        let uploaded_pota: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT
+                    UPPER(call),
+                    qso_date,
+                    SUBSTR(time_on, 1, 4),
+                    LOWER(band),
+                    UPPER(mode)
+                FROM qsos
+                WHERE pota_synced = 1
+            )
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+
+        let uploaded = UploadCounts {
+            qrz: uploaded_qrz,
+            pota: uploaded_pota,
+        };
+
+        // Pending = total - uploaded
+        let pending = PendingCounts {
+            qrz: total_unique_qsos - uploaded_qrz,
+            pota: self.count_pending_pota_qsos()?,
+        };
+
+        Ok(SyncStats {
+            total_unique_qsos,
+            downloaded,
+            uploaded,
+            pending,
+        })
+    }
+
+    /// Count POTA QSOs that are pending upload (have my_sig=POTA but not in pota_qsos table)
+    fn count_pending_pota_qsos(&self) -> Result<i64> {
+        // Count QSOs that:
+        // 1. Have my_sig='POTA' (they're POTA activations)
+        // 2. Are NOT already in pota_qsos table (not yet on POTA.app)
+        let count: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM qsos q
+            WHERE (
+                json_extract(q.adif_record, '$.my_sig') = 'POTA'
+                OR json_extract(q.adif_record, '$.MY_SIG') = 'POTA'
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM pota_qsos p
+                WHERE UPPER(q.call) = UPPER(p.worked_callsign)
+                  AND q.qso_date = REPLACE(SUBSTR(p.qso_datetime, 1, 10), '-', '')
+                  AND SUBSTR(q.time_on, 1, 4) = REPLACE(SUBSTR(p.qso_datetime, 12, 5), ':', '')
+            )
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Check if a specific activation (park_ref + date) has QSOs already on POTA.app
+    /// Returns the count of QSOs already uploaded for this activation
+    pub fn count_pota_uploaded_qsos(&self, park_ref: &str, date: &str) -> Result<i64> {
+        // Date in qsos table is YYYYMMDD, in pota_qsos it's YYYY-MM-DD
+        let formatted_date = if date.len() == 8 && !date.contains('-') {
+            format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8])
+        } else {
+            date.to_string()
+        };
+
+        let count: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM pota_qsos
+            WHERE reference = ?1
+              AND DATE(qso_datetime) = ?2
+            "#,
+            params![park_ref, formatted_date],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Check which QSOs in an activation are already on POTA.app
+    /// Returns a set of (call, time_hhmm) pairs that are already uploaded
+    pub fn get_pota_uploaded_qso_keys(
+        &self,
+        park_ref: &str,
+        date: &str,
+    ) -> Result<std::collections::HashSet<(String, String)>> {
+        use std::collections::HashSet;
+
+        // Date in qsos table is YYYYMMDD, in pota_qsos it's YYYY-MM-DD
+        let formatted_date = if date.len() == 8 && !date.contains('-') {
+            format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8])
+        } else {
+            date.to_string()
+        };
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT UPPER(worked_callsign), REPLACE(SUBSTR(qso_datetime, 12, 5), ':', '')
+            FROM pota_qsos
+            WHERE reference = ?1
+              AND DATE(qso_datetime) = ?2
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![park_ref, formatted_date], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut keys = HashSet::new();
+        for (call, time) in rows.flatten() {
+            keys.insert((call, time));
+        }
+        Ok(keys)
+    }
+
     // === LoFi Database Operations ===
 
     /// Insert or update a LoFi operation
@@ -1177,7 +1650,7 @@ impl Database {
                 deleted = excluded.deleted,
                 synced = excluded.synced,
                 raw_json = excluded.raw_json,
-                last_updated_at = datetime('now')
+                last_updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             "#,
             params![
                 &op.uuid,
@@ -1336,7 +1809,7 @@ impl Database {
                 notes = excluded.notes,
                 deleted = excluded.deleted,
                 raw_json = excluded.raw_json,
-                last_updated_at = datetime('now')
+                last_updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             "#,
             params![
                 &qso.uuid,
@@ -1525,6 +1998,50 @@ pub struct LofiStats {
     pub operations: i64,
     pub qsos: i64,
     pub pota_operations: i64,
+}
+
+/// POTA-specific statistics
+#[derive(Debug)]
+pub struct PotaStats {
+    pub activations: i64,
+    pub qsos: i64,
+    pub valid_activations: i64,
+    pub unique_parks: i64,
+}
+
+/// Sync statistics showing downloaded/uploaded counts per integration
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SyncStats {
+    /// Total unique QSOs across all sources (deduplicated)
+    pub total_unique_qsos: i64,
+    /// QSOs downloaded from each source
+    pub downloaded: SourceCounts,
+    /// QSOs uploaded/synced to each service
+    pub uploaded: UploadCounts,
+    /// Pending uploads to each service
+    pub pending: PendingCounts,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SourceCounts {
+    pub local: i64,
+    pub qrz: i64,
+    pub lofi: i64,
+    pub pota: i64,
+    pub wavelog: i64,
+    pub lotw: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UploadCounts {
+    pub qrz: i64,
+    pub pota: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PendingCounts {
+    pub qrz: i64,
+    pub pota: i64,
 }
 
 /// Compute SHA256 hash of content

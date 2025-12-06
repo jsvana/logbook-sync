@@ -6,15 +6,21 @@ use axum::{
     Json, Router,
     extract::{Multipart, Path, State},
     http::{StatusCode, header::SET_COOKIE},
-    response::{Html, IntoResponse},
+    response::{
+        Html, IntoResponse,
+        sse::{Event, Sse},
+    },
     routing::{get, post, put},
 };
 use axum_extra::extract::CookieJar;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 
 use crate::config::SyncConfig;
@@ -26,6 +32,9 @@ use crate::qrz::QrzClient;
 use rusqlite::Connection;
 
 const SESSION_COOKIE_NAME: &str = "logbook_session";
+
+/// Type alias for SSE stream responses to reduce type complexity
+type SseStream = Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>;
 
 /// Shared application state
 #[derive(Clone)]
@@ -481,6 +490,31 @@ async fn get_stats(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
     }
 }
 
+async fn get_sync_stats(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    use crate::db::SyncStats;
+
+    // Require authentication
+    if get_current_user(&jar, &state).is_none() {
+        return (StatusCode::UNAUTHORIZED, Json(None::<SyncStats>));
+    }
+
+    let db = match Database::open(&state.db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Failed to open database for sync stats: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(None::<SyncStats>));
+        }
+    };
+
+    match db.get_sync_stats() {
+        Ok(stats) => (StatusCode::OK, Json(Some(stats))),
+        Err(e) => {
+            tracing::error!("Failed to get sync stats: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(None::<SyncStats>))
+        }
+    }
+}
+
 async fn get_recent_qsos(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
     // Require authentication
     if get_current_user(&jar, &state).is_none() {
@@ -626,21 +660,36 @@ async fn list_integrations(State(state): State<AppState>, jar: CookieJar) -> imp
 
                     let sync_interval_secs = state.sync_config.interval_for(&i.integration_type);
 
-                    // Get integration-specific stats (e.g., LoFi synced counts)
-                    let stats = if i.integration_type == "lofi" {
-                        if let Ok(db) = Database::open(&state.db_path) {
-                            db.get_lofi_stats().ok().map(|s| {
-                                serde_json::json!({
-                                    "operations": s.operations,
-                                    "qsos": s.qsos,
-                                    "pota_operations": s.pota_operations
+                    // Get integration-specific stats (e.g., LoFi synced counts, POTA stats)
+                    let stats = match i.integration_type.as_str() {
+                        "lofi" => {
+                            if let Ok(db) = Database::open(&state.db_path) {
+                                db.get_lofi_stats().ok().map(|s| {
+                                    serde_json::json!({
+                                        "operations": s.operations,
+                                        "qsos": s.qsos,
+                                        "pota_operations": s.pota_operations
+                                    })
                                 })
-                            })
-                        } else {
-                            None
+                            } else {
+                                None
+                            }
                         }
-                    } else {
-                        None
+                        "pota" => {
+                            if let Ok(db) = Database::open(&state.db_path) {
+                                db.get_pota_stats().ok().map(|s| {
+                                    serde_json::json!({
+                                        "activations": s.activations,
+                                        "qsos": s.qsos,
+                                        "valid_activations": s.valid_activations,
+                                        "unique_parks": s.unique_parks
+                                    })
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
                     };
 
                     IntegrationInfo {
@@ -941,6 +990,14 @@ async fn test_qrz_connection(
 async fn test_ntfy_connection(
     config: &integrations::NtfyIntegrationConfig,
 ) -> (StatusCode, Json<SuccessResponse>) {
+    tracing::info!(
+        server = %config.server,
+        topic = %config.topic,
+        has_token = config.token.is_some(),
+        priority = config.priority,
+        "Testing ntfy connection"
+    );
+
     if config.topic.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -985,7 +1042,7 @@ async fn test_ntfy_connection(
 async fn test_pota_connection(
     config: &integrations::PotaIntegrationConfig,
 ) -> (StatusCode, Json<SuccessResponse>) {
-    use pota_adif_upload::PotaClient;
+    use crate::pota::browser::authenticate_via_browser;
 
     if config.email.is_empty() {
         return (
@@ -1007,20 +1064,40 @@ async fn test_pota_connection(
         );
     }
 
-    // Try to authenticate with POTA - successful auth is sufficient to verify credentials
-    match PotaClient::authenticate(&config.email, &config.password).await {
-        Ok(_client) => (
-            StatusCode::OK,
-            Json(SuccessResponse {
-                success: true,
-                message: Some("Authentication successful!".into()),
-            }),
-        ),
-        Err(e) => (
+    // Try to authenticate with POTA via headless browser
+    // Run in a blocking task since the browser operations are synchronous
+    let email = config.email.clone();
+    let password = config.password.clone();
+
+    match tokio::task::spawn_blocking(move || authenticate_via_browser(&email, &password, true))
+        .await
+    {
+        Ok(Ok(tokens)) => {
+            let msg = if let Some(callsign) = tokens.callsign {
+                format!("Authentication successful! Logged in as {}", callsign)
+            } else {
+                "Authentication successful!".into()
+            };
+            (
+                StatusCode::OK,
+                Json(SuccessResponse {
+                    success: true,
+                    message: Some(msg),
+                }),
+            )
+        }
+        Ok(Err(e)) => (
             StatusCode::OK,
             Json(SuccessResponse {
                 success: false,
                 message: Some(format!("Authentication failed: {}", e)),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SuccessResponse {
+                success: false,
+                message: Some(format!("Internal error: {}", e)),
             }),
         ),
     }
@@ -1132,6 +1209,7 @@ async fn lofi_setup(
         client_secret,
         bearer_token: Some(bearer_token),
         account_uuid: Some(registration.account.uuid),
+        callsign: Some(req.callsign.clone()),
         device_linked: false,
         sync_batch_size: 50,
         sync_loop_delay_ms: 10000,
@@ -2237,6 +2315,10 @@ pub struct PotaActivationInfo {
     pub qso_count: usize,
     pub is_valid: bool,
     pub qsos: Vec<PotaQsoInfo>,
+    /// Number of QSOs already uploaded to POTA.app
+    pub uploaded_qso_count: usize,
+    /// True if all QSOs are already on POTA.app
+    pub fully_uploaded: bool,
 }
 
 /// Brief info about a QSO in a POTA activation
@@ -2246,6 +2328,8 @@ pub struct PotaQsoInfo {
     pub time: String,
     pub band: String,
     pub mode: String,
+    /// True if this specific QSO is already on POTA.app
+    pub already_uploaded: bool,
 }
 
 /// Request for POTA upload (can specify which activations to upload)
@@ -2257,7 +2341,7 @@ pub struct PotaUploadRequest {
 }
 
 /// Response for POTA upload
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PotaUploadResponse {
     pub success: bool,
     pub message: String,
@@ -2320,46 +2404,61 @@ async fn pota_preview(State(state): State<AppState>, jar: CookieJar) -> impl Int
     // Generate preview
     let preview = crate::pota::preview_upload(&qsos);
 
+    // Helper to convert activation with upload status
+    let convert_activation =
+        |a: &crate::pota::PotaActivation, is_valid: bool| -> PotaActivationInfo {
+            // Get which QSOs are already uploaded for this activation
+            let uploaded_keys = db
+                .get_pota_uploaded_qso_keys(&a.park_ref, &a.date)
+                .unwrap_or_default();
+
+            let qsos_with_status: Vec<PotaQsoInfo> = a
+                .qsos
+                .iter()
+                .map(|q| {
+                    let key = (
+                        q.call.to_uppercase(),
+                        q.time_on[..4.min(q.time_on.len())].to_string(),
+                    );
+                    let already_uploaded = uploaded_keys.contains(&key);
+                    PotaQsoInfo {
+                        call: q.call.clone(),
+                        time: q.time_on.clone(),
+                        band: q.band.clone(),
+                        mode: q.mode.clone(),
+                        already_uploaded,
+                    }
+                })
+                .collect();
+
+            let uploaded_qso_count = qsos_with_status
+                .iter()
+                .filter(|q| q.already_uploaded)
+                .count();
+            let fully_uploaded =
+                uploaded_qso_count == qsos_with_status.len() && !qsos_with_status.is_empty();
+
+            PotaActivationInfo {
+                park_ref: a.park_ref.clone(),
+                date: a.date.clone(),
+                qso_count: a.qsos.len(),
+                is_valid,
+                qsos: qsos_with_status,
+                uploaded_qso_count,
+                fully_uploaded,
+            }
+        };
+
     let valid_activations: Vec<PotaActivationInfo> = preview
         .valid_activations
         .iter()
-        .map(|a| PotaActivationInfo {
-            park_ref: a.park_ref.clone(),
-            date: a.date.clone(),
-            qso_count: a.qsos.len(),
-            is_valid: true,
-            qsos: a
-                .qsos
-                .iter()
-                .map(|q| PotaQsoInfo {
-                    call: q.call.clone(),
-                    time: q.time_on.clone(),
-                    band: q.band.clone(),
-                    mode: q.mode.clone(),
-                })
-                .collect(),
-        })
+        .map(|a| convert_activation(a, true))
         .collect();
 
     let invalid_activations: Vec<PotaActivationInfo> = preview
         .invalid_activations
         .iter()
-        .map(|a| PotaActivationInfo {
-            park_ref: a.park_ref.clone(),
-            date: a.date.clone(),
-            qso_count: a.qsos.len(),
-            is_valid: false,
-            qsos: a
-                .qsos
-                .iter()
-                .map(|q| PotaQsoInfo {
-                    call: q.call.clone(),
-                    time: q.time_on.clone(),
-                    band: q.band.clone(),
-                    mode: q.mode.clone(),
-                })
-                .collect(),
-        })
+        .map(|a| convert_activation(a, false))
         .collect();
 
     (
@@ -2605,6 +2704,231 @@ async fn pota_upload(
     )
 }
 
+/// SSE event for POTA upload progress
+#[derive(Debug, Clone, Serialize)]
+struct PotaProgressEvent {
+    step: String,
+    detail: Option<String>,
+    is_error: bool,
+    /// Final result when upload completes
+    result: Option<PotaUploadResponse>,
+}
+
+/// Helper to create an error SSE stream
+fn pota_error_stream(step: &str, detail: &str) -> SseStream {
+    let event = PotaProgressEvent {
+        step: step.to_string(),
+        detail: Some(detail.to_string()),
+        is_error: true,
+        result: None,
+    };
+    let data = serde_json::to_string(&event).unwrap();
+    Sse::new(Box::pin(futures::stream::once(async move {
+        Ok::<_, Infallible>(Event::default().data(data))
+    })))
+}
+
+/// Upload POTA activations with SSE progress updates
+async fn pota_upload_sse(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(req): Json<PotaUploadRequest>,
+) -> SseStream {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return pota_error_stream("Error", "Unauthorized");
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            return pota_error_stream("Error", "Internal error");
+        }
+    };
+
+    // Get POTA integration config
+    let pota_config = match integrations::get_integration(
+        &conn,
+        &state.master_key,
+        user.id,
+        &user_salt,
+        "pota",
+    ) {
+        Ok(Some(i)) => match i.config {
+            integrations::IntegrationConfig::Pota(c) => c,
+            _ => {
+                return pota_error_stream("Error", "Invalid integration type");
+            }
+        },
+        _ => {
+            return pota_error_stream("Error", "POTA integration not configured");
+        }
+    };
+
+    // Get all QSOs
+    let db = match Database::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return pota_error_stream("Error", &format!("Database error: {}", e));
+        }
+    };
+
+    let qsos = match db.get_all_qsos() {
+        Ok(q) => q,
+        Err(e) => {
+            return pota_error_stream("Error", &format!("Failed to get QSOs: {}", e));
+        }
+    };
+
+    // Group into activations
+    let (all_activations, _skipped) = crate::pota::group_pota_activations(&qsos);
+
+    // Filter by requested activation keys
+    let activations_to_upload: Vec<_> = all_activations
+        .into_iter()
+        .filter(|a| {
+            if let Some(ref requested) = req.activations {
+                let key = format!("{}:{}", a.park_ref, a.date);
+                requested.contains(&key)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    // Create channel for progress updates
+    let (tx, mut rx) = mpsc::channel::<crate::pota::BrowserProgress>(32);
+
+    // Create progress callback
+    let progress_callback: crate::pota::ProgressCallback = Arc::new(move |progress| {
+        let _ = tx.try_send(progress);
+    });
+
+    // Spawn upload task
+    let email = pota_config.email.clone();
+    let password = pota_config.password.clone();
+    let user_id = user.id;
+    let db_path = state.db_path.clone();
+
+    let mut upload_handle = tokio::spawn(async move {
+        crate::pota::upload_to_pota_with_progress(
+            &email,
+            &password,
+            &activations_to_upload,
+            Some(progress_callback),
+        )
+        .await
+    });
+
+    // Create SSE stream
+    let stream = async_stream::stream! {
+        // Send initial event
+        yield Ok::<_, Infallible>(Event::default().data(
+            serde_json::to_string(&PotaProgressEvent {
+                step: "Starting upload".to_string(),
+                detail: None,
+                is_error: false,
+                result: None,
+            }).unwrap()
+        ));
+
+        // Forward progress updates
+        loop {
+            tokio::select! {
+                Some(progress) = rx.recv() => {
+                    yield Ok::<_, Infallible>(Event::default().data(
+                        serde_json::to_string(&PotaProgressEvent {
+                            step: progress.step,
+                            detail: progress.detail,
+                            is_error: progress.is_error,
+                            result: None,
+                        }).unwrap()
+                    ));
+                }
+                result = &mut upload_handle => {
+                    // Upload completed
+                    match result {
+                        Ok(Ok(upload_result)) => {
+                            // Record sync result
+                            if let Ok(user_conn) = Connection::open(&db_path) {
+                                if upload_result.errors.is_empty() {
+                                    let _ = integrations::record_sync_success(
+                                        &user_conn,
+                                        user_id,
+                                        "pota",
+                                        "upload",
+                                        upload_result.qsos_uploaded as i64,
+                                        Some(&format!("Uploaded {} activations", upload_result.activations_uploaded)),
+                                    );
+                                } else {
+                                    let _ = integrations::record_sync_error(
+                                        &user_conn,
+                                        user_id,
+                                        "pota",
+                                        "upload",
+                                        &upload_result.errors.join("; "),
+                                    );
+                                }
+                            }
+
+                            let message = format!(
+                                "Uploaded {} activations ({} QSOs){}",
+                                upload_result.activations_uploaded,
+                                upload_result.qsos_uploaded,
+                                if upload_result.errors.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" with {} errors", upload_result.errors.len())
+                                }
+                            );
+
+                            yield Ok::<_, Infallible>(Event::default().data(
+                                serde_json::to_string(&PotaProgressEvent {
+                                    step: "Complete".to_string(),
+                                    detail: Some(message.clone()),
+                                    is_error: false,
+                                    result: Some(PotaUploadResponse {
+                                        success: upload_result.errors.is_empty(),
+                                        message,
+                                        activations_uploaded: upload_result.activations_uploaded,
+                                        qsos_uploaded: upload_result.qsos_uploaded,
+                                        errors: upload_result.errors,
+                                    }),
+                                }).unwrap()
+                            ));
+                        }
+                        Ok(Err(e)) => {
+                            yield Ok::<_, Infallible>(Event::default().data(
+                                serde_json::to_string(&PotaProgressEvent {
+                                    step: "Error".to_string(),
+                                    detail: Some(e.to_string()),
+                                    is_error: true,
+                                    result: None,
+                                }).unwrap()
+                            ));
+                        }
+                        Err(e) => {
+                            yield Ok::<_, Infallible>(Event::default().data(
+                                serde_json::to_string(&PotaProgressEvent {
+                                    step: "Error".to_string(),
+                                    detail: Some(format!("Task failed: {}", e)),
+                                    is_error: true,
+                                    result: None,
+                                }).unwrap()
+                            ));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    };
+
+    Sse::new(Box::pin(stream))
+}
+
 #[derive(Debug, Serialize)]
 pub struct PotaJobsResponse {
     pub success: bool,
@@ -2705,6 +3029,358 @@ async fn pota_jobs(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
             }),
         ),
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct PotaDownloadResponse {
+    pub success: bool,
+    pub activations_synced: i64,
+    pub qsos_synced: i64,
+    pub new_activations: i64,
+    pub new_qsos: i64,
+    pub message: Option<String>,
+}
+
+/// Download POTA activations and QSOs from POTA.app using SSE for progress
+async fn pota_download_sse(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let (user, conn) = match get_current_user_full(&jar, &state) {
+        Some(u) => u,
+        None => {
+            let event = Event::default().event("error").data("Unauthorized");
+            let stream = futures::stream::once(async { Ok::<_, Infallible>(event) });
+            return Sse::new(Box::pin(stream)
+                as std::pin::Pin<
+                    Box<dyn Stream<Item = Result<Event, Infallible>> + Send>,
+                >);
+        }
+    };
+
+    let user_salt = match users::get_user_encryption_salt(&user) {
+        Ok(s) => s,
+        Err(_) => {
+            let event = Event::default()
+                .event("error")
+                .data("Internal error: could not get user salt");
+            let stream = futures::stream::once(async { Ok::<_, Infallible>(event) });
+            return Sse::new(Box::pin(stream)
+                as std::pin::Pin<
+                    Box<dyn Stream<Item = Result<Event, Infallible>> + Send>,
+                >);
+        }
+    };
+
+    // Get POTA integration config
+    let integration = match integrations::get_integration(
+        &conn,
+        &state.master_key,
+        user.id,
+        &user_salt,
+        "pota",
+    ) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            let event = Event::default()
+                .event("error")
+                .data("POTA integration not configured");
+            let stream = futures::stream::once(async { Ok::<_, Infallible>(event) });
+            return Sse::new(Box::pin(stream)
+                as std::pin::Pin<
+                    Box<dyn Stream<Item = Result<Event, Infallible>> + Send>,
+                >);
+        }
+        Err(e) => {
+            let event = Event::default()
+                .event("error")
+                .data(format!("Failed to get POTA config: {}", e));
+            let stream = futures::stream::once(async { Ok::<_, Infallible>(event) });
+            return Sse::new(Box::pin(stream)
+                as std::pin::Pin<
+                    Box<dyn Stream<Item = Result<Event, Infallible>> + Send>,
+                >);
+        }
+    };
+
+    let pota_config = match integration.config {
+        integrations::IntegrationConfig::Pota(c) => c,
+        _ => {
+            let event = Event::default()
+                .event("error")
+                .data("Invalid integration type");
+            let stream = futures::stream::once(async { Ok::<_, Infallible>(event) });
+            return Sse::new(Box::pin(stream)
+                as std::pin::Pin<
+                    Box<dyn Stream<Item = Result<Event, Infallible>> + Send>,
+                >);
+        }
+    };
+
+    let db_path = state.db_path.clone();
+
+    // Create an mpsc channel for progress updates
+    let (tx, rx) = mpsc::channel::<Event>(32);
+
+    // Spawn the sync task
+    let email = pota_config.email.clone();
+    let password = pota_config.password.clone();
+    tokio::spawn(async move {
+        let _ = perform_pota_download(&db_path, &email, &password, tx).await;
+    });
+
+    // Convert the receiver to a stream
+    let stream = async_stream::stream! {
+        let mut rx = rx;
+        while let Some(event) = rx.recv().await {
+            yield Ok::<_, Infallible>(event);
+        }
+    };
+
+    Sse::new(Box::pin(stream)
+        as std::pin::Pin<
+            Box<dyn Stream<Item = Result<Event, Infallible>> + Send>,
+        >)
+}
+
+/// Perform the POTA download operation with progress updates
+async fn perform_pota_download(
+    db_path: &std::path::Path,
+    email: &str,
+    password: &str,
+    tx: mpsc::Sender<Event>,
+) -> anyhow::Result<()> {
+    use crate::db::Database;
+    use crate::pota::PotaUploader;
+    use std::fs;
+
+    // Helper to send progress
+    let send_progress = |tx: &mpsc::Sender<Event>, step: &str, detail: Option<&str>| {
+        let msg = if let Some(d) = detail {
+            serde_json::json!({ "step": step, "detail": d })
+        } else {
+            serde_json::json!({ "step": step })
+        };
+        let event = Event::default().event("progress").data(msg.to_string());
+        let _ = tx.try_send(event);
+    };
+
+    send_progress(&tx, "Initializing", Some("Setting up POTA connection"));
+
+    // Create cache directory and uploader
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("logbook-sync");
+    fs::create_dir_all(&cache_dir).ok();
+    let cache_path = cache_dir.join("pota_tokens.json");
+
+    let mut uploader = PotaUploader::new(
+        email.to_string(),
+        password.to_string(),
+        cache_path,
+        true, // headless mode
+    );
+
+    send_progress(&tx, "Authenticating", Some("Logging into POTA.app"));
+
+    // Get activations
+    let activations = match uploader.get_activations().await {
+        Ok(a) => a,
+        Err(e) => {
+            let event = Event::default()
+                .event("error")
+                .data(format!("Failed to fetch activations: {}", e));
+            let _ = tx.send(event).await;
+            return Err(e);
+        }
+    };
+
+    send_progress(
+        &tx,
+        "Fetched activations",
+        Some(&format!("{} activations found", activations.len())),
+    );
+
+    // Open database
+    let db = match Database::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            let event = Event::default()
+                .event("error")
+                .data(format!("Failed to open database: {}", e));
+            let _ = tx.send(event).await;
+            return Err(anyhow::anyhow!("Database error: {}", e));
+        }
+    };
+
+    let mut total_activations = 0i64;
+    let mut new_activations = 0i64;
+    let mut total_qsos = 0i64;
+    let mut new_qsos = 0i64;
+
+    // Process each activation
+    for (idx, activation) in activations.iter().enumerate() {
+        send_progress(
+            &tx,
+            "Processing activation",
+            Some(&format!(
+                "{} on {} ({}/{})",
+                activation.reference,
+                activation.date,
+                idx + 1,
+                activations.len()
+            )),
+        );
+
+        // Upsert activation
+        match db.upsert_pota_activation(activation) {
+            Ok(is_new) => {
+                total_activations += 1;
+                if is_new {
+                    new_activations += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to upsert activation {} on {}: {}",
+                    activation.reference,
+                    activation.date,
+                    e
+                );
+            }
+        }
+
+        // Fetch QSOs for this activation
+        match uploader
+            .get_activation_qsos(&activation.reference, &activation.date)
+            .await
+        {
+            Ok(qsos) => {
+                for qso in qsos {
+                    match db.upsert_pota_qso(&qso) {
+                        Ok(is_new) => {
+                            total_qsos += 1;
+                            if is_new {
+                                new_qsos += 1;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to upsert POTA QSO {}: {}", qso.qso_id, e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch QSOs for {} on {}: {}",
+                    activation.reference,
+                    activation.date,
+                    e
+                );
+            }
+        }
+    }
+
+    // Update sync timestamp
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Err(e) = db.set_pota_last_sync(&now) {
+        tracing::warn!("Failed to update POTA sync timestamp: {}", e);
+    }
+
+    // Send completion event
+    let result = PotaDownloadResponse {
+        success: true,
+        activations_synced: total_activations,
+        qsos_synced: total_qsos,
+        new_activations,
+        new_qsos,
+        message: Some(format!(
+            "Synced {} activations ({} new), {} QSOs ({} new)",
+            total_activations, new_activations, total_qsos, new_qsos
+        )),
+    };
+
+    let event = Event::default()
+        .event("complete")
+        .data(serde_json::to_string(&result).unwrap_or_default());
+    let _ = tx.send(event).await;
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct PotaStatsResponse {
+    pub success: bool,
+    pub stats: Option<PotaStatsData>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PotaStatsData {
+    pub activations: i64,
+    pub qsos: i64,
+    pub valid_activations: i64,
+    pub unique_parks: i64,
+    pub last_sync: Option<String>,
+}
+
+/// Get POTA sync statistics
+async fn pota_stats(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let _user = match get_current_user(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(PotaStatsResponse {
+                    success: false,
+                    stats: None,
+                    message: Some("Unauthorized".into()),
+                }),
+            );
+        }
+    };
+
+    let db = match crate::db::Database::open(&state.db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaStatsResponse {
+                    success: false,
+                    stats: None,
+                    message: Some(format!("Database error: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let stats = match db.get_pota_stats() {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PotaStatsResponse {
+                    success: false,
+                    stats: None,
+                    message: Some(format!("Failed to get stats: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let last_sync = db.get_pota_last_sync().ok().flatten();
+
+    (
+        StatusCode::OK,
+        Json(PotaStatsResponse {
+            success: true,
+            stats: Some(PotaStatsData {
+                activations: stats.activations,
+                qsos: stats.qsos,
+                valid_activations: stats.valid_activations,
+                unique_parks: stats.unique_parks,
+                last_sync,
+            }),
+            message: None,
+        }),
+    )
 }
 
 // === User profile handlers ===
@@ -3024,6 +3700,7 @@ pub async fn build_router(
         // Health/stats
         .route("/health", get(health))
         .route("/stats", get(get_stats))
+        .route("/stats/sync", get(get_sync_stats))
         .route("/qsos/stats", get(get_stats))
         .route("/qsos/recent", get(get_recent_qsos))
         // Users
@@ -3054,7 +3731,10 @@ pub async fn build_router(
         // POTA endpoints
         .route("/sync/pota/preview", get(pota_preview))
         .route("/sync/pota/upload", post(pota_upload))
+        .route("/sync/pota/upload/stream", post(pota_upload_sse))
         .route("/sync/pota/jobs", get(pota_jobs))
+        .route("/sync/pota/download/stream", post(pota_download_sse))
+        .route("/sync/pota/stats", get(pota_stats))
         // Log upload
         .route("/logs/upload", post(upload_log));
 

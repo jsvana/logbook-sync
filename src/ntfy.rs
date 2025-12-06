@@ -16,7 +16,7 @@ pub struct NtfyConfig {
     pub server: String,
     /// The topic to publish to
     pub topic: String,
-    /// Optional authentication token
+    /// Password/token for authentication
     pub token: Option<String>,
     /// Priority level (1-5, default 3)
     #[serde(default = "default_ntfy_priority")]
@@ -68,6 +68,7 @@ impl NtfyClient {
             .header("Priority", self.config.priority.to_string())
             .header("Tags", "radio,satellite_antenna");
 
+        // Add authentication if configured
         if let Some(ref token) = self.config.token {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
@@ -116,6 +117,7 @@ impl NtfyClient {
             .header("Priority", "4")
             .header("Tags", "warning,radio");
 
+        // Add authentication if configured
         if let Some(ref token) = self.config.token {
             request = request.header("Authorization", format!("Bearer {}", token));
         }

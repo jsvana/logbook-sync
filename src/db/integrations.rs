@@ -29,6 +29,8 @@ pub struct LofiIntegrationConfig {
     pub client_secret: String,
     pub bearer_token: Option<String>,
     pub account_uuid: Option<String>,
+    /// Callsign used for registration (needed for token refresh)
+    pub callsign: Option<String>,
     pub device_linked: bool,
     #[serde(default = "default_sync_batch_size")]
     pub sync_batch_size: u32,
@@ -97,7 +99,7 @@ pub struct NtfyIntegrationConfig {
     pub server: String,
     /// The topic to publish to
     pub topic: String,
-    /// Optional authentication token
+    /// Optional authentication token/password
     pub token: Option<String>,
     /// Priority level (1-5, default 3)
     #[serde(default = "default_ntfy_priority")]
@@ -219,7 +221,7 @@ pub fn save_integration(
         ON CONFLICT(user_id, integration_type) DO UPDATE SET
             enabled = excluded.enabled,
             encrypted_config = excluded.encrypted_config,
-            updated_at = datetime('now')
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
         "#,
         params![user_id, integration_type, enabled, &encrypted],
     )
@@ -360,7 +362,7 @@ pub fn set_integration_enabled(
     conn.execute(
         r#"
         UPDATE user_integrations
-        SET enabled = ?1, updated_at = datetime('now')
+        SET enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
         WHERE user_id = ?2 AND integration_type = ?3
         "#,
         params![enabled, user_id, integration_type],
@@ -476,9 +478,9 @@ pub fn record_sync_success(
     conn.execute(
         r#"
         INSERT INTO user_sync_state (user_id, integration_type, direction, last_sync_at, last_sync_result, last_sync_message, items_synced)
-        VALUES (?1, ?2, ?3, datetime('now'), 'success', ?4, ?5)
+        VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'success', ?4, ?5)
         ON CONFLICT(user_id, integration_type, direction) DO UPDATE SET
-            last_sync_at = datetime('now'),
+            last_sync_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             last_sync_result = 'success',
             last_sync_message = excluded.last_sync_message,
             items_synced = excluded.items_synced
@@ -499,9 +501,9 @@ pub fn record_sync_error(
     conn.execute(
         r#"
         INSERT INTO user_sync_state (user_id, integration_type, direction, last_sync_at, last_sync_result, last_sync_message, items_synced)
-        VALUES (?1, ?2, ?3, datetime('now'), 'error', ?4, 0)
+        VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'error', ?4, 0)
         ON CONFLICT(user_id, integration_type, direction) DO UPDATE SET
-            last_sync_at = datetime('now'),
+            last_sync_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             last_sync_result = 'error',
             last_sync_message = excluded.last_sync_message,
             items_synced = 0
@@ -566,4 +568,29 @@ pub fn get_all_sync_states(conn: &Connection, user_id: i64) -> Result<Vec<SyncSt
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(states)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ntfy_config_deserialization() {
+        // Test JSON that comes from frontend (with string priority)
+        let json = r#"{"type":"ntfy","server":"https://ntfy.sh","topic":"test","priority":"3","notify_on_sync":true,"notify_on_error":true}"#;
+        let result: std::result::Result<NtfyIntegrationConfig, _> = serde_json::from_str(json);
+        println!("String priority result: {:?}", result);
+
+        // Test JSON with number priority
+        let json = r#"{"type":"ntfy","server":"https://ntfy.sh","topic":"test","priority":3,"notify_on_sync":true,"notify_on_error":true}"#;
+        let result: std::result::Result<NtfyIntegrationConfig, _> = serde_json::from_str(json);
+        println!("Number priority result: {:?}", result);
+        assert!(result.is_ok());
+
+        // Test without priority (should use default)
+        let json = r#"{"server":"https://ntfy.sh","topic":"test"}"#;
+        let result: std::result::Result<NtfyIntegrationConfig, _> = serde_json::from_str(json);
+        println!("No priority result: {:?}", result);
+        assert!(result.is_ok());
+    }
 }
