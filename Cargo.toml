@@ -1,6 +1,6 @@
 [package]
 name = "logbook-sync"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2024"
 description = "ADIF log synchronization daemon for amateur radio"
 authors = ["jsvana"]
@@ -47,7 +47,7 @@ thiserror = "1"
 anyhow = "1"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Hashing for file checksums and HMAC
 sha2 = "0.10"

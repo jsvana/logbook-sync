@@ -64,6 +64,10 @@ enum Commands {
         /// Make this user an admin
         #[arg(long)]
         admin: bool,
+
+        /// Password (if not provided, will prompt interactively)
+        #[arg(long, env = "LOGBOOK_SYNC_PASSWORD")]
+        password: Option<String>,
     },
 
     /// Remove a user
@@ -167,7 +171,8 @@ async fn main() -> Result<()> {
             email,
             callsign,
             admin,
-        } => run_user_add(&config, username, email, callsign, admin),
+            password,
+        } => run_user_add(&config, username, email, callsign, admin, password),
         Commands::UserRemove { username, force } => run_user_remove(&config, &username, force),
         Commands::UserList { format } => run_user_list(&config, &format),
         Commands::UserResetPw { username } => run_user_reset_pw(&config, &username),
@@ -306,19 +311,28 @@ fn run_user_add(
     email: Option<String>,
     callsign: Option<String>,
     admin: bool,
+    password_arg: Option<String>,
 ) -> Result<()> {
     use rusqlite::Connection;
 
-    let password = rpassword::prompt_password("Enter password: ")?;
-    let confirm = rpassword::prompt_password("Confirm password: ")?;
+    let password = if let Some(pw) = password_arg {
+        if pw.len() < 12 {
+            anyhow::bail!("Password must be at least 12 characters");
+        }
+        pw
+    } else {
+        let password = rpassword::prompt_password("Enter password: ")?;
+        let confirm = rpassword::prompt_password("Confirm password: ")?;
 
-    if password != confirm {
-        anyhow::bail!("Passwords do not match");
-    }
+        if password != confirm {
+            anyhow::bail!("Passwords do not match");
+        }
 
-    if password.len() < 12 {
-        anyhow::bail!("Password must be at least 12 characters");
-    }
+        if password.len() < 12 {
+            anyhow::bail!("Password must be at least 12 characters");
+        }
+        password
+    };
 
     let conn = Connection::open(&config.database.path)?;
 
