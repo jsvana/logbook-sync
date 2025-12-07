@@ -138,6 +138,20 @@ lazy_static! {
         &["service", "operation"]
     ).expect("metric can be created");
 
+    // In-flight sync operations
+    pub static ref SYNC_IN_FLIGHT: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("logbook_sync_in_flight", "Number of sync operations currently in progress")
+            .namespace("logbook_sync"),
+        &["service", "direction"]
+    ).expect("metric can be created");
+
+    // Sync operation totals
+    pub static ref SYNC_OPERATIONS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("logbook_sync_operations_total", "Total number of sync operations by result")
+            .namespace("logbook_sync"),
+        &["service", "direction", "result"]
+    ).expect("metric can be created");
+
     // Process metrics
     pub static ref PROCESS_START_TIME: Gauge = Gauge::new(
         "logbook_sync_process_start_time_seconds",
@@ -216,6 +230,12 @@ pub fn register_metrics() {
             .expect("collector can be registered");
         REGISTRY
             .register(Box::new(RETRIES_TOTAL.clone()))
+            .expect("collector can be registered");
+        REGISTRY
+            .register(Box::new(SYNC_IN_FLIGHT.clone()))
+            .expect("collector can be registered");
+        REGISTRY
+            .register(Box::new(SYNC_OPERATIONS_TOTAL.clone()))
             .expect("collector can be registered");
         REGISTRY
             .register(Box::new(PROCESS_START_TIME.clone()))
@@ -359,6 +379,27 @@ pub fn record_circuit_breaker_trip(service: &str) {
 /// Record a retry
 pub fn record_retry(service: &str, operation: &str) {
     RETRIES_TOTAL.with_label_values(&[service, operation]).inc();
+}
+
+/// Increment in-flight sync operations
+pub fn inc_sync_in_flight(service: &str, direction: &str) {
+    SYNC_IN_FLIGHT
+        .with_label_values(&[service, direction])
+        .inc();
+}
+
+/// Decrement in-flight sync operations
+pub fn dec_sync_in_flight(service: &str, direction: &str) {
+    SYNC_IN_FLIGHT
+        .with_label_values(&[service, direction])
+        .dec();
+}
+
+/// Increment sync operations counter
+pub fn inc_sync_operations(service: &str, direction: &str, result: &str) {
+    SYNC_OPERATIONS_TOTAL
+        .with_label_values(&[service, direction, result])
+        .inc();
 }
 
 /// Get metrics in Prometheus text format

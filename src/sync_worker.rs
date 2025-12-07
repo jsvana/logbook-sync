@@ -621,6 +621,8 @@ async fn run_sync_task(
     state: &Arc<SyncWorkerState>,
     task: &PendingSyncTask,
 ) -> crate::Result<SyncTaskResult> {
+    use crate::metrics;
+
     info!(
         user_id = task.user_id,
         integration = %task.integration_type,
@@ -628,7 +630,11 @@ async fn run_sync_task(
         "Running background sync"
     );
 
-    match (
+    // Track in-flight operations
+    metrics::inc_sync_in_flight(&task.integration_type, &task.direction);
+    let start = std::time::Instant::now();
+
+    let result = match (
         &task.integration_type[..],
         &task.direction[..],
         &task.config,
@@ -656,6 +662,53 @@ async fn run_sync_task(
             );
             Ok(SyncTaskResult::default())
         }
+    };
+
+    // Record metrics
+    let duration_secs = start.elapsed().as_secs_f64();
+    metrics::dec_sync_in_flight(&task.integration_type, &task.direction);
+    metrics::record_sync_duration(&task.integration_type, &task.direction, duration_secs);
+
+    match &result {
+        Ok(task_result) => {
+            metrics::record_sync_success(&task.integration_type);
+            metrics::inc_sync_operations(&task.integration_type, &task.direction, "success");
+
+            // Record QSO counts
+            if task_result.new_downloads > 0 {
+                metrics::record_qso_downloaded(
+                    &task.integration_type,
+                    task_result.new_downloads as u64,
+                );
+            }
+            if task_result.uploads > 0 {
+                metrics::record_qso_uploaded(&task.integration_type);
+                // If multiple uploaded, record them
+                for _ in 1..task_result.uploads {
+                    metrics::record_qso_uploaded(&task.integration_type);
+                }
+            }
+        }
+        Err(e) => {
+            let error_type = categorize_error(e);
+            metrics::record_sync_error(&task.integration_type, &error_type);
+            metrics::inc_sync_operations(&task.integration_type, &task.direction, "failure");
+        }
+    }
+
+    result
+}
+
+/// Categorize an error for metrics purposes
+fn categorize_error(error: &crate::Error) -> String {
+    match error {
+        crate::Error::LofiAuthError => "auth".to_string(),
+        crate::Error::Lofi(msg) if msg.contains("404") => "not_found".to_string(),
+        crate::Error::Lofi(_) => "api".to_string(),
+        crate::Error::Http(_) => "http".to_string(),
+        crate::Error::Database(_) => "database".to_string(),
+        crate::Error::Io(_) => "io".to_string(),
+        _ => "other".to_string(),
     }
 }
 
