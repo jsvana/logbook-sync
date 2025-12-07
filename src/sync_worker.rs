@@ -927,9 +927,34 @@ async fn run_qrz_upload(
     user_id: i64,
     config: &integrations::QrzIntegrationConfig,
 ) -> crate::Result<SyncTaskResult> {
+    use crate::db::users;
+
     if !config.upload_enabled {
         return Ok(SyncTaskResult::default());
     }
+
+    // Get the user's callsign to filter QSOs
+    let user_callsign = {
+        let db = Database::open(db_path)?;
+        match users::get_user_by_id(db.conn(), user_id)? {
+            Some(user) => user.callsign,
+            None => {
+                warn!(user_id = user_id, "User not found for QRZ upload");
+                return Ok(SyncTaskResult::default());
+            }
+        }
+    };
+
+    let user_callsign = match user_callsign {
+        Some(c) => c.to_uppercase(),
+        None => {
+            warn!(
+                user_id = user_id,
+                "User has no callsign configured, skipping QRZ upload"
+            );
+            return Ok(SyncTaskResult::default());
+        }
+    };
 
     let client = QrzClient::new(config.api_key.clone(), config.user_agent.clone());
 
@@ -938,6 +963,21 @@ async fn run_qrz_upload(
         let db = Database::open(db_path)?;
         db.get_unsynced_qrz()?
     };
+
+    // Filter to only QSOs that belong to this user (by station_callsign)
+    let unsynced: Vec<_> = unsynced
+        .into_iter()
+        .filter(|stored_qso| {
+            if let Ok(qso) = serde_json::from_str::<crate::adif::Qso>(&stored_qso.adif_record) {
+                qso.station_callsign
+                    .as_ref()
+                    .map(|c| c.to_uppercase() == user_callsign)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        })
+        .collect();
 
     if unsynced.is_empty() {
         let db = Database::open(db_path)?;
@@ -951,6 +991,13 @@ async fn run_qrz_upload(
         )?;
         return Ok(SyncTaskResult::default());
     }
+
+    info!(
+        user_id = user_id,
+        callsign = %user_callsign,
+        count = unsynced.len(),
+        "Uploading QSOs to QRZ"
+    );
 
     let mut uploaded = 0i64;
     let mut errors = 0;

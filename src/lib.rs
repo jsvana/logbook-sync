@@ -8,6 +8,7 @@ pub mod error;
 pub mod hrdlog;
 pub mod lofi;
 pub mod lotw;
+pub mod metrics;
 pub mod ntfy;
 pub mod pota;
 pub mod qrz;

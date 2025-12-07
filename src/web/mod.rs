@@ -597,6 +597,27 @@ async fn health() -> impl IntoResponse {
     )
 }
 
+/// Root-level health endpoint for monitoring
+async fn health_root() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "healthy",
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
+}
+
+/// Root-level metrics endpoint for Prometheus
+async fn metrics_root() -> impl IntoResponse {
+    let metrics = crate::metrics::gather_metrics();
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=utf-8")],
+        metrics,
+    )
+}
+
 // === Integration handlers ===
 
 async fn list_integrations(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
@@ -3742,6 +3763,9 @@ pub async fn build_router(
     let static_service = ServeDir::new("static").fallback(get(index));
 
     Router::new()
+        // Root-level health and metrics endpoints (not behind /api)
+        .route("/health", get(health_root))
+        .route("/metrics", get(metrics_root))
         .nest("/api", api_routes)
         .fallback_service(static_service)
         .with_state(state)
