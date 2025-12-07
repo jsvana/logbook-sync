@@ -363,6 +363,9 @@ pub fn record_retry(service: &str, operation: &str) {
 
 /// Get metrics in Prometheus text format
 pub fn gather_metrics() -> String {
+    // Ensure metrics are registered
+    register_metrics();
+
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
     let metric_families = REGISTRY.gather();
