@@ -14,7 +14,9 @@
       "Bash(ls:*)",
       "Bash(git commit:*)",
       "Bash(git push)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(gh run:*)",
+      "Bash(gh release:*)"
     ],
     "deny": [],
     "ask": []
