@@ -93,9 +93,16 @@ base64 = "0.22"
 # Time handling for sessions
 time = "0.3"
 
-# Headless browser automation for POTA authentication
-headless_chrome = "1.0"
+# Headless browser for POTA authentication (optional, can use remote service instead)
+headless_chrome = { version = "1.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
+
+[features]
+# Enable local browser-based POTA authentication (adds ~50MB to binary)
+# When disabled, requires remote auth service for POTA
+local-browser = ["headless_chrome"]
+# Default features include local browser for backward compatibility
+default = ["local-browser"]

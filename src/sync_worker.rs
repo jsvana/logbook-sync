@@ -3,7 +3,7 @@
 //! This module provides a worker pool that periodically syncs enabled integrations
 //! for all users based on configured intervals.
 
-use crate::config::SyncConfig;
+use crate::config::{PotaAuthServiceConfig, SyncConfig};
 use crate::crypto::MasterKey;
 use crate::db::{Database, integrations, users};
 use crate::lofi::{LofiClient, LofiConfig};
@@ -50,16 +50,24 @@ pub struct SyncWorkerState {
     db_path: PathBuf,
     master_key: Arc<MasterKey>,
     sync_config: SyncConfig,
+    /// Configuration for remote POTA auth service (if any)
+    pota_auth_service: Option<PotaAuthServiceConfig>,
     /// Track when each (user_id, integration, direction) was last synced
     last_sync_times: RwLock<HashMap<(i64, String, String), DateTime<Utc>>>,
 }
 
 impl SyncWorkerState {
-    pub fn new(db_path: PathBuf, master_key: Arc<MasterKey>, sync_config: SyncConfig) -> Self {
+    pub fn new(
+        db_path: PathBuf,
+        master_key: Arc<MasterKey>,
+        sync_config: SyncConfig,
+        pota_auth_service: Option<PotaAuthServiceConfig>,
+    ) -> Self {
         Self {
             db_path,
             master_key,
             sync_config,
+            pota_auth_service,
             last_sync_times: RwLock::new(HashMap::new()),
         }
     }
@@ -121,6 +129,7 @@ pub async fn start_sync_workers(
     db_path: PathBuf,
     master_key: Arc<MasterKey>,
     sync_config: SyncConfig,
+    pota_auth_service: Option<PotaAuthServiceConfig>,
 ) {
     if !sync_config.enabled {
         info!("Background sync is disabled");
@@ -131,6 +140,7 @@ pub async fn start_sync_workers(
         db_path,
         master_key,
         sync_config.clone(),
+        pota_auth_service,
     ));
 
     // Load existing sync times from database
@@ -649,10 +659,22 @@ async fn run_sync_task(
             run_qrz_download(&state.db_path, task.user_id, qrz_config).await
         }
         ("pota", "download", integrations::IntegrationConfig::Pota(pota_config)) => {
-            run_pota_download(&state.db_path, task.user_id, pota_config).await
+            run_pota_download(
+                &state.db_path,
+                task.user_id,
+                pota_config,
+                state.pota_auth_service.as_ref(),
+            )
+            .await
         }
         ("pota", "upload", integrations::IntegrationConfig::Pota(pota_config)) => {
-            run_pota_upload(&state.db_path, task.user_id, pota_config).await
+            run_pota_upload(
+                &state.db_path,
+                task.user_id,
+                pota_config,
+                state.pota_auth_service.as_ref(),
+            )
+            .await
         }
         _ => {
             debug!(
@@ -1190,7 +1212,9 @@ async fn run_pota_download(
     db_path: &Path,
     user_id: i64,
     config: &integrations::PotaIntegrationConfig,
+    auth_service_config: Option<&PotaAuthServiceConfig>,
 ) -> crate::Result<SyncTaskResult> {
+    use crate::pota::auth_service::PotaAuthServiceClient;
     use crate::pota::browser::PotaUploader;
 
     info!(user_id = user_id, "Starting POTA download sync");
@@ -1209,9 +1233,26 @@ async fn run_pota_download(
         true, // headless mode
     );
 
-    // Ensure authenticated (sync operation)
+    // Set up remote auth service client if configured
+    if let Some(auth_config) = auth_service_config {
+        match PotaAuthServiceClient::new(auth_config.clone()) {
+            Ok(client) => {
+                info!("Using remote POTA auth service at {}", auth_config.url);
+                uploader.set_auth_service_client(client);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to create POTA auth service client: {}, falling back to local browser",
+                    e
+                );
+            }
+        }
+    }
+
+    // Ensure authenticated (async operation, uses remote service if configured)
     uploader
-        .ensure_authenticated()
+        .ensure_authenticated_async()
+        .await
         .map_err(|e| crate::Error::Other(format!("POTA authentication failed: {}", e)))?;
 
     // Get activations
@@ -1313,6 +1354,7 @@ async fn run_pota_upload(
     db_path: &Path,
     user_id: i64,
     config: &integrations::PotaIntegrationConfig,
+    auth_service_config: Option<&PotaAuthServiceConfig>,
 ) -> crate::Result<SyncTaskResult> {
     info!(user_id = user_id, "Starting POTA upload sync");
 
@@ -1387,10 +1429,15 @@ async fn run_pota_upload(
     );
 
     // Upload activations
-    let result =
-        crate::pota::upload_to_pota(&config.email, &config.password, &activations_to_upload)
-            .await
-            .map_err(|e| crate::Error::Other(format!("POTA upload failed: {}", e)))?;
+    let result = crate::pota::upload_to_pota_with_auth_service(
+        &config.email,
+        &config.password,
+        &activations_to_upload,
+        auth_service_config,
+        None,
+    )
+    .await
+    .map_err(|e| crate::Error::Other(format!("POTA upload failed: {}", e)))?;
 
     // Record sync result
     {

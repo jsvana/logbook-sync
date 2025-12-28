@@ -4,8 +4,11 @@
 //! to navigate the Cognito Hosted UI, then caches the resulting JWT tokens
 //! for subsequent direct API calls.
 
-use anyhow::{Context, Result, anyhow};
+#[cfg(feature = "local-browser")]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
 use base64::Engine;
+#[cfg(feature = "local-browser")]
 use headless_chrome::{Browser, LaunchOptions};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -138,6 +141,7 @@ fn report_progress(callback: &Option<ProgressCallback>, progress: BrowserProgres
 }
 
 /// Authenticate via headless browser and extract ID token
+#[cfg(feature = "local-browser")]
 pub fn authenticate_via_browser(
     username: &str,
     password: &str,
@@ -147,6 +151,7 @@ pub fn authenticate_via_browser(
 }
 
 /// Authenticate via headless browser with progress reporting
+#[cfg(feature = "local-browser")]
 pub fn authenticate_via_browser_with_progress(
     username: &str,
     password: &str,
@@ -1016,6 +1021,7 @@ pub struct PotaUploader {
     password: String,
     headless: bool,
     progress_callback: Option<ProgressCallback>,
+    auth_service_client: Option<super::auth_service::PotaAuthServiceClient>,
 }
 
 impl PotaUploader {
@@ -1034,7 +1040,19 @@ impl PotaUploader {
             password,
             headless,
             progress_callback: None,
+            auth_service_client: None,
         }
+    }
+
+    /// Set a remote auth service client for browser-free authentication
+    pub fn with_auth_service(mut self, client: super::auth_service::PotaAuthServiceClient) -> Self {
+        self.auth_service_client = Some(client);
+        self
+    }
+
+    /// Set a remote auth service client (mutable reference version)
+    pub fn set_auth_service_client(&mut self, client: super::auth_service::PotaAuthServiceClient) {
+        self.auth_service_client = Some(client);
     }
 
     /// Set a progress callback for status updates
@@ -1055,7 +1073,8 @@ impl PotaUploader {
         }
     }
 
-    /// Ensure we have valid tokens, authenticating if necessary
+    /// Ensure we have valid tokens, authenticating if necessary (sync version, uses local browser)
+    #[cfg(feature = "local-browser")]
     pub fn ensure_authenticated(&mut self) -> Result<()> {
         if self.tokens.as_ref().is_none_or(|t| !t.is_valid()) {
             info!("POTA tokens invalid or missing, authenticating via browser");
@@ -1070,6 +1089,49 @@ impl PotaUploader {
             )?;
             save_tokens(&tokens, &self.cache_path)?;
             self.tokens = Some(tokens);
+        } else {
+            self.report(BrowserProgress::new("Using cached authentication"));
+        }
+        Ok(())
+    }
+
+    /// Ensure we have valid tokens, using remote service if configured, otherwise local browser
+    pub async fn ensure_authenticated_async(&mut self) -> Result<()> {
+        if self.tokens.as_ref().is_none_or(|t| !t.is_valid()) {
+            // Try remote auth service first if configured
+            if let Some(ref client) = self.auth_service_client {
+                info!("POTA tokens invalid or missing, authenticating via remote service");
+                self.report(BrowserProgress::new(
+                    "Cached tokens expired, authenticating via remote service",
+                ));
+                let tokens = client.authenticate(&self.username, &self.password).await?;
+                save_tokens(&tokens, &self.cache_path)?;
+                self.tokens = Some(tokens);
+            } else {
+                // Fall back to local browser (only available with local-browser feature)
+                #[cfg(feature = "local-browser")]
+                {
+                    info!("POTA tokens invalid or missing, authenticating via local browser");
+                    self.report(BrowserProgress::new(
+                        "Cached tokens expired, re-authenticating via browser",
+                    ));
+                    let tokens = authenticate_via_browser_with_progress(
+                        &self.username,
+                        &self.password,
+                        self.headless,
+                        self.progress_callback.clone(),
+                    )?;
+                    save_tokens(&tokens, &self.cache_path)?;
+                    self.tokens = Some(tokens);
+                }
+                #[cfg(not(feature = "local-browser"))]
+                {
+                    return Err(anyhow!(
+                        "POTA authentication requires either a configured remote auth service \
+                         or the 'local-browser' feature to be enabled"
+                    ));
+                }
+            }
         } else {
             self.report(BrowserProgress::new("Using cached authentication"));
         }
@@ -1102,7 +1164,7 @@ impl PotaUploader {
             "Uploading ADIF file",
             filename,
         ));
-        self.ensure_authenticated()?;
+        self.ensure_authenticated_async().await?;
         let token = self
             .id_token()
             .ok_or_else(|| anyhow!("No valid token after authentication"))?;
@@ -1189,7 +1251,7 @@ impl PotaUploader {
     /// Get recent upload jobs
     pub async fn get_jobs(&mut self) -> Result<Vec<PotaUploadJob>> {
         self.report(BrowserProgress::new("Fetching upload jobs"));
-        self.ensure_authenticated()?;
+        self.ensure_authenticated_async().await?;
         let token = self.id_token().ok_or_else(|| anyhow!("No valid token"))?;
         get_upload_jobs(token).await
     }
@@ -1197,7 +1259,7 @@ impl PotaUploader {
     /// Get all activations from POTA
     pub async fn get_activations(&mut self) -> Result<Vec<PotaRemoteActivation>> {
         self.report(BrowserProgress::new("Fetching activations from POTA"));
-        self.ensure_authenticated()?;
+        self.ensure_authenticated_async().await?;
         let token = self.id_token().ok_or_else(|| anyhow!("No valid token"))?;
         get_activations(token).await
     }
@@ -1212,7 +1274,7 @@ impl PotaUploader {
             "Fetching activation QSOs",
             format!("{} on {}", reference, date),
         ));
-        self.ensure_authenticated()?;
+        self.ensure_authenticated_async().await?;
         let token = self.id_token().ok_or_else(|| anyhow!("No valid token"))?;
         get_all_activation_qsos(token, reference, date).await
     }

@@ -1,6 +1,0 @@
-[general]
-log_level = "debug"
-
-[database]
-#path = "/home/jsvana/projects/logbook-sync/test-state.db"
-path = "/home/jsvana/projects/logbook-sync/test-state2.db"

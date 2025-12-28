@@ -3,8 +3,10 @@
 //! Groups QSOs by UTC date and park reference, generating separate
 //! ADIF files suitable for upload to pota.app.
 
+pub mod auth_service;
 pub mod browser;
 
+pub use auth_service::PotaAuthServiceClient;
 pub use browser::{
     BrowserProgress, PotaCachedTokens, PotaRemoteActivation, PotaRemoteQso, PotaUploadJob,
     PotaUploader, ProgressCallback, UploadResult, get_activation_qsos, get_activations,
@@ -702,7 +704,25 @@ pub async fn upload_to_pota(
     password: &str,
     activations: &[PotaActivation],
 ) -> Result<PotaUploadResult> {
-    upload_to_pota_with_progress(email, password, activations, None).await
+    upload_to_pota_with_auth_service(email, password, activations, None, None).await
+}
+
+/// Upload POTA activations with optional remote auth service
+pub async fn upload_to_pota_with_auth_service(
+    email: &str,
+    password: &str,
+    activations: &[PotaActivation],
+    auth_service_config: Option<&crate::config::PotaAuthServiceConfig>,
+    progress_callback: Option<ProgressCallback>,
+) -> Result<PotaUploadResult> {
+    upload_to_pota_internal(
+        email,
+        password,
+        activations,
+        auth_service_config,
+        progress_callback,
+    )
+    .await
 }
 
 /// Upload POTA activations to POTA.app with progress reporting
@@ -710,6 +730,17 @@ pub async fn upload_to_pota_with_progress(
     email: &str,
     password: &str,
     activations: &[PotaActivation],
+    progress_callback: Option<ProgressCallback>,
+) -> Result<PotaUploadResult> {
+    upload_to_pota_internal(email, password, activations, None, progress_callback).await
+}
+
+/// Internal upload implementation with optional auth service
+async fn upload_to_pota_internal(
+    email: &str,
+    password: &str,
+    activations: &[PotaActivation],
+    auth_service_config: Option<&crate::config::PotaAuthServiceConfig>,
     progress_callback: Option<ProgressCallback>,
 ) -> Result<PotaUploadResult> {
     if activations.is_empty() {
@@ -735,15 +766,32 @@ pub async fn upload_to_pota_with_progress(
         true, // headless mode
     );
 
+    // Set up remote auth service client if configured
+    if let Some(auth_config) = auth_service_config {
+        match auth_service::PotaAuthServiceClient::new(auth_config.clone()) {
+            Ok(client) => {
+                info!("Using remote POTA auth service at {}", auth_config.url);
+                uploader.set_auth_service_client(client);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to create POTA auth service client: {}, falling back to local browser",
+                    e
+                );
+            }
+        }
+    }
+
     // Set progress callback if provided
     if let Some(cb) = progress_callback {
         uploader.set_progress_callback(cb);
     }
 
     // Ensure we're authenticated before uploading
-    info!("Authenticating with POTA.app via browser...");
+    info!("Authenticating with POTA.app...");
     uploader
-        .ensure_authenticated()
+        .ensure_authenticated_async()
+        .await
         .map_err(|e| Error::Other(format!("POTA authentication failed: {}", e)))?;
 
     let mut activations_uploaded = 0;

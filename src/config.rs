@@ -14,6 +14,8 @@ pub struct Config {
     pub resilience: ResilienceConfig,
     #[serde(default)]
     pub sync: SyncConfig,
+    #[serde(default)]
+    pub pota_auth_service: PotaAuthServiceConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -214,6 +216,41 @@ fn default_hrdlog_interval() -> u64 {
 
 fn default_wavelog_interval() -> u64 {
     600 // 10 minutes
+}
+
+/// Configuration for the remote POTA authentication service
+#[derive(Debug, Deserialize, Clone)]
+pub struct PotaAuthServiceConfig {
+    /// Base URL of the auth service (e.g., "https://pota-auth.railway.app")
+    #[serde(default)]
+    pub url: String,
+    /// API key for authenticating with the service
+    #[serde(default)]
+    pub api_key: String,
+    /// Request timeout in seconds
+    #[serde(default = "default_pota_auth_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl Default for PotaAuthServiceConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            api_key: String::new(),
+            timeout_secs: default_pota_auth_timeout(),
+        }
+    }
+}
+
+impl PotaAuthServiceConfig {
+    /// Check if the config is valid and usable
+    pub fn is_configured(&self) -> bool {
+        !self.url.is_empty() && !self.api_key.is_empty()
+    }
+}
+
+fn default_pota_auth_timeout() -> u64 {
+    90
 }
 
 impl Config {

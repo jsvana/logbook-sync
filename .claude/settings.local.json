@@ -4,7 +4,17 @@
       "WebFetch(domain:lofi.ham2k.net)",
       "Bash(sqlite3:*)",
       "Bash(timeout 10 curl:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(cargo --version:*)",
+      "Bash(git init:*)",
+      "Bash(cargo test:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial commit: Playwright-based POTA authentication service\n\n- Express server with API key authentication\n- Browser pool management \\(1-2 reusable contexts\\)\n- POTA Cognito login flow replicating logbook-sync browser.rs\n- Health check endpoint\n- Railway deployment configuration \\(Dockerfile + railway.toml\\)\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(gh repo create:*)",
+      "Bash(ls:*)",
+      "Bash(git commit:*)",
+      "Bash(git push)",
+      "Bash(pkill:*)"
     ],
     "deny": [],
     "ask": []

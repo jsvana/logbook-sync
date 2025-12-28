@@ -1063,7 +1063,7 @@ async fn test_ntfy_connection(
 async fn test_pota_connection(
     config: &integrations::PotaIntegrationConfig,
 ) -> (StatusCode, Json<SuccessResponse>) {
-    use crate::pota::browser::authenticate_via_browser;
+    use crate::pota::browser::PotaUploader;
 
     if config.email.is_empty() {
         return (
@@ -1085,16 +1085,26 @@ async fn test_pota_connection(
         );
     }
 
-    // Try to authenticate with POTA via headless browser
-    // Run in a blocking task since the browser operations are synchronous
-    let email = config.email.clone();
-    let password = config.password.clone();
+    // Create temporary cache path for testing
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("logbook-sync");
+    std::fs::create_dir_all(&cache_dir).ok();
+    let cache_path = cache_dir.join("pota_tokens_test.json");
 
-    match tokio::task::spawn_blocking(move || authenticate_via_browser(&email, &password, true))
-        .await
-    {
-        Ok(Ok(tokens)) => {
-            let msg = if let Some(callsign) = tokens.callsign {
+    // Create uploader and try to authenticate
+    let mut uploader = PotaUploader::new(
+        config.email.clone(),
+        config.password.clone(),
+        cache_path,
+        true, // headless mode
+    );
+
+    // TODO: Configure auth service client here if available in server config
+
+    match uploader.ensure_authenticated_async().await {
+        Ok(()) => {
+            let msg = if let Some(callsign) = uploader.callsign() {
                 format!("Authentication successful! Logged in as {}", callsign)
             } else {
                 "Authentication successful!".into()
@@ -1107,18 +1117,11 @@ async fn test_pota_connection(
                 }),
             )
         }
-        Ok(Err(e)) => (
+        Err(e) => (
             StatusCode::OK,
             Json(SuccessResponse {
                 success: false,
                 message: Some(format!("Authentication failed: {}", e)),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SuccessResponse {
-                success: false,
-                message: Some(format!("Internal error: {}", e)),
             }),
         ),
     }

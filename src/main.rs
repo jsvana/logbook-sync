@@ -533,10 +533,21 @@ async fn run_web_server(config: Config, bind_override: Option<String>) -> Result
             config.sync.worker_threads
         );
         let master_key_arc = Arc::new(master_key.clone());
+        let pota_auth_config = if config.pota_auth_service.is_configured() {
+            println!(
+                "POTA auth service configured: {}",
+                config.pota_auth_service.url
+            );
+            Some(config.pota_auth_service.clone())
+        } else {
+            println!("POTA auth service not configured, using local browser");
+            None
+        };
         start_sync_workers(
             config.database.path.clone(),
             master_key_arc,
             config.sync.clone(),
+            pota_auth_config,
         )
         .await;
     } else {
