@@ -2097,7 +2097,7 @@ impl Database {
         park_ref: &str,
         date: &str,
         job_id: u64,
-        verified_inserted: u32,
+        verified_inserted: i32,
     ) -> Result<()> {
         self.conn.execute(
             r#"

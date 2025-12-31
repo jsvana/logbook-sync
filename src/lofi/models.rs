@@ -196,8 +196,9 @@ pub struct OperationRef {
     pub ref_type: String,
 
     /// Reference code (e.g., "US-4571", "K-1234", "W6/NC-001")
-    #[serde(rename = "ref")]
-    pub reference: String,
+    /// Optional because LoFi can return placeholder refs without a reference code
+    #[serde(rename = "ref", default)]
+    pub reference: Option<String>,
 
     /// Full name (e.g., "Juan Bautista de Anza National Historic Trail")
     #[serde(default)]
@@ -554,12 +555,18 @@ impl LofiQso {
         operation_refs
             .iter()
             .find(|r| r.ref_type == "potaActivation")
-            .map(|r| r.reference.clone())
+            .and_then(|r| r.reference.clone())
+            .filter(|s| !s.is_empty())
     }
 
     /// Convert this LoFi QSO to an ADIF Qso struct
     /// Requires operation refs to get MY_SIG_INFO (our POTA park)
-    pub fn to_qso(&self, operation_refs: &[OperationRef]) -> Option<crate::adif::Qso> {
+    /// Optionally accepts the operation's grid square for MY_GRIDSQUARE
+    pub fn to_qso(
+        &self,
+        operation_refs: &[OperationRef],
+        operation_grid: Option<&str>,
+    ) -> Option<crate::adif::Qso> {
         use std::collections::HashMap;
 
         let their_call = self.their_call()?;
@@ -650,7 +657,7 @@ impl LofiQso {
             rst_rcvd: self.rst_rcvd().map(|s| s.to_string()),
             time_off: None,
             gridsquare: self.their_grid().map(|s| s.to_string()),
-            my_gridsquare: None, // Could get from operation if needed
+            my_gridsquare: operation_grid.map(|s| s.to_string()),
             my_sig: self
                 .get_my_pota_ref_from_operation(operation_refs)
                 .map(|_| "POTA".to_string()),

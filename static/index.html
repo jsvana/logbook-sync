@@ -912,9 +912,12 @@
                     const potaOps = stats?.pota_operations || 0;
                     statsDisplay = `${qsos} QSOs · ${operations} operations${potaOps > 0 ? ` · ${potaOps} POTA` : ''}`;
                 } else if (type === 'pota') {
-                    const activations = stats?.activations || 0;
-                    const qsos = stats?.qsos || 0;
-                    statsDisplay = `${activations} activations · ${qsos} QSOs`;
+                    console.log('POTA stats received:', stats);
+                    const parks = stats?.download_parks || 0;
+                    const activations = stats?.download_activations || 0;
+                    const partial = stats?.download_partial_activations || 0;
+                    const qsos = stats?.download_qsos || 0;
+                    statsDisplay = `${parks} parks · ${activations} activations · ${partial} partial · ${qsos} QSOs`;
                 } else if (result) {
                     statsDisplay = `${itemsSynced} downloaded`;
                 }
@@ -951,13 +954,29 @@
                 // Build stats display
                 let statsDisplay = '';
                 if (type === 'pota') {
-                    const validActivations = stats?.valid_activations || 0;
-                    const uniqueParks = stats?.unique_parks || 0;
-                    statsDisplay = `${validActivations} valid · ${uniqueParks} parks`;
+                    // Uploaded stats
+                    const uploadedParks = stats?.uploaded_parks || 0;
+                    const uploadedActivations = stats?.uploaded_activations || 0;
+                    const uploadedPartial = stats?.uploaded_partial_activations || 0;
+                    const uploadedQsos = stats?.uploaded_qsos || 0;
+                    // Pending stats
+                    const pendingParks = stats?.pending_parks || 0;
+                    const pendingActivations = stats?.pending_activations || 0;
+                    const pendingPartial = stats?.pending_partial_activations || 0;
+                    const pendingQsos = stats?.pending_qsos || 0;
+
+                    let parts = [];
+                    if (uploadedQsos > 0) {
+                        parts.push(`Uploaded: ${uploadedParks} parks · ${uploadedActivations} act · ${uploadedPartial} partial · ${uploadedQsos} QSOs`);
+                    }
+                    if (pendingQsos > 0) {
+                        parts.push(`Pending: ${pendingParks} parks · ${pendingActivations} act · ${pendingPartial} partial · ${pendingQsos} QSOs`);
+                    }
+                    statsDisplay = parts.join('<br>');
                 } else if (result) {
                     statsDisplay = `${itemsSynced} uploaded`;
                 }
-                if (pendingCount > 0) {
+                if (type !== 'pota' && pendingCount > 0) {
                     statsDisplay += statsDisplay ? ` · ${pendingCount} pending` : `${pendingCount} pending`;
                 }
 

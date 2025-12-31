@@ -1034,8 +1034,10 @@ pub struct PotaJobInfo {
     pub park_name: Option<String>,
     pub submitted: String,
     pub processed: Option<String>,
-    pub total_qsos: u32,
-    pub inserted_qsos: u32,
+    /// Total QSOs in upload, can be -1 if parsing failed
+    pub total_qsos: i32,
+    /// Inserted QSOs, can be -1 if processing failed
+    pub inserted_qsos: i32,
     pub callsign: Option<String>,
 }
 
@@ -1094,7 +1096,7 @@ pub async fn get_upload_jobs(
 #[derive(Debug, Clone)]
 pub enum VerificationResult {
     /// Job completed successfully with QSOs inserted
-    Verified { job_id: u64, inserted: u32 },
+    Verified { job_id: u64, inserted: i32 },
     /// Job completed but no QSOs were inserted (rejected/duplicate)
     Rejected { job_id: u64, message: String },
     /// Job failed with an error

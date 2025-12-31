@@ -527,36 +527,44 @@ async fn run_web_server(config: Config, bind_override: Option<String>) -> Result
     println!("Database: {}", config.database.path.display());
 
     // Start background sync workers
+    // Check if POTA auth service is configured (used by both sync workers and web endpoints)
+    let pota_auth_config = if config.pota_auth_service.is_configured() {
+        println!(
+            "POTA auth service configured: {}",
+            config.pota_auth_service.url
+        );
+        Some(config.pota_auth_service.clone())
+    } else {
+        println!("POTA auth service not configured, using local browser");
+        None
+    };
+
     if config.sync.enabled {
         println!(
             "Starting background sync workers ({} threads)",
             config.sync.worker_threads
         );
         let master_key_arc = Arc::new(master_key.clone());
-        let pota_auth_config = if config.pota_auth_service.is_configured() {
-            println!(
-                "POTA auth service configured: {}",
-                config.pota_auth_service.url
-            );
-            Some(config.pota_auth_service.clone())
-        } else {
-            println!("POTA auth service not configured, using local browser");
-            None
-        };
         start_sync_workers(
             config.database.path.clone(),
             master_key_arc,
             config.sync.clone(),
-            pota_auth_config,
+            pota_auth_config.clone(),
         )
         .await;
     } else {
         println!("Background sync is disabled");
     }
 
-    web::serve(config.database.path, master_key, config.sync, &bind)
-        .await
-        .context("Web server error")?;
+    web::serve(
+        config.database.path,
+        master_key,
+        config.sync,
+        pota_auth_config,
+        &bind,
+    )
+    .await
+    .context("Web server error")?;
 
     Ok(())
 }

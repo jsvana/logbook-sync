@@ -501,14 +501,17 @@ pub fn authenticate_via_browser_with_progress(
 pub struct PotaUploadJob {
     pub job_id: u64,
     /// Status codes: 0=pending, 1=processing, 2=complete, 3+=various error/special states
-    pub status: u32,
+    /// Can be -1 in some error conditions
+    pub status: i32,
     pub submitted: String,
     pub processed: Option<String>,
     pub reference: String,
     pub park_name: Option<String>,
     pub location: Option<String>,
-    pub total: u32,
-    pub inserted: u32,
+    /// Total QSOs in upload, can be -1 if parsing failed
+    pub total: i32,
+    /// Inserted QSOs, can be -1 if processing failed
+    pub inserted: i32,
     pub callsign_used: Option<String>,
     pub user_comment: Option<String>,
     // Allow additional fields we don't use
@@ -976,8 +979,27 @@ pub async fn get_upload_jobs(token: &str) -> Result<Vec<PotaUploadJob>> {
         return Err(anyhow!("Failed to get POTA jobs ({}): {}", status, body));
     }
 
-    let jobs: Vec<PotaUploadJob> = response.json().await?;
-    Ok(jobs)
+    // Get the raw text first for debugging
+    let body = response.text().await?;
+
+    // Try to parse it
+    match serde_json::from_str::<Vec<PotaUploadJob>>(&body) {
+        Ok(jobs) => Ok(jobs),
+        Err(e) => {
+            // Log a sample of the response for debugging
+            let sample = if body.len() > 500 {
+                &body[..500]
+            } else {
+                &body
+            };
+            warn!(
+                error = %e,
+                sample = %sample,
+                "Failed to parse POTA jobs response"
+            );
+            Err(anyhow!("Failed to parse POTA jobs: {}", e))
+        }
+    }
 }
 
 /// Save tokens to disk
@@ -1359,5 +1381,22 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
         assert_eq!(job.status_string(), "Completed");
+
+        // Test negative values (error states from API)
+        let failed_job = PotaUploadJob {
+            job_id: 2,
+            status: -1,
+            submitted: "2025-01-01".to_string(),
+            processed: None,
+            reference: "K-0001".to_string(),
+            park_name: None,
+            location: None,
+            total: -1,
+            inserted: -1,
+            callsign_used: None,
+            user_comment: None,
+            extra: std::collections::HashMap::new(),
+        };
+        assert_eq!(failed_job.status_string(), "Unknown");
     }
 }

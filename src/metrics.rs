@@ -163,6 +163,48 @@ lazy_static! {
             .namespace("logbook_sync"),
         &["version"]
     ).expect("metric can be created");
+
+    // POTA-specific metrics for performance monitoring
+    pub static ref POTA_ACTIVATIONS_FETCHED: IntCounter = IntCounter::new(
+        "logbook_sync_pota_activations_fetched_total",
+        "Total number of POTA activations fetched from API"
+    ).expect("metric can be created");
+
+    pub static ref POTA_QSOS_PER_SYNC: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "logbook_sync_pota_qsos_per_sync",
+            "Number of QSOs processed per POTA sync operation"
+        )
+        .namespace("logbook_sync")
+        .buckets(vec![1.0, 10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0]),
+        &["direction"]  // "upload" or "download"
+    ).expect("metric can be created");
+
+    pub static ref POTA_AUTH_DURATION_SECONDS: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "logbook_sync_pota_auth_duration_seconds",
+            "Duration of POTA authentication operations"
+        )
+        .namespace("logbook_sync")
+        .buckets(vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 90.0]),
+        &["source"]  // "remote_service", "local_browser", "cached"
+    ).expect("metric can be created");
+
+    pub static ref POTA_AUTH_SOURCE_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("logbook_sync_pota_auth_source_total", "POTA authentications by source")
+            .namespace("logbook_sync"),
+        &["source"]  // "remote_service", "local_browser", "cached"
+    ).expect("metric can be created");
+
+    pub static ref POTA_PENDING_ACTIVATIONS: IntGauge = IntGauge::new(
+        "logbook_sync_pota_pending_activations",
+        "Number of POTA activations pending upload"
+    ).expect("metric can be created");
+
+    pub static ref POTA_CONCURRENT_SYNCS: IntGauge = IntGauge::new(
+        "logbook_sync_pota_concurrent_syncs",
+        "Number of POTA sync operations currently in progress"
+    ).expect("metric can be created");
 }
 
 /// Register all metrics with the registry (idempotent - safe to call multiple times)
@@ -242,6 +284,26 @@ pub fn register_metrics() {
             .expect("collector can be registered");
         REGISTRY
             .register(Box::new(BUILD_INFO.clone()))
+            .expect("collector can be registered");
+
+        // POTA-specific metrics
+        REGISTRY
+            .register(Box::new(POTA_ACTIVATIONS_FETCHED.clone()))
+            .expect("collector can be registered");
+        REGISTRY
+            .register(Box::new(POTA_QSOS_PER_SYNC.clone()))
+            .expect("collector can be registered");
+        REGISTRY
+            .register(Box::new(POTA_AUTH_DURATION_SECONDS.clone()))
+            .expect("collector can be registered");
+        REGISTRY
+            .register(Box::new(POTA_AUTH_SOURCE_TOTAL.clone()))
+            .expect("collector can be registered");
+        REGISTRY
+            .register(Box::new(POTA_PENDING_ACTIVATIONS.clone()))
+            .expect("collector can be registered");
+        REGISTRY
+            .register(Box::new(POTA_CONCURRENT_SYNCS.clone()))
             .expect("collector can be registered");
 
         // Set build info

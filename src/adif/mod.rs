@@ -65,6 +65,47 @@ impl Qso {
         )
     }
 
+    /// Create a hash for deduplication without allocating strings
+    /// Uses the same fields as dedup_key() but returns a u64 hash instead
+    pub fn dedup_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+
+        // Hash call (case-insensitive)
+        for c in self.call.chars() {
+            c.to_ascii_uppercase().hash(&mut hasher);
+        }
+        ':'.hash(&mut hasher);
+
+        // Hash date as-is
+        self.qso_date.hash(&mut hasher);
+        ':'.hash(&mut hasher);
+
+        // Hash time (only HHMM)
+        let time_hhmm = if self.time_on.len() >= 4 {
+            &self.time_on[..4]
+        } else {
+            &self.time_on
+        };
+        time_hhmm.hash(&mut hasher);
+        ':'.hash(&mut hasher);
+
+        // Hash band (case-insensitive)
+        for c in self.band.chars() {
+            c.to_ascii_lowercase().hash(&mut hasher);
+        }
+        ':'.hash(&mut hasher);
+
+        // Hash mode (case-insensitive)
+        for c in self.mode.chars() {
+            c.to_ascii_uppercase().hash(&mut hasher);
+        }
+
+        hasher.finish()
+    }
+
     /// Normalize the time_on to 6 digits (HHMMSS)
     pub fn normalized_time(&self) -> String {
         if self.time_on.len() == 4 {
@@ -86,8 +127,9 @@ impl Qso {
         }
 
         // Also check QSLMSG field for "POTA" pattern (e.g., "POTA US-0189")
+        // Use case-insensitive search without allocation
         if let Some(qslmsg) = self.other_fields.get("QSLMSG")
-            && qslmsg.to_uppercase().contains("POTA")
+            && contains_ignore_ascii_case(qslmsg, "POTA")
         {
             return true;
         }
@@ -106,8 +148,8 @@ impl Qso {
 
         // Fall back to extracting from QSLMSG (e.g., "POTA US-0189")
         if let Some(qslmsg) = self.other_fields.get("QSLMSG") {
-            // Look for pattern like "POTA XX-NNNN"
-            if let Some(pos) = qslmsg.to_uppercase().find("POTA") {
+            // Look for pattern like "POTA XX-NNNN" using case-insensitive search
+            if let Some(pos) = find_ignore_ascii_case(qslmsg, "POTA") {
                 let after_pota = &qslmsg[pos + 4..].trim_start();
                 // Extract the park reference (first word after "POTA")
                 let park_ref = after_pota.split_whitespace().next()?;
@@ -121,4 +163,34 @@ impl Qso {
 
         None
     }
+}
+
+/// Case-insensitive substring search without allocation
+/// Returns true if `haystack` contains `needle` (case-insensitive)
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    find_ignore_ascii_case(haystack, needle).is_some()
+}
+
+/// Case-insensitive substring search without allocation
+/// Returns the starting position if `haystack` contains `needle` (case-insensitive)
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+
+    let needle_bytes = needle.as_bytes();
+    let haystack_bytes = haystack.as_bytes();
+
+    'outer: for i in 0..=(haystack_bytes.len() - needle_bytes.len()) {
+        for (j, &n) in needle_bytes.iter().enumerate() {
+            if !haystack_bytes[i + j].eq_ignore_ascii_case(&n) {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
 }
