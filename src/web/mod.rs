@@ -42,6 +42,7 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub master_key: Arc<MasterKey>,
     pub sync_config: SyncConfig,
+    pub pota_auth_service: Option<crate::config::PotaAuthServiceConfig>,
 }
 
 // === Request/Response types ===
@@ -698,15 +699,35 @@ async fn list_integrations(State(state): State<AppState>, jar: CookieJar) -> imp
                         }
                         "pota" => {
                             if let Ok(db) = Database::open(&state.db_path) {
-                                db.get_pota_stats().ok().map(|s| {
-                                    serde_json::json!({
-                                        "activations": s.activations,
-                                        "qsos": s.qsos,
-                                        "valid_activations": s.valid_activations,
-                                        "unique_parks": s.unique_parks
-                                    })
-                                })
+                                match db.get_pota_stats() {
+                                    Ok(s) => {
+                                        tracing::debug!(
+                                            download_parks = s.download_parks,
+                                            download_qsos = s.download_qsos,
+                                            "Returning POTA stats in integration list"
+                                        );
+                                        Some(serde_json::json!({
+                                            "download_parks": s.download_parks,
+                                            "download_activations": s.download_activations,
+                                            "download_partial_activations": s.download_partial_activations,
+                                            "download_qsos": s.download_qsos,
+                                            "uploaded_parks": s.uploaded_parks,
+                                            "uploaded_activations": s.uploaded_activations,
+                                            "uploaded_partial_activations": s.uploaded_partial_activations,
+                                            "uploaded_qsos": s.uploaded_qsos,
+                                            "pending_parks": s.pending_parks,
+                                            "pending_activations": s.pending_activations,
+                                            "pending_partial_activations": s.pending_partial_activations,
+                                            "pending_qsos": s.pending_qsos
+                                        }))
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to get POTA stats: {}", e);
+                                        None
+                                    }
+                                }
                             } else {
+                                tracing::warn!("Failed to open database for POTA stats");
                                 None
                             }
                         }
@@ -943,7 +964,7 @@ async fn test_integration(
             ),
         },
         "pota" => match serde_json::from_value::<integrations::PotaIntegrationConfig>(req.config) {
-            Ok(config) => test_pota_connection(&config).await,
+            Ok(config) => test_pota_connection(&config, state.pota_auth_service.as_ref()).await,
             Err(e) => (
                 StatusCode::BAD_REQUEST,
                 Json(SuccessResponse {
@@ -1062,6 +1083,7 @@ async fn test_ntfy_connection(
 
 async fn test_pota_connection(
     config: &integrations::PotaIntegrationConfig,
+    auth_service_config: Option<&crate::config::PotaAuthServiceConfig>,
 ) -> (StatusCode, Json<SuccessResponse>) {
     use crate::pota::browser::PotaUploader;
 
@@ -1100,7 +1122,13 @@ async fn test_pota_connection(
         true, // headless mode
     );
 
-    // TODO: Configure auth service client here if available in server config
+    // Configure auth service client if available
+    if let Some(auth_config) = auth_service_config
+        && let Ok(client) =
+            crate::pota::auth_service::PotaAuthServiceClient::new(auth_config.clone())
+    {
+        uploader.set_auth_service_client(client);
+    }
 
     match uploader.ensure_authenticated_async().await {
         Ok(()) => {
@@ -1911,7 +1939,7 @@ async fn sync_lofi(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
                     continue;
                 }
 
-                if let Err(e) = db.upsert_lofi_qso(qso, Some(&op.account)) {
+                if let Err(e) = db.upsert_lofi_qso(qso, Some(&op.account), user.id) {
                     tracing::warn!("Failed to save LoFi QSO: {}", e);
                 } else {
                     total_qsos += 1;
@@ -2376,21 +2404,42 @@ pub struct PotaUploadResponse {
 
 /// Preview POTA activations (dry run)
 async fn pota_preview(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
-    if get_current_user(&jar, &state).is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(PotaPreviewResponse {
-                success: false,
-                valid_activations: vec![],
-                invalid_activations: vec![],
-                total_qsos: 0,
-                skipped_qsos: 0,
-                message: Some("Unauthorized".into()),
-            }),
-        );
-    }
+    let user = match get_current_user(&jar, &state) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(PotaPreviewResponse {
+                    success: false,
+                    valid_activations: vec![],
+                    invalid_activations: vec![],
+                    total_qsos: 0,
+                    skipped_qsos: 0,
+                    message: Some("Unauthorized".into()),
+                }),
+            );
+        }
+    };
 
-    // Get all QSOs
+    // Get user's callsign for filtering
+    let user_callsign = match &user.callsign {
+        Some(c) => c.to_uppercase(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(PotaPreviewResponse {
+                    success: false,
+                    valid_activations: vec![],
+                    invalid_activations: vec![],
+                    total_qsos: 0,
+                    skipped_qsos: 0,
+                    message: Some("No callsign configured - set your callsign in settings".into()),
+                }),
+            );
+        }
+    };
+
+    // Get only POTA QSOs for this user (with proper user isolation)
     let db = match Database::open(&state.db_path) {
         Ok(db) => db,
         Err(e) => {
@@ -2408,7 +2457,7 @@ async fn pota_preview(State(state): State<AppState>, jar: CookieJar) -> impl Int
         }
     };
 
-    let qsos = match db.get_all_qsos() {
+    let qsos = match db.get_pota_qsos_for_user(user.id, &user_callsign) {
         Ok(q) => q,
         Err(e) => {
             return (
@@ -2520,6 +2569,23 @@ async fn pota_upload(
         }
     };
 
+    // Get user's callsign for filtering QSOs
+    let user_callsign = match &user.callsign {
+        Some(c) => c.to_uppercase(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(PotaUploadResponse {
+                    success: false,
+                    message: "No callsign configured - set your callsign in settings".into(),
+                    activations_uploaded: 0,
+                    qsos_uploaded: 0,
+                    errors: vec![],
+                }),
+            );
+        }
+    };
+
     let user_salt = match users::get_user_encryption_salt(&user) {
         Ok(s) => s,
         Err(_) => {
@@ -2607,7 +2673,8 @@ async fn pota_upload(
         }
     };
 
-    let qsos = match db.get_all_qsos() {
+    // Get only POTA QSOs for this user (with proper user isolation)
+    let qsos = match db.get_pota_qsos_for_user(user.id, &user_callsign) {
         Ok(q) => q,
         Err(e) => {
             let err_msg = e.to_string();
@@ -2625,31 +2692,74 @@ async fn pota_upload(
         }
     };
 
-    // Group into activations
+    // Group into activations (QSOs are already filtered to POTA-only)
     let (all_activations, _skipped) = crate::pota::group_pota_activations(&qsos);
 
     // Optionally filter by requested activation keys
     // Note: We upload all activations, not just "valid" ones (10+ QSOs).
     // Incomplete activations can still be uploaded - they just won't count as
     // a valid activation for the activator's credit.
-    let activations_to_upload: Vec<_> = all_activations
-        .into_iter()
-        .filter(|a| {
-            if let Some(ref requested) = req.activations {
-                let key = format!("{}:{}", a.park_ref, a.date);
-                requested.contains(&key)
-            } else {
-                true
+    //
+    // Filter to requested activations and claim them for upload (prevents duplicates)
+    let mut activations_to_upload = Vec::new();
+    let mut skipped_in_progress = 0;
+
+    for a in all_activations {
+        // Check if this activation was requested
+        let should_upload = if let Some(ref requested) = req.activations {
+            let key = format!("{}:{}", a.park_ref, a.date);
+            requested.contains(&key)
+        } else {
+            true
+        };
+
+        if !should_upload {
+            continue;
+        }
+
+        // Try to claim this activation for upload (prevents concurrent uploads)
+        match db.try_start_pota_upload(user.id, &a.park_ref, &a.date, a.qsos.len() as i64) {
+            Ok(true) => {
+                tracing::debug!(
+                    park_ref = %a.park_ref,
+                    date = %a.date,
+                    "Claimed activation for upload"
+                );
+                activations_to_upload.push(a);
             }
-        })
-        .collect();
+            Ok(false) => {
+                tracing::debug!(
+                    park_ref = %a.park_ref,
+                    date = %a.date,
+                    "Activation already being uploaded or was recently uploaded, skipping"
+                );
+                skipped_in_progress += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    park_ref = %a.park_ref,
+                    date = %a.date,
+                    error = %e,
+                    "Failed to check upload status, skipping activation"
+                );
+            }
+        }
+    }
 
     if activations_to_upload.is_empty() {
+        let message = if skipped_in_progress > 0 {
+            format!(
+                "{} activation(s) already being uploaded or recently uploaded",
+                skipped_in_progress
+            )
+        } else {
+            "No activations to upload".into()
+        };
         return (
             StatusCode::OK,
             Json(PotaUploadResponse {
                 success: true,
-                message: "No activations to upload".into(),
+                message,
                 activations_uploaded: 0,
                 qsos_uploaded: 0,
                 errors: vec![],
@@ -2668,6 +2778,10 @@ async fn pota_upload(
         Ok(r) => r,
         Err(e) => {
             let err_msg = e.to_string();
+            // Mark all claimed activations as failed
+            for a in &activations_to_upload {
+                let _ = db.mark_pota_upload_failed(user.id, &a.park_ref, &a.date, &err_msg);
+            }
             let _ = integrations::record_sync_error(&conn, user.id, "pota", "upload", &err_msg);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2681,6 +2795,18 @@ async fn pota_upload(
             );
         }
     };
+
+    // Mark all claimed activations as completed
+    for a in &activations_to_upload {
+        if let Err(e) = db.mark_pota_upload_completed(user.id, &a.park_ref, &a.date) {
+            tracing::warn!(
+                park_ref = %a.park_ref,
+                date = %a.date,
+                error = %e,
+                "Failed to mark activation as uploaded"
+            );
+        }
+    }
 
     // Record sync result
     if result.errors.is_empty() {
@@ -2809,17 +2935,56 @@ async fn pota_upload_sse(
     // Group into activations
     let (all_activations, _skipped) = crate::pota::group_pota_activations(&qsos);
 
-    // Filter by requested activation keys
-    let activations_to_upload: Vec<_> = all_activations
-        .into_iter()
-        .filter(|a| {
-            if let Some(ref requested) = req.activations {
-                let key = format!("{}:{}", a.park_ref, a.date);
-                requested.contains(&key)
-            } else {
-                true
+    // Filter by requested activation keys and claim them for upload
+    let mut activations_to_upload = Vec::new();
+
+    for a in all_activations {
+        // Check if this activation was requested
+        let should_upload = if let Some(ref requested) = req.activations {
+            let key = format!("{}:{}", a.park_ref, a.date);
+            requested.contains(&key)
+        } else {
+            true
+        };
+
+        if !should_upload {
+            continue;
+        }
+
+        // Try to claim this activation for upload (prevents concurrent uploads)
+        match db.try_start_pota_upload(user.id, &a.park_ref, &a.date, a.qsos.len() as i64) {
+            Ok(true) => {
+                activations_to_upload.push(a);
             }
-        })
+            Ok(false) => {
+                tracing::debug!(
+                    park_ref = %a.park_ref,
+                    date = %a.date,
+                    "Activation already being uploaded or was recently uploaded, skipping"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    park_ref = %a.park_ref,
+                    date = %a.date,
+                    error = %e,
+                    "Failed to check upload status, skipping activation"
+                );
+            }
+        }
+    }
+
+    if activations_to_upload.is_empty() {
+        return pota_error_stream(
+            "Complete",
+            "No activations to upload (already uploaded or in progress)",
+        );
+    }
+
+    // Track which activations we claimed so we can mark them as completed/failed
+    let claimed_activations: Vec<(String, String)> = activations_to_upload
+        .iter()
+        .map(|a| (a.park_ref.clone(), a.date.clone()))
         .collect();
 
     // Create channel for progress updates
@@ -2835,15 +3000,36 @@ async fn pota_upload_sse(
     let password = pota_config.password.clone();
     let user_id = user.id;
     let db_path = state.db_path.clone();
+    let db_path_for_status = state.db_path.clone();
+    let claimed_for_task = claimed_activations.clone();
 
     let mut upload_handle = tokio::spawn(async move {
-        crate::pota::upload_to_pota_with_progress(
+        let result = crate::pota::upload_to_pota_with_progress(
             &email,
             &password,
             &activations_to_upload,
             Some(progress_callback),
         )
-        .await
+        .await;
+
+        // Mark activations as completed or failed based on result
+        if let Ok(db) = Database::open(&db_path_for_status) {
+            match &result {
+                Ok(_) => {
+                    for (park_ref, date) in &claimed_for_task {
+                        let _ = db.mark_pota_upload_completed(user_id, park_ref, date);
+                    }
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    for (park_ref, date) in &claimed_for_task {
+                        let _ = db.mark_pota_upload_failed(user_id, park_ref, date, &error_msg);
+                    }
+                }
+            }
+        }
+
+        result
     });
 
     // Create SSE stream
@@ -3035,7 +3221,13 @@ async fn pota_jobs(State(state): State<AppState>, jar: CookieJar) -> impl IntoRe
         }
     };
 
-    match crate::pota::get_upload_jobs(&pota_config.email, &pota_config.password).await {
+    match crate::pota::get_upload_jobs(
+        &pota_config.email,
+        &pota_config.password,
+        state.pota_auth_service.as_ref(),
+    )
+    .await
+    {
         Ok(jobs) => (
             StatusCode::OK,
             Json(PotaJobsResponse {
@@ -3139,6 +3331,7 @@ async fn pota_download_sse(State(state): State<AppState>, jar: CookieJar) -> imp
     };
 
     let db_path = state.db_path.clone();
+    let pota_auth_service = state.pota_auth_service.clone();
 
     // Create an mpsc channel for progress updates
     let (tx, rx) = mpsc::channel::<Event>(32);
@@ -3147,7 +3340,8 @@ async fn pota_download_sse(State(state): State<AppState>, jar: CookieJar) -> imp
     let email = pota_config.email.clone();
     let password = pota_config.password.clone();
     tokio::spawn(async move {
-        let _ = perform_pota_download(&db_path, &email, &password, tx).await;
+        let _ = perform_pota_download(&db_path, &email, &password, pota_auth_service.as_ref(), tx)
+            .await;
     });
 
     // Convert the receiver to a stream
@@ -3169,6 +3363,7 @@ async fn perform_pota_download(
     db_path: &std::path::Path,
     email: &str,
     password: &str,
+    auth_service_config: Option<&crate::config::PotaAuthServiceConfig>,
     tx: mpsc::Sender<Event>,
 ) -> anyhow::Result<()> {
     use crate::db::Database;
@@ -3201,6 +3396,14 @@ async fn perform_pota_download(
         cache_path,
         true, // headless mode
     );
+
+    // Configure auth service client if available
+    if let Some(auth_config) = auth_service_config
+        && let Ok(client) =
+            crate::pota::auth_service::PotaAuthServiceClient::new(auth_config.clone())
+    {
+        uploader.set_auth_service_client(client);
+    }
 
     send_progress(&tx, "Authenticating", Some("Logging into POTA.app"));
 
@@ -3338,10 +3541,24 @@ pub struct PotaStatsResponse {
 
 #[derive(Debug, Serialize)]
 pub struct PotaStatsData {
-    pub activations: i64,
-    pub qsos: i64,
-    pub valid_activations: i64,
-    pub unique_parks: i64,
+    // Download stats (from POTA.app)
+    pub download_parks: i64,
+    pub download_activations: i64,
+    pub download_partial_activations: i64,
+    pub download_qsos: i64,
+
+    // Upload stats (to POTA.app) - fully uploaded activations
+    pub uploaded_parks: i64,
+    pub uploaded_activations: i64,
+    pub uploaded_partial_activations: i64,
+    pub uploaded_qsos: i64,
+
+    // Pending stats - not yet on POTA.app
+    pub pending_parks: i64,
+    pub pending_activations: i64,
+    pub pending_partial_activations: i64,
+    pub pending_qsos: i64,
+
     pub last_sync: Option<String>,
 }
 
@@ -3396,10 +3613,18 @@ async fn pota_stats(State(state): State<AppState>, jar: CookieJar) -> impl IntoR
         Json(PotaStatsResponse {
             success: true,
             stats: Some(PotaStatsData {
-                activations: stats.activations,
-                qsos: stats.qsos,
-                valid_activations: stats.valid_activations,
-                unique_parks: stats.unique_parks,
+                download_parks: stats.download_parks,
+                download_activations: stats.download_activations,
+                download_partial_activations: stats.download_partial_activations,
+                download_qsos: stats.download_qsos,
+                uploaded_parks: stats.uploaded_parks,
+                uploaded_activations: stats.uploaded_activations,
+                uploaded_partial_activations: stats.uploaded_partial_activations,
+                uploaded_qsos: stats.uploaded_qsos,
+                pending_parks: stats.pending_parks,
+                pending_activations: stats.pending_activations,
+                pending_partial_activations: stats.pending_partial_activations,
+                pending_qsos: stats.pending_qsos,
                 last_sync,
             }),
             message: None,
@@ -3708,11 +3933,13 @@ pub async fn build_router(
     db_path: PathBuf,
     master_key: MasterKey,
     sync_config: SyncConfig,
+    pota_auth_service: Option<crate::config::PotaAuthServiceConfig>,
 ) -> Router {
     let state = AppState {
         db_path,
         master_key: Arc::new(master_key),
         sync_config,
+        pota_auth_service,
     };
 
     // API routes
@@ -3779,6 +4006,7 @@ pub async fn serve(
     db_path: PathBuf,
     master_key: MasterKey,
     sync_config: SyncConfig,
+    pota_auth_service: Option<crate::config::PotaAuthServiceConfig>,
     bind: &str,
 ) -> std::result::Result<(), std::io::Error> {
     // Run migrations before starting the server
@@ -3793,7 +4021,7 @@ pub async fn serve(
         }
     }
 
-    let app = build_router(db_path, master_key, sync_config).await;
+    let app = build_router(db_path, master_key, sync_config, pota_auth_service).await;
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("Web server listening on {}", bind);

@@ -17,6 +17,7 @@ pub struct LofiSyncService<'a> {
     ntfy: Option<&'a NtfyClient>,
     batch_size: u32,
     loop_delay_ms: u64,
+    user_id: i64,
 }
 
 impl<'a> LofiSyncService<'a> {
@@ -27,6 +28,7 @@ impl<'a> LofiSyncService<'a> {
         ntfy: Option<&'a NtfyClient>,
         batch_size: u32,
         loop_delay_ms: u64,
+        user_id: i64,
     ) -> Self {
         Self {
             client,
@@ -34,6 +36,7 @@ impl<'a> LofiSyncService<'a> {
             ntfy,
             batch_size,
             loop_delay_ms,
+            user_id,
         }
     }
 
@@ -258,7 +261,9 @@ impl<'a> LofiSyncService<'a> {
                     continue;
                 }
 
-                let is_new = self.db.upsert_lofi_qso(qso, Some(account_uuid))?;
+                let is_new = self
+                    .db
+                    .upsert_lofi_qso(qso, Some(account_uuid), self.user_id)?;
                 if is_new {
                     new_count += 1;
                 } else {
@@ -338,6 +343,7 @@ impl<'a> LofiSyncService<'a> {
 }
 
 /// Run LoFi sync as a background task
+#[allow(clippy::too_many_arguments)]
 pub async fn run_lofi_sync_loop(
     client: LofiClient,
     db: Database,
@@ -345,6 +351,7 @@ pub async fn run_lofi_sync_loop(
     batch_size: u32,
     loop_delay_ms: u64,
     check_period_ms: u64,
+    user_id: i64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     info!(
@@ -371,6 +378,7 @@ pub async fn run_lofi_sync_loop(
                     ntfy.as_ref(),
                     batch_size,
                     loop_delay_ms,
+                    user_id,
                 );
 
                 if let Err(e) = service.sync_all().await {

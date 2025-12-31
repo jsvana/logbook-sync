@@ -23,6 +23,79 @@ use tracing::{info, warn};
 use crate::adif::{Qso, write_pota_adif};
 use crate::{Error, Result};
 
+/// Derive US state from Maidenhead grid square (4 or 6 character).
+/// Returns the most likely state abbreviation for US grid squares.
+/// This is approximate - grid squares can span state boundaries.
+fn grid_to_us_state(grid: &str) -> Option<&'static str> {
+    if grid.len() < 4 {
+        return None;
+    }
+    let field = &grid[..2].to_uppercase();
+    let square = &grid[2..4];
+
+    // Map field + square to most likely US state
+    // This covers the continental US - not exhaustive but handles common cases
+    match (field.as_str(), square) {
+        // California
+        ("CM", "87") | ("CM", "88") | ("CM", "97") | ("CM", "98") => Some("CA"),
+        ("DM", "03")
+        | ("DM", "04")
+        | ("DM", "05")
+        | ("DM", "06")
+        | ("DM", "07")
+        | ("DM", "12")
+        | ("DM", "13")
+        | ("DM", "14") => Some("CA"),
+        // Arizona
+        ("DM", "31") | ("DM", "32") | ("DM", "33") | ("DM", "41") | ("DM", "42") | ("DM", "43") => {
+            Some("AZ")
+        }
+        // Nevada
+        ("DM", "08") | ("DM", "09") | ("DM", "18") | ("DM", "19") | ("DM", "26") | ("DM", "27") => {
+            Some("NV")
+        }
+        // Oregon/Washington
+        ("CN", "74")
+        | ("CN", "75")
+        | ("CN", "84")
+        | ("CN", "85")
+        | ("CN", "86")
+        | ("CN", "87")
+        | ("CN", "88") => Some("WA"),
+        ("CN", "73") | ("CN", "82") | ("CN", "83") | ("CN", "93") | ("CN", "94") | ("CN", "95") => {
+            Some("OR")
+        }
+        // Texas
+        ("EM", "00")
+        | ("EM", "01")
+        | ("EM", "10")
+        | ("EM", "11")
+        | ("EM", "12")
+        | ("EM", "13")
+        | ("EM", "20")
+        | ("EM", "21") => Some("TX"),
+        // Florida
+        ("EL", "87") | ("EL", "88") | ("EL", "96") | ("EL", "97") | ("EL", "98") => Some("FL"),
+        // New York
+        ("FN", "21") | ("FN", "30") | ("FN", "31") => Some("NY"),
+        // Pennsylvania / New York border - default to NY
+        ("FN", "10") | ("FN", "11") | ("FN", "20") => Some("NY"),
+        // Colorado
+        ("DM", "69") | ("DM", "79") | ("DM", "78") | ("DN", "60") | ("DN", "70") => Some("CO"),
+        // Other common fields - return approximate state
+        ("CM", _) => Some("CA"),
+        ("DM", _) => Some("CA"), // Could be CA, AZ, NM, NV - default to CA for POTA
+        ("CN", _) => Some("WA"), // Pacific Northwest
+        ("DN", _) => Some("CO"), // Rocky Mountain area
+        ("EM", _) => Some("TX"), // South central
+        ("EN", _) => Some("WI"), // Upper Midwest
+        ("EL", _) => Some("FL"), // Southeast
+        ("FM", _) => Some("VA"), // Mid-Atlantic
+        ("FN", _) => Some("NY"), // Northeast
+        _ => None,
+    }
+}
+
 /// Key for grouping QSOs: (UTC Date, Park Reference)
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct PotaGroupKey {
@@ -158,7 +231,9 @@ impl PotaExporter {
         park: &str,
         date: &NaiveDate,
     ) -> String {
-        let mut output = String::new();
+        // Pre-allocate string buffer: ~300 bytes header + ~500 bytes per QSO
+        let estimated_size = 300 + (qsos.len() * 500);
+        let mut output = String::with_capacity(estimated_size);
 
         // Header with activator, park, and date
         let date_str = date.format("%Y-%m-%d").to_string();
@@ -187,7 +262,8 @@ impl PotaExporter {
     /// Field order follows Ham2K Portable Logger format for compatibility
     /// The park parameter ensures MY_SIG, MY_SIG_INFO, MY_POTA_REF, and QSLMSG are always present
     fn format_qso_record(&self, qso: &Qso, park: &str) -> String {
-        let mut record = String::new();
+        // Pre-allocate ~500 bytes for a typical QSO record
+        let mut record = String::with_capacity(500);
 
         // Core QSO fields
         record.push_str(&format_field("CALL", &qso.call));
@@ -576,18 +652,21 @@ pub struct PotaUploadResult {
 
 /// Group QSOs into POTA activations by park reference and UTC date
 /// Deduplicates QSOs by call/date/time/band/mode within each activation
+///
+/// Optimized to avoid cloning QSOs during grouping - only clones when building
+/// the final PotaActivation structs.
 pub fn group_pota_activations(qsos: &[Qso]) -> (Vec<PotaActivation>, usize) {
     use std::collections::HashSet;
 
-    // Group by (park_ref, date), with deduplication
-    let mut groups: HashMap<(String, String), Vec<Qso>> = HashMap::new();
-    let mut seen_keys: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    // Group by (park_ref, date), storing indices to avoid cloning during grouping
+    let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    let mut seen_keys: HashMap<(String, String), HashSet<u64>> = HashMap::new();
     let mut skipped = 0;
 
     // Special annotation callsigns from Ham2K PoLo that shouldn't be uploaded
     const ANNOTATION_CALLS: &[&str] = &["SOLAR", "WEATHER", "NOTE"];
 
-    for qso in qsos {
+    for (idx, qso) in qsos.iter().enumerate() {
         // Check if this is a POTA QSO with a valid park reference
         if !qso.is_pota() {
             skipped += 1;
@@ -595,8 +674,11 @@ pub fn group_pota_activations(qsos: &[Qso]) -> (Vec<PotaActivation>, usize) {
         }
 
         // Skip Ham2K PoLo annotation records (SOLAR, WEATHER, NOTE)
-        let call_upper = qso.call.to_uppercase();
-        if ANNOTATION_CALLS.contains(&call_upper.as_str()) {
+        // Use case-insensitive comparison without allocation
+        if ANNOTATION_CALLS
+            .iter()
+            .any(|&ann| qso.call.eq_ignore_ascii_case(ann))
+        {
             tracing::debug!(call = %qso.call, "Skipping Ham2K PoLo annotation record");
             skipped += 1;
             continue;
@@ -618,11 +700,13 @@ pub fn group_pota_activations(qsos: &[Qso]) -> (Vec<PotaActivation>, usize) {
         }
 
         let group_key = (park_ref, qso.qso_date.clone());
-        let dedup_key = qso.dedup_key();
+
+        // Use hash-based deduplication to avoid String allocation
+        let dedup_hash = qso.dedup_hash();
 
         // Check for duplicates within this activation
         let seen = seen_keys.entry(group_key.clone()).or_default();
-        if seen.contains(&dedup_key) {
+        if seen.contains(&dedup_hash) {
             tracing::debug!(
                 call = %qso.call,
                 date = %qso.qso_date,
@@ -631,18 +715,22 @@ pub fn group_pota_activations(qsos: &[Qso]) -> (Vec<PotaActivation>, usize) {
             );
             continue;
         }
-        seen.insert(dedup_key);
+        seen.insert(dedup_hash);
 
-        groups.entry(group_key).or_default().push(qso.clone());
+        // Store index instead of cloning
+        groups.entry(group_key).or_default().push(idx);
     }
 
-    // Convert to activations
+    // Convert to activations - only clone QSOs here when building final struct
     let mut activations: Vec<PotaActivation> = groups
         .into_iter()
-        .map(|((park_ref, date), qsos)| PotaActivation {
-            park_ref,
-            date,
-            qsos,
+        .map(|((park_ref, date), indices)| {
+            let activation_qsos = indices.into_iter().map(|i| qsos[i].clone()).collect();
+            PotaActivation {
+                park_ref,
+                date,
+                qsos: activation_qsos,
+            }
         })
         .collect();
 
@@ -815,15 +903,35 @@ async fn upload_to_pota_internal(
         // Park reference format: XX-NNNN (e.g., "US-4571")
         // Location format: XX-SS (e.g., "US-CA")
         let park_prefix = activation.park_ref.split('-').next().unwrap_or("US");
+
+        // Try to get state from QSO my_state field first
         let my_state = activation
             .qsos
             .first()
             .and_then(|q| q.my_state.as_deref())
-            .unwrap_or("");
-        let location = if !my_state.is_empty() {
-            format!("{}-{}", park_prefix, my_state)
+            .filter(|s| !s.is_empty());
+
+        // Fall back to deriving state from grid square if my_state is empty
+        let derived_state = if my_state.is_none() && park_prefix == "US" {
+            activation
+                .qsos
+                .first()
+                .and_then(|q| q.my_gridsquare.as_deref())
+                .and_then(grid_to_us_state)
         } else {
-            park_prefix.to_string()
+            None
+        };
+
+        let state = my_state.or(derived_state);
+        let location = match state {
+            Some(s) => format!("{}-{}", park_prefix, s),
+            None => {
+                warn!(
+                    park = %activation.park_ref,
+                    "No state found for POTA upload - location may be incomplete"
+                );
+                park_prefix.to_string()
+            }
         };
 
         // Generate ADIF for this activation with proper POTA header
@@ -854,6 +962,8 @@ async fn upload_to_pota_internal(
             park = %activation.park_ref,
             date = %activation.date,
             qsos = activation.qsos.len(),
+            location = %location,
+            callsign = %callsign,
             idx = idx + 1,
             total = total_activations,
             "Uploading activation to POTA"
@@ -930,7 +1040,11 @@ pub struct PotaJobInfo {
 }
 
 /// Get POTA upload job status using headless browser authentication
-pub async fn get_upload_jobs(email: &str, password: &str) -> Result<Vec<PotaJobInfo>> {
+pub async fn get_upload_jobs(
+    email: &str,
+    password: &str,
+    auth_service_config: Option<&crate::config::PotaAuthServiceConfig>,
+) -> Result<Vec<PotaJobInfo>> {
     // Create the POTA uploader with browser-based authentication
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
@@ -944,6 +1058,13 @@ pub async fn get_upload_jobs(email: &str, password: &str) -> Result<Vec<PotaJobI
         cache_path,
         true, // headless mode
     );
+
+    // Configure auth service client if available
+    if let Some(auth_config) = auth_service_config
+        && let Ok(client) = auth_service::PotaAuthServiceClient::new(auth_config.clone())
+    {
+        uploader.set_auth_service_client(client);
+    }
 
     let jobs = uploader
         .get_jobs()

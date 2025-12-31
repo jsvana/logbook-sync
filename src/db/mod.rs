@@ -6,6 +6,7 @@ use crate::{Error, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub use integrations::*;
@@ -412,6 +413,23 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_pota_qsos_worked_callsign ON pota_qsos(worked_callsign);
             CREATE INDEX IF NOT EXISTS idx_pota_qsos_reference ON pota_qsos(reference);
             CREATE INDEX IF NOT EXISTS idx_pota_qsos_station_callsign ON pota_qsos(station_callsign);
+
+            -- POTA upload status tracking (prevents duplicate uploads)
+            CREATE TABLE IF NOT EXISTS pota_upload_status (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                park_ref TEXT NOT NULL,           -- Park reference (e.g., "US-0189")
+                date TEXT NOT NULL,               -- YYYY-MM-DD format
+                status TEXT NOT NULL DEFAULT 'uploading',  -- 'uploading', 'uploaded', 'failed'
+                qso_count INTEGER NOT NULL DEFAULT 0,      -- Number of QSOs in this upload
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                completed_at TEXT,
+                error_message TEXT,
+                UNIQUE(user_id, park_ref, date)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pota_upload_status_user ON pota_upload_status(user_id);
+            CREATE INDEX IF NOT EXISTS idx_pota_upload_status_status ON pota_upload_status(status);
             "#,
         )?;
         Ok(())
@@ -447,6 +465,20 @@ impl Database {
             )?;
         }
 
+        // Add user_id column for multi-user isolation (migration v5)
+        if !columns.contains(&"user_id".to_string()) {
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE qsos ADD COLUMN user_id INTEGER REFERENCES users(id);
+                "#,
+            )?;
+            // Create index for user-scoped queries
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_qsos_user ON qsos(user_id)",
+                [],
+            )?;
+        }
+
         // Create index on lotw_qsl_rcvd (after migration ensures column exists)
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_qsos_lotw ON qsos(lotw_qsl_rcvd)",
@@ -477,6 +509,27 @@ impl Database {
             )?;
         }
 
+        // Create pota_upload_status table if it doesn't exist (migration v6)
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS pota_upload_status (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                park_ref TEXT NOT NULL,
+                date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'uploading',
+                qso_count INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                completed_at TEXT,
+                error_message TEXT,
+                UNIQUE(user_id, park_ref, date)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pota_upload_status_user ON pota_upload_status(user_id);
+            CREATE INDEX IF NOT EXISTS idx_pota_upload_status_status ON pota_upload_status(status);
+            "#,
+        )?;
+
         Ok(())
     }
 
@@ -493,7 +546,22 @@ impl Database {
         source: &str,
         source_id: Option<&str>,
     ) -> Result<i64> {
-        let (id, _is_new) = self.upsert_qso_with_source_ext(qso, source_file, source, source_id)?;
+        let (id, _is_new) =
+            self.upsert_qso_with_source_ext(qso, source_file, source, source_id, None)?;
+        Ok(id)
+    }
+
+    /// Insert or update a QSO record with source tracking and user_id
+    pub fn upsert_qso_with_source_for_user(
+        &self,
+        qso: &Qso,
+        source_file: Option<&str>,
+        source: &str,
+        source_id: Option<&str>,
+        user_id: i64,
+    ) -> Result<i64> {
+        let (id, _is_new) =
+            self.upsert_qso_with_source_ext(qso, source_file, source, source_id, Some(user_id))?;
         Ok(id)
     }
 
@@ -504,6 +572,7 @@ impl Database {
         source_file: Option<&str>,
         source: &str,
         source_id: Option<&str>,
+        user_id: Option<i64>,
     ) -> Result<(i64, bool)> {
         let now = Utc::now().to_rfc3339();
         let adif_json = serde_json::to_string(qso).map_err(|e| Error::Other(e.to_string()))?;
@@ -516,15 +585,16 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO qsos (call, qso_date, time_on, band, mode, source_file, source_hash,
-                              created_at, updated_at, adif_record, source, source_id)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11)
+                              created_at, updated_at, adif_record, source, source_id, user_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(call, qso_date, time_on, band, mode) DO UPDATE SET
                 source_file = COALESCE(excluded.source_file, source_file),
                 source_hash = excluded.source_hash,
                 updated_at = excluded.updated_at,
                 adif_record = excluded.adif_record,
                 source = COALESCE(excluded.source, source),
-                source_id = COALESCE(excluded.source_id, source_id)
+                source_id = COALESCE(excluded.source_id, source_id),
+                user_id = COALESCE(excluded.user_id, user_id)
             "#,
             params![
                 qso.call.to_uppercase(),
@@ -538,6 +608,7 @@ impl Database {
                 adif_json,
                 source,
                 source_id,
+                user_id,
             ],
         )?;
 
@@ -943,6 +1014,85 @@ impl Database {
 
         let qsos = stmt
             .query_map([], |row| {
+                let json: String = row.get(0)?;
+                Ok(json)
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str::<Qso>(&json).ok())
+            .collect();
+
+        Ok(qsos)
+    }
+
+    /// Get POTA-tagged QSOs for a specific station callsign (legacy, no user filtering)
+    ///
+    /// DEPRECATED: Use get_pota_qsos_for_user instead to ensure proper user isolation.
+    pub fn get_pota_qsos_for_callsign(&self, station_callsign: &str) -> Result<Vec<Qso>> {
+        let callsign_upper = station_callsign.to_uppercase();
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT adif_record FROM qsos
+            WHERE (
+                UPPER(json_extract(adif_record, '$.MY_SIG')) = 'POTA'
+                OR UPPER(json_extract(adif_record, '$.my_sig')) = 'POTA'
+            )
+            AND COALESCE(
+                json_extract(adif_record, '$.MY_SIG_INFO'),
+                json_extract(adif_record, '$.my_sig_info')
+            ) IS NOT NULL
+            AND (
+                UPPER(json_extract(adif_record, '$.STATION_CALLSIGN')) = ?1
+                OR UPPER(json_extract(adif_record, '$.station_callsign')) = ?1
+            )
+            ORDER BY qso_date, time_on
+            "#,
+        )?;
+
+        let qsos = stmt
+            .query_map([&callsign_upper], |row| {
+                let json: String = row.get(0)?;
+                Ok(json)
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str::<Qso>(&json).ok())
+            .collect();
+
+        Ok(qsos)
+    }
+
+    /// Get POTA-tagged QSOs for a specific user
+    ///
+    /// This is an optimized query for POTA sync that:
+    /// 1. Only loads QSOs where MY_SIG='POTA' (activator QSOs)
+    /// 2. Filters by user_id to ensure proper data isolation
+    /// 3. Filters by station_callsign as additional verification
+    /// 4. Requires valid MY_SIG_INFO (park reference)
+    ///
+    /// This ensures only the specified user's QSOs are returned.
+    pub fn get_pota_qsos_for_user(&self, user_id: i64, station_callsign: &str) -> Result<Vec<Qso>> {
+        let callsign_upper = station_callsign.to_uppercase();
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT adif_record FROM qsos
+            WHERE user_id = ?1
+            AND (
+                UPPER(json_extract(adif_record, '$.MY_SIG')) = 'POTA'
+                OR UPPER(json_extract(adif_record, '$.my_sig')) = 'POTA'
+            )
+            AND COALESCE(
+                json_extract(adif_record, '$.MY_SIG_INFO'),
+                json_extract(adif_record, '$.my_sig_info')
+            ) IS NOT NULL
+            AND (
+                UPPER(json_extract(adif_record, '$.STATION_CALLSIGN')) = ?2
+                OR UPPER(json_extract(adif_record, '$.station_callsign')) = ?2
+            )
+            ORDER BY qso_date, time_on
+            "#,
+        )?;
+
+        let qsos = stmt
+            .query_map(params![user_id, &callsign_upper], |row| {
                 let json: String = row.get(0)?;
                 Ok(json)
             })?
@@ -1374,35 +1524,142 @@ impl Database {
         Ok(count)
     }
 
-    /// Get POTA statistics
+    /// Get POTA statistics with download/upload/pending breakdown
     pub fn get_pota_stats(&self) -> Result<PotaStats> {
-        let activations: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM pota_activations", [], |row| {
-                    row.get(0)
-                })?;
-
-        let qsos: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM pota_qsos", [], |row| row.get(0))?;
-
-        let valid_activations: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM pota_activations WHERE total >= 10",
-            [],
-            |row| row.get(0),
-        )?;
-
-        let unique_parks: i64 = self.conn.query_row(
+        // === Download stats (from POTA.app - stored in pota_activations/pota_qsos tables) ===
+        let download_parks: i64 = self.conn.query_row(
             "SELECT COUNT(DISTINCT reference) FROM pota_activations",
             [],
             |row| row.get(0),
         )?;
 
+        let download_activations: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pota_activations WHERE total >= 10",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let download_partial_activations: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pota_activations WHERE total < 10",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let download_qsos: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM pota_qsos", [], |row| row.get(0))?;
+
+        tracing::debug!(
+            download_parks,
+            download_activations,
+            download_partial_activations,
+            download_qsos,
+            "POTA download stats from database"
+        );
+
+        // === Local POTA activations (from qsos table with MY_SIG=POTA) ===
+        // Get unique (park_ref, date) combinations from local POTA QSOs
+        // Note: my_sig and my_sig_info are stored in adif_record JSON, not as columns
+        let local_activations: Vec<(String, String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT
+                    UPPER(COALESCE(
+                        json_extract(adif_record, '$.MY_SIG_INFO'),
+                        json_extract(adif_record, '$.my_sig_info')
+                    )) as park_ref,
+                    qso_date,
+                    COUNT(*) as qso_count
+                FROM qsos
+                WHERE (
+                    UPPER(json_extract(adif_record, '$.MY_SIG')) = 'POTA'
+                    OR UPPER(json_extract(adif_record, '$.my_sig')) = 'POTA'
+                )
+                AND COALESCE(
+                    json_extract(adif_record, '$.MY_SIG_INFO'),
+                    json_extract(adif_record, '$.my_sig_info')
+                ) IS NOT NULL
+                GROUP BY park_ref, qso_date
+                "#,
+            )?;
+
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+
+        // For each local activation, count how many QSOs are already on POTA.app
+        let mut uploaded_parks_set = std::collections::HashSet::new();
+        let mut pending_parks_set = std::collections::HashSet::new();
+        let mut uploaded_activations: i64 = 0;
+        let mut uploaded_partial_activations: i64 = 0;
+        let mut pending_activations: i64 = 0;
+        let mut pending_partial_activations: i64 = 0;
+        let mut uploaded_qsos: i64 = 0;
+        let mut pending_qsos: i64 = 0;
+
+        for (park_ref, date, local_qso_count) in &local_activations {
+            let uploaded_count = self.count_pota_uploaded_qsos(park_ref, date).unwrap_or(0);
+            // Ensure pending_count is never negative (can happen if POTA.app has more QSOs
+            // than local, e.g., if QSOs were deleted locally or added directly on POTA.app)
+            let pending_count = (*local_qso_count - uploaded_count).max(0);
+            // Use the minimum of local_qso_count and uploaded_count for uploaded stats
+            // to avoid over-counting if remote has more than local
+            let actual_uploaded = uploaded_count.min(*local_qso_count);
+
+            // Track uploaded QSOs
+            uploaded_qsos += actual_uploaded;
+            pending_qsos += pending_count;
+
+            // Track parks
+            if uploaded_count > 0 {
+                uploaded_parks_set.insert(park_ref.clone());
+            }
+            if pending_count > 0 {
+                pending_parks_set.insert(park_ref.clone());
+            }
+
+            // Track activations
+            // An activation is considered uploaded if ALL its QSOs are on POTA.app
+            // An activation is pending if it has ANY QSOs not yet on POTA.app
+            let is_valid = *local_qso_count >= 10;
+
+            if pending_count == 0 && uploaded_count > 0 {
+                // All QSOs uploaded
+                if is_valid {
+                    uploaded_activations += 1;
+                } else {
+                    uploaded_partial_activations += 1;
+                }
+            } else if pending_count > 0 {
+                // Has pending QSOs
+                if is_valid {
+                    pending_activations += 1;
+                } else {
+                    pending_partial_activations += 1;
+                }
+            }
+        }
+
         Ok(PotaStats {
-            activations,
-            qsos,
-            valid_activations,
-            unique_parks,
+            download_parks,
+            download_activations,
+            download_partial_activations,
+            download_qsos,
+            uploaded_parks: uploaded_parks_set.len() as i64,
+            uploaded_activations,
+            uploaded_partial_activations,
+            uploaded_qsos,
+            pending_parks: pending_parks_set.len() as i64,
+            pending_activations,
+            pending_partial_activations,
+            pending_qsos,
         })
     }
 
@@ -1614,6 +1871,186 @@ impl Database {
         Ok(keys)
     }
 
+    /// Get ALL uploaded QSO keys from POTA.app in a single query
+    /// Returns a HashMap keyed by (park_ref, date) containing sets of (call, time_hhmm) pairs
+    /// This avoids the N+1 query pattern when checking multiple activations
+    #[allow(clippy::type_complexity)]
+    pub fn get_all_pota_uploaded_qso_keys(
+        &self,
+    ) -> Result<HashMap<(String, String), Vec<(String, String)>>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                reference,
+                DATE(qso_datetime) as qso_date,
+                UPPER(worked_callsign),
+                REPLACE(SUBSTR(qso_datetime, 12, 5), ':', '')
+            FROM pota_qsos
+            ORDER BY reference, qso_date
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?, // reference
+                row.get::<_, String>(1)?, // date (YYYY-MM-DD)
+                row.get::<_, String>(2)?, // call (uppercased)
+                row.get::<_, String>(3)?, // time (HHMM)
+            ))
+        })?;
+
+        let mut result: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+        for row in rows.flatten() {
+            let (reference, date_str, call, time) = row;
+            // Convert date from YYYY-MM-DD to YYYYMMDD to match activation.date format
+            let date_yyyymmdd = date_str.replace('-', "");
+            let key = (reference, date_yyyymmdd);
+            result.entry(key).or_default().push((call, time));
+        }
+        Ok(result)
+    }
+
+    // === POTA Upload Status Tracking ===
+
+    /// Try to start a POTA upload for an activation.
+    /// Returns Ok(true) if we successfully claimed the upload (no one else is uploading).
+    /// Returns Ok(false) if another process is already uploading this activation.
+    /// This uses INSERT OR IGNORE to atomically claim the upload.
+    pub fn try_start_pota_upload(
+        &self,
+        user_id: i64,
+        park_ref: &str,
+        date: &str,
+        qso_count: i64,
+    ) -> Result<bool> {
+        // First, check if there's already an upload in progress or completed recently
+        let existing: Option<(String, String)> = self
+            .conn
+            .query_row(
+                r#"
+                SELECT status, started_at FROM pota_upload_status
+                WHERE user_id = ?1 AND park_ref = ?2 AND date = ?3
+                "#,
+                params![user_id, park_ref, date],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        if let Some((status, started_at)) = existing {
+            match status.as_str() {
+                "uploading" => {
+                    // Check if it's stale (started more than 10 minutes ago)
+                    if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&started_at) {
+                        let age = Utc::now().signed_duration_since(started.with_timezone(&Utc));
+                        if age.num_minutes() < 10 {
+                            // Recent upload in progress, don't start another
+                            return Ok(false);
+                        }
+                        // Stale upload, we'll replace it below
+                    }
+                }
+                "uploaded" => {
+                    // Already uploaded, don't upload again
+                    return Ok(false);
+                }
+                "failed" => {
+                    // Previous attempt failed, we'll retry below
+                }
+                _ => {}
+            }
+        }
+
+        // Insert or replace the status
+        self.conn.execute(
+            r#"
+            INSERT INTO pota_upload_status (user_id, park_ref, date, status, qso_count, started_at, completed_at, error_message)
+            VALUES (?1, ?2, ?3, 'uploading', ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), NULL, NULL)
+            ON CONFLICT(user_id, park_ref, date) DO UPDATE SET
+                status = 'uploading',
+                qso_count = excluded.qso_count,
+                started_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                completed_at = NULL,
+                error_message = NULL
+            "#,
+            params![user_id, park_ref, date, qso_count],
+        )?;
+
+        Ok(true)
+    }
+
+    /// Mark a POTA upload as completed successfully
+    pub fn mark_pota_upload_completed(
+        &self,
+        user_id: i64,
+        park_ref: &str,
+        date: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE pota_upload_status
+            SET status = 'uploaded',
+                completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE user_id = ?1 AND park_ref = ?2 AND date = ?3
+            "#,
+            params![user_id, park_ref, date],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a POTA upload as failed
+    pub fn mark_pota_upload_failed(
+        &self,
+        user_id: i64,
+        park_ref: &str,
+        date: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE pota_upload_status
+            SET status = 'failed',
+                completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                error_message = ?4
+            WHERE user_id = ?1 AND park_ref = ?2 AND date = ?3
+            "#,
+            params![user_id, park_ref, date, error],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a POTA activation is currently being uploaded or was recently uploaded
+    /// Returns the status if found: "uploading", "uploaded", or "failed"
+    pub fn get_pota_upload_status(
+        &self,
+        user_id: i64,
+        park_ref: &str,
+        date: &str,
+    ) -> Result<Option<String>> {
+        let status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM pota_upload_status WHERE user_id = ?1 AND park_ref = ?2 AND date = ?3",
+                params![user_id, park_ref, date],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status)
+    }
+
+    /// Clear stale "uploading" statuses (older than 10 minutes)
+    /// This handles cases where an upload process crashed
+    pub fn clear_stale_pota_uploads(&self) -> Result<i64> {
+        let affected = self.conn.execute(
+            r#"
+            DELETE FROM pota_upload_status
+            WHERE status = 'uploading'
+              AND datetime(started_at) < datetime('now', '-10 minutes')
+            "#,
+            [],
+        )?;
+        Ok(affected as i64)
+    }
+
     // === LoFi Database Operations ===
 
     /// Insert or update a LoFi operation
@@ -1680,6 +2117,10 @@ impl Database {
         )?;
 
         for ref_item in &op.refs {
+            // Skip refs with empty or missing reference codes (e.g., placeholder refs from LoFi)
+            let Some(reference) = ref_item.reference.as_ref().filter(|s| !s.is_empty()) else {
+                continue;
+            };
             self.conn.execute(
                 r#"
                 INSERT INTO lofi_operation_refs (
@@ -1690,7 +2131,7 @@ impl Database {
                 params![
                     &op.uuid,
                     &ref_item.ref_type,
-                    &ref_item.reference,
+                    reference,
                     &ref_item.program,
                     &ref_item.name,
                     &ref_item.location,
@@ -1738,7 +2179,7 @@ impl Database {
             .query_map(params![operation_uuid], |row| {
                 Ok(crate::lofi::OperationRef {
                     ref_type: row.get(0)?,
-                    reference: row.get(1)?,
+                    reference: Some(row.get(1)?),
                     program: row.get(2)?,
                     name: row.get(3)?,
                     location: row.get(4)?,
@@ -1756,10 +2197,12 @@ impl Database {
     /// Returns true if this is a new QSO (not previously seen)
     /// `account_override` can be used to provide the account UUID from the operation
     /// when the QSO itself doesn't include it (per-operation endpoint)
+    /// `user_id` is used to associate the QSO with the correct user for data isolation
     pub fn upsert_lofi_qso(
         &self,
         qso: &crate::lofi::LofiQso,
         account_override: Option<&str>,
+        user_id: i64,
     ) -> Result<bool> {
         let existing: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM lofi_qsos WHERE lofi_uuid = ?1",
@@ -1873,21 +2316,33 @@ impl Database {
         }
 
         // Also insert into the main qsos table for unified QSO handling
-        // Get operation refs to populate POTA fields
-        let operation_refs = if let Some(op_uuid) = &qso.operation {
-            self.get_lofi_operation_refs(op_uuid).unwrap_or_default()
+        // Get operation refs and grid to populate POTA fields
+        let (operation_refs, operation_grid) = if let Some(op_uuid) = &qso.operation {
+            let refs = self.get_lofi_operation_refs(op_uuid).unwrap_or_default();
+            // Get operation grid from database
+            let grid: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT grid FROM lofi_operations WHERE lofi_uuid = ?1",
+                    params![op_uuid],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            (refs, grid)
         } else {
-            vec![]
+            (vec![], None)
         };
 
         // Convert LoFi QSO to ADIF QSO and insert into main table
-        if let Some(adif_qso) = qso.to_qso(&operation_refs) {
-            // Use source="lofi" and source_id=uuid for tracking
-            let _ = self.upsert_qso_with_source(
+        if let Some(adif_qso) = qso.to_qso(&operation_refs, operation_grid.as_deref()) {
+            // Use source="lofi" and source_id=uuid for tracking, with user_id for isolation
+            let _ = self.upsert_qso_with_source_for_user(
                 &adif_qso,
                 None, // no source file
                 qso_source::LOFI,
                 Some(&qso.uuid),
+                user_id,
             );
         }
 
@@ -2000,13 +2455,26 @@ pub struct LofiStats {
     pub pota_operations: i64,
 }
 
-/// POTA-specific statistics
-#[derive(Debug)]
+/// POTA-specific statistics with download/upload/pending breakdown
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PotaStats {
-    pub activations: i64,
-    pub qsos: i64,
-    pub valid_activations: i64,
-    pub unique_parks: i64,
+    // Download stats (from POTA.app)
+    pub download_parks: i64,
+    pub download_activations: i64,
+    pub download_partial_activations: i64,
+    pub download_qsos: i64,
+
+    // Upload stats (to POTA.app) - QSOs that exist in both local and remote
+    pub uploaded_parks: i64,
+    pub uploaded_activations: i64,
+    pub uploaded_partial_activations: i64,
+    pub uploaded_qsos: i64,
+
+    // Pending stats - local POTA QSOs not yet on POTA.app
+    pub pending_parks: i64,
+    pub pending_activations: i64,
+    pub pending_partial_activations: i64,
+    pub pending_qsos: i64,
 }
 
 /// Sync statistics showing downloaded/uploaded counts per integration
