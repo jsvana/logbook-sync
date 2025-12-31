@@ -13,7 +13,7 @@ pub use browser::{
     get_all_activation_qsos,
 };
 
-use chrono::NaiveDate;
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -1088,4 +1088,191 @@ pub async fn get_upload_jobs(
             }
         })
         .collect())
+}
+
+/// Result of verifying a POTA upload job
+#[derive(Debug, Clone)]
+pub enum VerificationResult {
+    /// Job completed successfully with QSOs inserted
+    Verified { job_id: u64, inserted: u32 },
+    /// Job completed but no QSOs were inserted (rejected/duplicate)
+    Rejected { job_id: u64, message: String },
+    /// Job failed with an error
+    Failed { job_id: u64, message: String },
+    /// Job is still processing (not yet complete)
+    Pending,
+    /// No matching job found
+    NotFound,
+}
+
+/// Find a matching job from a list of POTA upload jobs
+///
+/// Matches by park reference, callsign, and submission time within the given window.
+pub fn find_matching_job<'a>(
+    jobs: &'a [PotaUploadJob],
+    park_ref: &str,
+    callsign: &str,
+    started_at: DateTime<Utc>,
+    time_window: Duration,
+) -> Option<&'a PotaUploadJob> {
+    jobs.iter().find(|job| {
+        // Match park reference
+        if job.reference != park_ref {
+            return false;
+        }
+
+        // Match callsign (case-insensitive)
+        let job_callsign = job.callsign_used.as_deref().unwrap_or("");
+        if !job_callsign.eq_ignore_ascii_case(callsign) {
+            return false;
+        }
+
+        // Match submission time within window
+        // POTA job.submitted format: "2024-12-30T12:34:56Z" or similar
+        if let Ok(job_submitted) = DateTime::parse_from_rfc3339(&job.submitted) {
+            let job_time = job_submitted.with_timezone(&Utc);
+            let diff = if job_time > started_at {
+                job_time - started_at
+            } else {
+                started_at - job_time
+            };
+            diff <= time_window
+        } else {
+            // If we can't parse the time, don't match
+            false
+        }
+    })
+}
+
+/// Check the status of a matched job and return verification result
+pub fn check_job_status(job: &PotaUploadJob) -> VerificationResult {
+    match job.status {
+        2 => {
+            // Completed
+            if job.inserted > 0 {
+                VerificationResult::Verified {
+                    job_id: job.job_id,
+                    inserted: job.inserted,
+                }
+            } else {
+                VerificationResult::Rejected {
+                    job_id: job.job_id,
+                    message: format!("No QSOs inserted (submitted: {}, inserted: 0)", job.total),
+                }
+            }
+        }
+        0 | 1 => {
+            // Pending or Processing
+            VerificationResult::Pending
+        }
+        7 => {
+            // Duplicate
+            VerificationResult::Rejected {
+                job_id: job.job_id,
+                message: "Duplicate upload".to_string(),
+            }
+        }
+        status => {
+            // Other error states
+            VerificationResult::Failed {
+                job_id: job.job_id,
+                message: format!("Job failed with status {}", status),
+            }
+        }
+    }
+}
+
+/// Verify a POTA upload by polling for job completion
+///
+/// Polls the POTA jobs API up to `max_attempts` times with increasing delays.
+/// Returns the verification result once the job completes or times out.
+pub async fn verify_upload(
+    uploader: &mut PotaUploader,
+    park_ref: &str,
+    callsign: &str,
+    started_at: DateTime<Utc>,
+    max_attempts: u32,
+) -> Result<VerificationResult> {
+    let time_window = Duration::minutes(5);
+    let delays_ms = [5000, 10000, 15000]; // 5s, 10s, 15s
+
+    for attempt in 0..max_attempts {
+        // Wait before polling (except first attempt)
+        if attempt > 0 {
+            let delay = delays_ms
+                .get(attempt as usize - 1)
+                .copied()
+                .unwrap_or(15000);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+
+        // Fetch current jobs
+        let jobs = uploader
+            .get_jobs()
+            .await
+            .map_err(|e| Error::Other(format!("Failed to get POTA jobs: {}", e)))?;
+
+        // Find matching job
+        if let Some(job) = find_matching_job(&jobs, park_ref, callsign, started_at, time_window) {
+            let result = check_job_status(job);
+            match &result {
+                VerificationResult::Pending => {
+                    // Job still processing, continue polling
+                    info!(
+                        park_ref = %park_ref,
+                        job_id = job.job_id,
+                        attempt = attempt + 1,
+                        "Job still processing, will retry"
+                    );
+                    continue;
+                }
+                VerificationResult::Verified { job_id, inserted } => {
+                    info!(
+                        park_ref = %park_ref,
+                        job_id = %job_id,
+                        inserted = %inserted,
+                        "Upload verified successfully"
+                    );
+                    return Ok(result);
+                }
+                VerificationResult::Rejected { job_id, message } => {
+                    warn!(
+                        park_ref = %park_ref,
+                        job_id = %job_id,
+                        message = %message,
+                        "Upload was rejected"
+                    );
+                    return Ok(result);
+                }
+                VerificationResult::Failed { job_id, message } => {
+                    warn!(
+                        park_ref = %park_ref,
+                        job_id = %job_id,
+                        message = %message,
+                        "Upload job failed"
+                    );
+                    return Ok(result);
+                }
+                VerificationResult::NotFound => unreachable!(),
+            }
+        } else {
+            info!(
+                park_ref = %park_ref,
+                attempt = attempt + 1,
+                "No matching job found yet, will retry"
+            );
+        }
+    }
+
+    // After all attempts, check one more time for the job
+    let jobs = uploader
+        .get_jobs()
+        .await
+        .map_err(|e| Error::Other(format!("Failed to get POTA jobs: {}", e)))?;
+
+    if let Some(job) = find_matching_job(&jobs, park_ref, callsign, started_at, time_window) {
+        Ok(check_job_status(job))
+    } else {
+        Ok(VerificationResult::NotFound)
+    }
 }

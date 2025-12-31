@@ -530,6 +530,23 @@ impl Database {
             "#,
         )?;
 
+        // Add job verification columns to pota_upload_status (migration v7)
+        let pota_columns: Vec<String> = self
+            .conn
+            .prepare("PRAGMA table_info(pota_upload_status)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<_, _>>()?;
+
+        if !pota_columns.is_empty() && !pota_columns.contains(&"job_id".to_string()) {
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE pota_upload_status ADD COLUMN job_id INTEGER;
+                ALTER TABLE pota_upload_status ADD COLUMN verified_inserted INTEGER;
+                ALTER TABLE pota_upload_status ADD COLUMN callsign TEXT;
+                "#,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -1922,6 +1939,7 @@ impl Database {
         park_ref: &str,
         date: &str,
         qso_count: i64,
+        callsign: &str,
     ) -> Result<bool> {
         // First, check if there's already an upload in progress or completed recently
         let existing: Option<(String, String)> = self
@@ -1938,7 +1956,7 @@ impl Database {
 
         if let Some((status, started_at)) = existing {
             match status.as_str() {
-                "uploading" => {
+                "uploading" | "pending_verification" => {
                     // Check if it's stale (started more than 10 minutes ago)
                     if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&started_at) {
                         let age = Utc::now().signed_duration_since(started.with_timezone(&Utc));
@@ -1963,16 +1981,19 @@ impl Database {
         // Insert or replace the status
         self.conn.execute(
             r#"
-            INSERT INTO pota_upload_status (user_id, park_ref, date, status, qso_count, started_at, completed_at, error_message)
-            VALUES (?1, ?2, ?3, 'uploading', ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), NULL, NULL)
+            INSERT INTO pota_upload_status (user_id, park_ref, date, status, qso_count, started_at, completed_at, error_message, callsign)
+            VALUES (?1, ?2, ?3, 'uploading', ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), NULL, NULL, ?5)
             ON CONFLICT(user_id, park_ref, date) DO UPDATE SET
                 status = 'uploading',
                 qso_count = excluded.qso_count,
                 started_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                 completed_at = NULL,
-                error_message = NULL
+                error_message = NULL,
+                callsign = excluded.callsign,
+                job_id = NULL,
+                verified_inserted = NULL
             "#,
-            params![user_id, park_ref, date, qso_count],
+            params![user_id, park_ref, date, qso_count, callsign],
         )?;
 
         Ok(true)
@@ -2045,6 +2066,112 @@ impl Database {
             DELETE FROM pota_upload_status
             WHERE status = 'uploading'
               AND datetime(started_at) < datetime('now', '-10 minutes')
+            "#,
+            [],
+        )?;
+        Ok(affected as i64)
+    }
+
+    /// Mark a POTA upload as pending verification (file accepted, awaiting job completion)
+    pub fn mark_pota_upload_pending_verification(
+        &self,
+        user_id: i64,
+        park_ref: &str,
+        date: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE pota_upload_status
+            SET status = 'pending_verification'
+            WHERE user_id = ?1 AND park_ref = ?2 AND date = ?3
+            "#,
+            params![user_id, park_ref, date],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a POTA upload as verified with job details
+    pub fn mark_pota_upload_verified(
+        &self,
+        user_id: i64,
+        park_ref: &str,
+        date: &str,
+        job_id: u64,
+        verified_inserted: u32,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE pota_upload_status
+            SET status = 'uploaded',
+                completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                job_id = ?4,
+                verified_inserted = ?5
+            WHERE user_id = ?1 AND park_ref = ?2 AND date = ?3
+            "#,
+            params![user_id, park_ref, date, job_id, verified_inserted],
+        )?;
+        Ok(())
+    }
+
+    /// Get pending POTA verifications for a user (uploads awaiting job confirmation)
+    /// Returns list of (park_ref, date, callsign, started_at)
+    pub fn get_pending_pota_verifications(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT park_ref, date, callsign, started_at
+            FROM pota_upload_status
+            WHERE user_id = ?1
+              AND status = 'pending_verification'
+              AND datetime(started_at) > datetime('now', '-1 hour')
+            ORDER BY started_at DESC
+            "#,
+        )?;
+
+        let results = stmt
+            .query_map(params![user_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(results)
+    }
+
+    /// Get all users with pending POTA verifications
+    pub fn get_users_with_pending_pota_verifications(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT DISTINCT user_id
+            FROM pota_upload_status
+            WHERE status = 'pending_verification'
+              AND datetime(started_at) > datetime('now', '-1 hour')
+            "#,
+        )?;
+
+        let results = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(results)
+    }
+
+    /// Mark stale pending verifications as failed (older than 1 hour)
+    pub fn fail_stale_pota_verifications(&self) -> Result<i64> {
+        let affected = self.conn.execute(
+            r#"
+            UPDATE pota_upload_status
+            SET status = 'failed',
+                completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                error_message = 'Verification timed out after 1 hour'
+            WHERE status = 'pending_verification'
+              AND datetime(started_at) < datetime('now', '-1 hour')
             "#,
             [],
         )?;

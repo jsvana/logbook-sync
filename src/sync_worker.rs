@@ -7,6 +7,9 @@ use crate::config::{PotaAuthServiceConfig, SyncConfig};
 use crate::crypto::MasterKey;
 use crate::db::{Database, integrations, users};
 use crate::lofi::{LofiClient, LofiConfig};
+use crate::metrics::{
+    POTA_ACTIVATIONS_FETCHED, POTA_CONCURRENT_SYNCS, POTA_PENDING_ACTIVATIONS, POTA_QSOS_PER_SYNC,
+};
 use crate::ntfy::{NtfyClient, NtfyConfig};
 use crate::qrz::QrzClient;
 use chrono::{DateTime, Utc};
@@ -54,6 +57,9 @@ pub struct SyncWorkerState {
     pota_auth_service: Option<PotaAuthServiceConfig>,
     /// Track when each (user_id, integration, direction) was last synced
     last_sync_times: RwLock<HashMap<(i64, String, String), DateTime<Utc>>>,
+    /// Per-user mutexes to serialize POTA auth (prevents race between download/upload for same user)
+    /// Different users can authenticate in parallel, improving throughput for multi-user deployments
+    pota_auth_locks: RwLock<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SyncWorkerState {
@@ -69,7 +75,32 @@ impl SyncWorkerState {
             sync_config,
             pota_auth_service,
             last_sync_times: RwLock::new(HashMap::new()),
+            pota_auth_locks: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Get or create a per-user POTA auth lock
+    /// This allows different users to authenticate in parallel while preventing
+    /// race conditions between upload and download for the same user
+    async fn get_pota_auth_lock(&self, user_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+        // First check with read lock (fast path for existing lock)
+        {
+            let locks = self.pota_auth_locks.read().await;
+            if let Some(lock) = locks.get(&user_id) {
+                return Arc::clone(lock);
+            }
+        }
+
+        // Need to create a new lock - use write lock
+        let mut locks = self.pota_auth_locks.write().await;
+        // Double-check in case another task created it while we waited for write lock
+        if let Some(lock) = locks.get(&user_id) {
+            return Arc::clone(lock);
+        }
+
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(user_id, Arc::clone(&lock));
+        lock
     }
 
     /// Check if a sync task is due based on last sync time and configured interval
@@ -276,9 +307,16 @@ async fn sync_scheduler(state: Arc<SyncWorkerState>) {
 
     // Check every 30 seconds for work to do
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+    let mut tick_count: u64 = 0;
 
     loop {
         interval.tick().await;
+        tick_count += 1;
+
+        // Run POTA upload verification every 60 seconds (every 2 ticks)
+        if tick_count.is_multiple_of(2) {
+            verify_pending_pota_uploads(&state).await;
+        }
 
         // Collect pending tasks synchronously (no await while holding db connection)
         let pending_tasks = match collect_pending_tasks(&state).await {
@@ -659,20 +697,24 @@ async fn run_sync_task(
             run_qrz_download(&state.db_path, task.user_id, qrz_config).await
         }
         ("pota", "download", integrations::IntegrationConfig::Pota(pota_config)) => {
+            let pota_auth_lock = state.get_pota_auth_lock(task.user_id).await;
             run_pota_download(
                 &state.db_path,
                 task.user_id,
                 pota_config,
                 state.pota_auth_service.as_ref(),
+                &pota_auth_lock,
             )
             .await
         }
         ("pota", "upload", integrations::IntegrationConfig::Pota(pota_config)) => {
+            let pota_auth_lock = state.get_pota_auth_lock(task.user_id).await;
             run_pota_upload(
                 &state.db_path,
                 task.user_id,
                 pota_config,
                 state.pota_auth_service.as_ref(),
+                &pota_auth_lock,
             )
             .await
         }
@@ -928,7 +970,7 @@ async fn run_lofi_download(
                         continue;
                     }
 
-                    match db.upsert_lofi_qso(qso, Some(&op.account)) {
+                    match db.upsert_lofi_qso(qso, Some(&op.account), user_id) {
                         Ok(is_new) => {
                             total_qsos += 1;
                             if is_new {
@@ -1167,7 +1209,13 @@ async fn run_qrz_download(
         let db = Database::open(db_path)?;
         for fetched in &fetched_qsos {
             let source_id = fetched.qrz_logid.map(|id| id.to_string());
-            match db.upsert_qso_with_source_ext(&fetched.qso, None, "qrz", source_id.as_deref()) {
+            match db.upsert_qso_with_source_ext(
+                &fetched.qso,
+                None,
+                "qrz",
+                source_id.as_deref(),
+                Some(user_id),
+            ) {
                 Ok((_id, is_new)) => {
                     imported += 1;
                     if is_new {
@@ -1213,11 +1261,18 @@ async fn run_pota_download(
     user_id: i64,
     config: &integrations::PotaIntegrationConfig,
     auth_service_config: Option<&PotaAuthServiceConfig>,
+    pota_auth_lock: &tokio::sync::Mutex<()>,
 ) -> crate::Result<SyncTaskResult> {
     use crate::pota::auth_service::PotaAuthServiceClient;
     use crate::pota::browser::PotaUploader;
 
     info!(user_id = user_id, "Starting POTA download sync");
+
+    // Track concurrent POTA syncs
+    POTA_CONCURRENT_SYNCS.inc();
+
+    // Open database once and reuse connection throughout
+    let db = Database::open(db_path)?;
 
     // Create POTA uploader (which also handles downloads)
     let cache_dir = dirs::cache_dir()
@@ -1234,6 +1289,14 @@ async fn run_pota_download(
     );
 
     // Set up remote auth service client if configured
+    debug!(
+        "POTA download: auth_service_config is {}",
+        if auth_service_config.is_some() {
+            "Some"
+        } else {
+            "None"
+        }
+    );
     if let Some(auth_config) = auth_service_config {
         match PotaAuthServiceClient::new(auth_config.clone()) {
             Ok(client) => {
@@ -1249,11 +1312,22 @@ async fn run_pota_download(
         }
     }
 
+    // Acquire lock to serialize POTA authentication across tasks
+    // This prevents race conditions where download and upload both try to auth simultaneously
+    debug!("POTA download: waiting for auth lock");
+    let _auth_guard = pota_auth_lock.lock().await;
+    debug!("POTA download: acquired auth lock");
+
     // Ensure authenticated (async operation, uses remote service if configured)
     uploader
         .ensure_authenticated_async()
         .await
         .map_err(|e| crate::Error::Other(format!("POTA authentication failed: {}", e)))?;
+
+    // Release lock after authentication (drop happens automatically at end of scope,
+    // but we can drop early since we have valid tokens now)
+    drop(_auth_guard);
+    debug!("POTA download: released auth lock");
 
     // Get activations
     let activations = uploader
@@ -1261,27 +1335,51 @@ async fn run_pota_download(
         .await
         .map_err(|e| crate::Error::Other(format!("Failed to get POTA activations: {}", e)))?;
 
+    // Record metrics for activations fetched
+    POTA_ACTIVATIONS_FETCHED.inc_by(activations.len() as u64);
+
+    info!(
+        user_id = user_id,
+        count = activations.len(),
+        "Fetched POTA activations from API"
+    );
+
+    if activations.is_empty() {
+        info!(
+            user_id = user_id,
+            "No POTA activations found - user may not have any activations on POTA.app"
+        );
+    }
+
     let mut activations_saved = 0i64;
     let mut qsos_saved = 0i64;
     let mut new_qsos = 0i64;
 
-    // Save activations to database
-    {
-        let db = Database::open(db_path)?;
-        for activation in &activations {
-            if let Err(e) = db.upsert_pota_activation(activation) {
-                warn!(
-                    reference = %activation.reference,
-                    "Failed to save POTA activation: {}", e
-                );
-            } else {
-                activations_saved += 1;
-            }
+    // Save activations to database (reusing connection)
+    for (i, activation) in activations.iter().enumerate() {
+        if let Err(e) = db.upsert_pota_activation(activation) {
+            warn!(
+                reference = %activation.reference,
+                "Failed to save POTA activation: {}", e
+            );
+        } else {
+            activations_saved += 1;
+        }
+        // Yield to allow other async tasks to progress during CPU-bound work
+        if (i + 1) % 10 == 0 {
+            tokio::task::yield_now().await;
         }
     }
 
     // Download QSOs for each activation
     for activation in &activations {
+        debug!(
+            reference = %activation.reference,
+            date = %activation.date,
+            total = activation.total,
+            "Fetching QSOs for POTA activation"
+        );
+
         let qsos = match uploader
             .get_activation_qsos(&activation.reference, &activation.date)
             .await
@@ -1297,21 +1395,29 @@ async fn run_pota_download(
             }
         };
 
-        // Save QSOs to database
-        {
-            let db = Database::open(db_path)?;
-            for qso in &qsos {
-                match db.upsert_pota_qso(qso) {
-                    Ok(is_new) => {
-                        qsos_saved += 1;
-                        if is_new {
-                            new_qsos += 1;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to save POTA QSO: {}", e);
+        debug!(
+            reference = %activation.reference,
+            date = %activation.date,
+            qsos_fetched = qsos.len(),
+            "Fetched QSOs for POTA activation"
+        );
+
+        // Save QSOs to database (reusing connection)
+        for (i, qso) in qsos.iter().enumerate() {
+            match db.upsert_pota_qso(qso) {
+                Ok(is_new) => {
+                    qsos_saved += 1;
+                    if is_new {
+                        new_qsos += 1;
                     }
                 }
+                Err(e) => {
+                    warn!("Failed to save POTA QSO: {}", e);
+                }
+            }
+            // Yield to allow other async tasks to progress during CPU-bound work
+            if (i + 1) % 10 == 0 {
+                tokio::task::yield_now().await;
             }
         }
 
@@ -1319,22 +1425,25 @@ async fn run_pota_download(
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 
-    // Record sync result
-    {
-        let db = Database::open(db_path)?;
-        let message = format!(
-            "Downloaded {} activations, {} QSOs ({} new) from POTA.app",
-            activations_saved, qsos_saved, new_qsos
-        );
-        integrations::record_sync_success(
-            db.conn(),
-            user_id,
-            "pota",
-            "download",
-            qsos_saved,
-            Some(&message),
-        )?;
-    }
+    // Record sync result (reusing connection)
+    let message = format!(
+        "Downloaded {} activations, {} QSOs ({} new) from POTA.app",
+        activations_saved, qsos_saved, new_qsos
+    );
+    integrations::record_sync_success(
+        db.conn(),
+        user_id,
+        "pota",
+        "download",
+        qsos_saved,
+        Some(&message),
+    )?;
+
+    // Record QSOs per sync metric
+    POTA_QSOS_PER_SYNC
+        .with_label_values(&["download"])
+        .observe(qsos_saved as f64);
+    POTA_CONCURRENT_SYNCS.dec();
 
     info!(
         user_id = user_id,
@@ -1355,62 +1464,141 @@ async fn run_pota_upload(
     user_id: i64,
     config: &integrations::PotaIntegrationConfig,
     auth_service_config: Option<&PotaAuthServiceConfig>,
+    pota_auth_lock: &tokio::sync::Mutex<()>,
 ) -> crate::Result<SyncTaskResult> {
+    use crate::db::users;
+
     info!(user_id = user_id, "Starting POTA upload sync");
 
-    // Get all QSOs from database
-    let qsos = {
-        let db = Database::open(db_path)?;
-        db.get_all_qsos()?
+    // Track concurrent POTA syncs
+    POTA_CONCURRENT_SYNCS.inc();
+
+    // Open database once and reuse connection throughout
+    let db = Database::open(db_path)?;
+
+    // Get the user's callsign to filter QSOs (only sync this user's QSOs)
+    let user_callsign = match users::get_user_by_id(db.conn(), user_id)? {
+        Some(user) => user.callsign,
+        None => {
+            warn!(user_id = user_id, "User not found for POTA upload");
+            return Ok(SyncTaskResult::default());
+        }
     };
+
+    let user_callsign = match user_callsign {
+        Some(c) => c.to_uppercase(),
+        None => {
+            warn!(
+                user_id = user_id,
+                "User has no callsign configured, skipping POTA upload"
+            );
+            return Ok(SyncTaskResult::default());
+        }
+    };
+
+    // Get only POTA-tagged QSOs for this user (with proper user isolation)
+    let qsos = db.get_pota_qsos_for_user(user_id, &user_callsign)?;
+
+    debug!(
+        user_id = user_id,
+        callsign = %user_callsign,
+        pota_qso_count = qsos.len(),
+        "Loaded POTA QSOs for user"
+    );
 
     // Generate preview to see what activations need uploading
     let preview = crate::pota::preview_upload(&qsos);
 
     // Check which activations have pending QSOs (not fully uploaded)
+    // Use batch query to get all uploaded keys at once (avoids N+1 query problem)
+    let all_uploaded_keys = db.get_all_pota_uploaded_qso_keys().unwrap_or_default();
+
     let mut activations_to_upload = Vec::new();
 
+    for (i, activation) in preview
+        .valid_activations
+        .iter()
+        .chain(preview.invalid_activations.iter())
+        .enumerate()
     {
-        let db = Database::open(db_path)?;
-        for activation in preview
-            .valid_activations
+        // Get uploaded keys for this specific activation from the batch result
+        let activation_key = (activation.park_ref.clone(), activation.date.clone());
+        let uploaded_keys = all_uploaded_keys.get(&activation_key);
+
+        // Count how many QSOs in this activation are NOT already uploaded
+        let pending_count = activation
+            .qsos
             .iter()
-            .chain(preview.invalid_activations.iter())
-        {
-            // Check how many QSOs are already uploaded for this activation
-            let uploaded_keys = db
-                .get_pota_uploaded_qso_keys(&activation.park_ref, &activation.date)
-                .unwrap_or_default();
+            .filter(|q| {
+                let call_upper = q.call.to_uppercase();
+                let time_hhmm = &q.time_on[..4.min(q.time_on.len())];
+                match uploaded_keys {
+                    Some(keys) => {
+                        // Check if (call, time) pair exists in uploaded keys
+                        !keys
+                            .iter()
+                            .any(|(c, t): &(String, String)| c == &call_upper && t == time_hhmm)
+                    }
+                    None => true, // No uploaded keys means all are pending
+                }
+            })
+            .count();
 
-            // Count how many QSOs in this activation are NOT already uploaded
-            let pending_count = activation
+        if pending_count > 0 {
+            // Get callsign from first QSO for tracking
+            let callsign = activation
                 .qsos
-                .iter()
-                .filter(|q| {
-                    let key = (
-                        q.call.to_uppercase(),
-                        q.time_on[..4.min(q.time_on.len())].to_string(),
-                    );
-                    !uploaded_keys.contains(&key)
-                })
-                .count();
+                .first()
+                .and_then(|q| q.station_callsign.as_deref())
+                .unwrap_or("UNKNOWN");
 
-            if pending_count > 0 {
-                debug!(
-                    park_ref = %activation.park_ref,
-                    date = %activation.date,
-                    pending = pending_count,
-                    "Activation has pending QSOs to upload"
-                );
-                activations_to_upload.push(activation.clone());
+            // Try to claim this activation for upload (prevents duplicate uploads)
+            match db.try_start_pota_upload(
+                user_id,
+                &activation.park_ref,
+                &activation.date,
+                pending_count as i64,
+                callsign,
+            ) {
+                Ok(true) => {
+                    debug!(
+                        park_ref = %activation.park_ref,
+                        date = %activation.date,
+                        pending = pending_count,
+                        "Claimed activation for upload"
+                    );
+                    activations_to_upload.push(activation.clone());
+                }
+                Ok(false) => {
+                    debug!(
+                        park_ref = %activation.park_ref,
+                        date = %activation.date,
+                        "Activation already being uploaded or was recently uploaded, skipping"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        park_ref = %activation.park_ref,
+                        date = %activation.date,
+                        error = %e,
+                        "Failed to check upload status, skipping activation"
+                    );
+                }
             }
         }
+
+        // Yield to allow other async tasks to progress during CPU-bound work
+        if (i + 1) % 10 == 0 {
+            tokio::task::yield_now().await;
+        }
     }
+
+    // Record pending activations metric
+    POTA_PENDING_ACTIVATIONS.set(activations_to_upload.len() as i64);
 
     if activations_to_upload.is_empty() {
         info!(user_id = user_id, "No pending POTA activations to upload");
         // Record sync success with 0 items
-        let db = Database::open(db_path)?;
         integrations::record_sync_success(
             db.conn(),
             user_id,
@@ -1419,6 +1607,7 @@ async fn run_pota_upload(
             0,
             Some("No pending activations"),
         )?;
+        POTA_CONCURRENT_SYNCS.dec();
         return Ok(SyncTaskResult::default());
     }
 
@@ -1428,7 +1617,13 @@ async fn run_pota_upload(
         "Uploading pending POTA activations"
     );
 
-    // Upload activations
+    // Acquire lock to serialize POTA authentication across tasks
+    // This prevents race conditions where download and upload both try to auth simultaneously
+    debug!("POTA upload: waiting for auth lock");
+    let _auth_guard = pota_auth_lock.lock().await;
+    debug!("POTA upload: acquired auth lock");
+
+    // Upload activations (authentication happens inside, will use cached tokens if available)
     let result = crate::pota::upload_to_pota_with_auth_service(
         &config.email,
         &config.password,
@@ -1436,35 +1631,75 @@ async fn run_pota_upload(
         auth_service_config,
         None,
     )
-    .await
-    .map_err(|e| crate::Error::Other(format!("POTA upload failed: {}", e)))?;
+    .await;
 
-    // Record sync result
-    {
-        let db = Database::open(db_path)?;
-        if result.errors.is_empty() {
-            let message = format!(
-                "Uploaded {} activations, {} QSOs to POTA.app",
-                result.activations_uploaded, result.qsos_uploaded
+    // Release lock after upload completes (includes authentication)
+    drop(_auth_guard);
+    debug!("POTA upload: released auth lock");
+
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            // Upload failed - mark all claimed activations as failed
+            let error_msg = format!("POTA upload failed: {}", e);
+            for activation in &activations_to_upload {
+                let _ = db.mark_pota_upload_failed(
+                    user_id,
+                    &activation.park_ref,
+                    &activation.date,
+                    &error_msg,
+                );
+            }
+            return Err(crate::Error::Other(error_msg));
+        }
+    };
+
+    // Mark all claimed activations as pending verification
+    // Background verification will check POTA jobs API to confirm actual success
+    for activation in &activations_to_upload {
+        if let Err(e) = db.mark_pota_upload_pending_verification(
+            user_id,
+            &activation.park_ref,
+            &activation.date,
+        ) {
+            warn!(
+                park_ref = %activation.park_ref,
+                date = %activation.date,
+                error = %e,
+                "Failed to mark activation as pending verification"
             );
-            integrations::record_sync_success(
-                db.conn(),
-                user_id,
-                "pota",
-                "upload",
-                result.qsos_uploaded as i64,
-                Some(&message),
-            )?;
-        } else {
-            let message = format!(
-                "Uploaded {} activations, {} QSOs ({} errors)",
-                result.activations_uploaded,
-                result.qsos_uploaded,
-                result.errors.len()
-            );
-            integrations::record_sync_error(db.conn(), user_id, "pota", "upload", &message)?;
         }
     }
+
+    // Record sync result (reusing existing database connection)
+    if result.errors.is_empty() {
+        let message = format!(
+            "Uploaded {} activations, {} QSOs to POTA.app",
+            result.activations_uploaded, result.qsos_uploaded
+        );
+        integrations::record_sync_success(
+            db.conn(),
+            user_id,
+            "pota",
+            "upload",
+            result.qsos_uploaded as i64,
+            Some(&message),
+        )?;
+    } else {
+        let message = format!(
+            "Uploaded {} activations, {} QSOs ({} errors)",
+            result.activations_uploaded,
+            result.qsos_uploaded,
+            result.errors.len()
+        );
+        integrations::record_sync_error(db.conn(), user_id, "pota", "upload", &message)?;
+    }
+
+    // Record QSOs per sync metric
+    POTA_QSOS_PER_SYNC
+        .with_label_values(&["upload"])
+        .observe(result.qsos_uploaded as f64);
+    POTA_CONCURRENT_SYNCS.dec();
 
     info!(
         user_id = user_id,
@@ -1477,4 +1712,244 @@ async fn run_pota_upload(
         uploads: result.qsos_uploaded as i64,
         ..Default::default()
     })
+}
+
+/// Verify pending POTA uploads by checking job status
+///
+/// This function runs periodically to verify uploads that are in 'pending_verification' status.
+/// It fetches the POTA jobs API and matches pending uploads to completed jobs.
+pub async fn verify_pending_pota_uploads(state: &Arc<SyncWorkerState>) {
+    let db = match Database::open(&state.db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            warn!(error = %e, "Failed to open database for POTA verification");
+            return;
+        }
+    };
+
+    // First, fail any stale pending verifications (older than 1 hour)
+    match db.fail_stale_pota_verifications() {
+        Ok(count) if count > 0 => {
+            warn!(
+                count = count,
+                "Failed stale POTA verifications (older than 1 hour)"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = %e, "Failed to check for stale POTA verifications");
+        }
+    }
+
+    // Get all users with pending verifications
+    let user_ids = match db.get_users_with_pending_pota_verifications() {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(error = %e, "Failed to get users with pending POTA verifications");
+            return;
+        }
+    };
+
+    if user_ids.is_empty() {
+        return;
+    }
+
+    debug!(
+        user_count = user_ids.len(),
+        "Found users with pending POTA verifications"
+    );
+
+    for user_id in user_ids {
+        if let Err(e) = verify_user_pota_uploads(state, user_id).await {
+            warn!(
+                user_id = user_id,
+                error = %e,
+                "Failed to verify POTA uploads for user"
+            );
+        }
+    }
+}
+
+/// Verify pending POTA uploads for a specific user
+async fn verify_user_pota_uploads(state: &Arc<SyncWorkerState>, user_id: i64) -> crate::Result<()> {
+    // Get pending verifications and POTA config (sync, before any awaits)
+    let (pending, pota_config) = {
+        let db = Database::open(&state.db_path)?;
+        let pending = db.get_pending_pota_verifications(user_id)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        debug!(
+            user_id = user_id,
+            count = pending.len(),
+            "Verifying pending POTA uploads"
+        );
+
+        let conn = db.conn();
+        let user = users::get_user_by_id(conn, user_id)?
+            .ok_or_else(|| crate::Error::Other("User not found".to_string()))?;
+        let user_salt = users::get_user_encryption_salt(&user)?;
+
+        let user_integrations =
+            integrations::get_user_integrations(conn, &state.master_key, user_id, &user_salt)
+                .map_err(|e| {
+                    crate::Error::Other(format!("Failed to get user integrations: {}", e))
+                })?;
+
+        let pota_config = user_integrations
+            .into_iter()
+            .find_map(|i| {
+                if let integrations::IntegrationConfig::Pota(config) = i.config {
+                    Some(config)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                warn!(
+                    user_id = user_id,
+                    "No POTA config found for user with pending verifications"
+                );
+                crate::Error::Other("No POTA config found".to_string())
+            })?;
+
+        (pending, pota_config)
+    }; // db dropped here before any await
+
+    // Create POTA uploader and authenticate
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("logbook-sync");
+    std::fs::create_dir_all(&cache_dir).ok();
+    let cache_path = cache_dir.join(format!("pota_tokens_{}.json", user_id));
+
+    let mut uploader = crate::pota::PotaUploader::new(
+        pota_config.email.clone(),
+        pota_config.password.clone(),
+        cache_path,
+        true,
+    );
+
+    // Configure auth service if available
+    if let Some(ref auth_config) = state.pota_auth_service
+        && let Ok(client) = crate::pota::PotaAuthServiceClient::new(auth_config.clone())
+    {
+        uploader.set_auth_service_client(client);
+    }
+
+    // Authenticate
+    uploader
+        .ensure_authenticated_async()
+        .await
+        .map_err(|e| crate::Error::Other(format!("POTA authentication failed: {}", e)))?;
+
+    // Fetch jobs
+    let jobs = uploader
+        .get_jobs()
+        .await
+        .map_err(|e| crate::Error::Other(format!("Failed to get POTA jobs: {}", e)))?;
+
+    // Verify each pending upload
+    let time_window = chrono::Duration::minutes(5);
+    let db_path = state.db_path.clone();
+
+    for (park_ref, date, callsign, started_at) in pending {
+        // Parse started_at timestamp
+        let started = match chrono::DateTime::parse_from_rfc3339(&started_at) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(_) => {
+                warn!(
+                    park_ref = %park_ref,
+                    date = %date,
+                    "Invalid started_at timestamp, skipping"
+                );
+                continue;
+            }
+        };
+
+        // Find matching job
+        if let Some(job) =
+            crate::pota::find_matching_job(&jobs, &park_ref, &callsign, started, time_window)
+        {
+            let result = crate::pota::check_job_status(job);
+
+            // Open database for status update
+            let db = match Database::open(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    warn!(error = %e, "Failed to open database for verification update");
+                    continue;
+                }
+            };
+
+            match result {
+                crate::pota::VerificationResult::Verified { job_id, inserted } => {
+                    info!(
+                        user_id = user_id,
+                        park_ref = %park_ref,
+                        date = %date,
+                        job_id = job_id,
+                        inserted = inserted,
+                        "POTA upload verified"
+                    );
+                    if let Err(e) =
+                        db.mark_pota_upload_verified(user_id, &park_ref, &date, job_id, inserted)
+                    {
+                        warn!(error = %e, "Failed to mark upload as verified");
+                    }
+                }
+                crate::pota::VerificationResult::Rejected { job_id, message } => {
+                    warn!(
+                        user_id = user_id,
+                        park_ref = %park_ref,
+                        date = %date,
+                        job_id = job_id,
+                        message = %message,
+                        "POTA upload was rejected"
+                    );
+                    if let Err(e) = db.mark_pota_upload_failed(user_id, &park_ref, &date, &message)
+                    {
+                        warn!(error = %e, "Failed to mark upload as failed");
+                    }
+                }
+                crate::pota::VerificationResult::Failed { job_id, message } => {
+                    warn!(
+                        user_id = user_id,
+                        park_ref = %park_ref,
+                        date = %date,
+                        job_id = job_id,
+                        message = %message,
+                        "POTA upload job failed"
+                    );
+                    if let Err(e) = db.mark_pota_upload_failed(user_id, &park_ref, &date, &message)
+                    {
+                        warn!(error = %e, "Failed to mark upload as failed");
+                    }
+                }
+                crate::pota::VerificationResult::Pending => {
+                    debug!(
+                        park_ref = %park_ref,
+                        date = %date,
+                        "POTA job still pending, will check again"
+                    );
+                }
+                crate::pota::VerificationResult::NotFound => {
+                    debug!(
+                        park_ref = %park_ref,
+                        date = %date,
+                        "No matching POTA job found yet"
+                    );
+                }
+            }
+        } else {
+            debug!(
+                park_ref = %park_ref,
+                date = %date,
+                "No matching POTA job found"
+            );
+        }
+    }
+
+    Ok(())
 }

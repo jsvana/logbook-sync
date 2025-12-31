@@ -2717,8 +2717,16 @@ async fn pota_upload(
             continue;
         }
 
+        // Get callsign from first QSO for tracking
+        let callsign = a
+            .qsos
+            .first()
+            .and_then(|q| q.station_callsign.as_deref())
+            .unwrap_or("UNKNOWN");
+
         // Try to claim this activation for upload (prevents concurrent uploads)
-        match db.try_start_pota_upload(user.id, &a.park_ref, &a.date, a.qsos.len() as i64) {
+        match db.try_start_pota_upload(user.id, &a.park_ref, &a.date, a.qsos.len() as i64, callsign)
+        {
             Ok(true) => {
                 tracing::debug!(
                     park_ref = %a.park_ref,
@@ -2796,14 +2804,15 @@ async fn pota_upload(
         }
     };
 
-    // Mark all claimed activations as completed
+    // Mark all claimed activations as pending verification
+    // Background verification will check POTA jobs API to confirm actual success
     for a in &activations_to_upload {
-        if let Err(e) = db.mark_pota_upload_completed(user.id, &a.park_ref, &a.date) {
+        if let Err(e) = db.mark_pota_upload_pending_verification(user.id, &a.park_ref, &a.date) {
             tracing::warn!(
                 park_ref = %a.park_ref,
                 date = %a.date,
                 error = %e,
-                "Failed to mark activation as uploaded"
+                "Failed to mark activation as pending verification"
             );
         }
     }
@@ -2832,7 +2841,7 @@ async fn pota_upload(
     }
 
     let message = format!(
-        "Uploaded {} activations ({} QSOs){}",
+        "Uploaded {} activations ({} QSOs){}. Verification pending.",
         result.activations_uploaded,
         result.qsos_uploaded,
         if result.errors.is_empty() {
@@ -2951,8 +2960,16 @@ async fn pota_upload_sse(
             continue;
         }
 
+        // Get callsign from first QSO for tracking
+        let callsign = a
+            .qsos
+            .first()
+            .and_then(|q| q.station_callsign.as_deref())
+            .unwrap_or("UNKNOWN");
+
         // Try to claim this activation for upload (prevents concurrent uploads)
-        match db.try_start_pota_upload(user.id, &a.park_ref, &a.date, a.qsos.len() as i64) {
+        match db.try_start_pota_upload(user.id, &a.park_ref, &a.date, a.qsos.len() as i64, callsign)
+        {
             Ok(true) => {
                 activations_to_upload.push(a);
             }
@@ -3012,12 +3029,14 @@ async fn pota_upload_sse(
         )
         .await;
 
-        // Mark activations as completed or failed based on result
+        // Mark activations based on result
+        // On success: mark as pending_verification (background will verify with POTA jobs API)
+        // On failure: mark as failed
         if let Ok(db) = Database::open(&db_path_for_status) {
             match &result {
                 Ok(_) => {
                     for (park_ref, date) in &claimed_for_task {
-                        let _ = db.mark_pota_upload_completed(user_id, park_ref, date);
+                        let _ = db.mark_pota_upload_pending_verification(user_id, park_ref, date);
                     }
                 }
                 Err(e) => {
@@ -3084,7 +3103,7 @@ async fn pota_upload_sse(
                             }
 
                             let message = format!(
-                                "Uploaded {} activations ({} QSOs){}",
+                                "Uploaded {} activations ({} QSOs){}. Verification pending.",
                                 upload_result.activations_uploaded,
                                 upload_result.qsos_uploaded,
                                 if upload_result.errors.is_empty() {
